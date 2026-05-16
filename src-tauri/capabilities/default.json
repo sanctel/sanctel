@@ -15,9 +15,15 @@
     "fs:allow-app-local-data-read",
     "fs:allow-app-local-data-write",
     "fs:allow-app-local-data-meta",
+    "fs:allow-exists",
+    "fs:allow-read-dir",
+    "fs:allow-stat",
     {
       "identifier": "fs:scope",
-      "allow": [{ "path": "$APPLOCALDATA/**" }]
+      "allow": [
+        { "path": "$APPLOCALDATA/**" },
+        { "path": "$HOME/.claude/projects/**" }
+      ]
     }
   ]
 }

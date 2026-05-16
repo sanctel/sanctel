@@ -1,7 +1,8 @@
 import { useTabStore } from "../store/tabStore";
 import { useTmuxStatus } from "../store/tmuxStatusStore";
 import type { Tab, TabKind } from "../types";
-import { DEMO_WORKTREES } from "../worktrees";
+import { DEMO_WORKTREES, findWorktree } from "../worktrees";
+import { discoverAgentSessionForWorktree } from "../../terminal/agent-session-discovery-tauri";
 
 const kindGlyph: Record<TabKind, string> = {
   browser: "○",
@@ -22,6 +23,7 @@ export default function Sidebar() {
 
   const newTab = useTabStore((s) => s.newTab);
   const newTerminalTab = useTabStore((s) => s.newTerminalTab);
+  const newChatTab = useTabStore((s) => s.newChatTab);
   const closeTab = useTabStore((s) => s.closeTab);
   const activateTab = useTabStore((s) => s.activateTab);
   const switchSpace = useTabStore((s) => s.switchSpace);
@@ -104,9 +106,6 @@ export default function Sidebar() {
 
       <div className="new-buttons">
         <button onClick={() => newTab("browser", "")}>+ Browser</button>
-        {tmuxAvailable && (
-          <button onClick={() => newTab("chat", "")}>+ Chat</button>
-        )}
       </div>
 
       {tmuxAvailable && (
@@ -124,6 +123,31 @@ export default function Sidebar() {
           <button onClick={() => newTerminalTab(null)} title="$HOME, no worktree">
             detached
           </button>
+        </div>
+      )}
+
+      {tmuxAvailable && (
+        <div className="new-chats">
+          <span className="new-terminals-label">+ Chat in</span>
+          {DEMO_WORKTREES.map((w) => (
+            <button
+              key={w.id}
+              onClick={async () => {
+                // Slice 6 / issue #7: look up the newest claude session for
+                // this Worktree's cwd before creating the tab so the
+                // initialCommand can resume it. A miss falls back to plain
+                // `claude` and the first message creates a new transcript.
+                const wt = findWorktree(w.id);
+                const sessionId = wt
+                  ? await discoverAgentSessionForWorktree(wt.path)
+                  : null;
+                await newChatTab(w.id, sessionId);
+              }}
+              title={w.path}
+            >
+              {w.branch}
+            </button>
+          ))}
         </div>
       )}
 
