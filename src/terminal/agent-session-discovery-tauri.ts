@@ -12,9 +12,7 @@ import {
 } from "./agent-session-discovery";
 
 const tauriFs: AgentSessionFs = {
-  async exists(path) {
-    return exists(path);
-  },
+  exists,
   async readDir(path) {
     const entries = await readDir(path);
     const out: AgentSessionFsEntry[] = [];
@@ -23,9 +21,7 @@ const tauriFs: AgentSessionFs = {
         const s = await stat(`${path}/${e.name}`);
         // mtime can be null on platforms that don't expose it; treat as 0
         // so the entry still ranks below files with a real mtime.
-        const t =
-          s.mtime instanceof Date ? s.mtime.getTime() : Number(s.mtime ?? 0);
-        out.push({ name: e.name, mtime: t });
+        out.push({ name: e.name, mtime: s.mtime?.getTime() ?? 0 });
       } catch {
         // Skip unreadable entries — they shouldn't block discovery.
       }

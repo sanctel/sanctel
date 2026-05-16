@@ -1,7 +1,7 @@
 import { useTabStore } from "../store/tabStore";
 import { useTmuxStatus } from "../store/tmuxStatusStore";
 import type { Tab, TabKind } from "../types";
-import { DEMO_WORKTREES, findWorktree } from "../worktrees";
+import { DEMO_WORKTREES } from "../worktrees";
 import { discoverAgentSessionForWorktree } from "../../terminal/agent-session-discovery-tauri";
 
 const kindGlyph: Record<TabKind, string> = {
@@ -137,10 +137,7 @@ export default function Sidebar() {
                 // this Worktree's cwd before creating the tab so the
                 // initialCommand can resume it. A miss falls back to plain
                 // `claude` and the first message creates a new transcript.
-                const wt = findWorktree(w.id);
-                const sessionId = wt
-                  ? await discoverAgentSessionForWorktree(wt.path)
-                  : null;
+                const sessionId = await discoverAgentSessionForWorktree(w.path);
                 await newChatTab(w.id, sessionId);
               }}
               title={w.path}
