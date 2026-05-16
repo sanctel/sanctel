@@ -21,6 +21,33 @@ use std::process::Output;
 /// The default socket name used by the production sanctel app.
 pub const DEFAULT_SOCKET: &str = "sanctel";
 
+/// Next `term-N` for the given existing window names. Gaps are tolerated
+/// (max + 1 rather than the lowest free integer) so that closing window N
+/// never re-uses N for a future tab in the same session — keeps `windowName`
+/// stable as a tmux handle across the session's lifetime.
+///
+/// Non-numeric names (`bash`, `build-watcher`, malformed `term-`, `term-abc`)
+/// are ignored. The `term-` prefix is the only one this allocator owns —
+/// users renaming their own tmux windows to anything else don't perturb the
+/// counter.
+pub fn allocate_window_name(existing: &[String]) -> String {
+    let mut max: u64 = 0;
+    for name in existing {
+        let Some(rest) = name.strip_prefix("term-") else {
+            continue;
+        };
+        if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(n) = rest.parse::<u64>() {
+            if n > max {
+                max = n;
+            }
+        }
+    }
+    format!("term-{}", max + 1)
+}
+
 /// Errors surfaced from the tmux wrapper. Stringly-typed kinds are fine —
 /// callers either retry (Race) or surface to the user (everything else).
 #[derive(Debug, Clone)]
@@ -342,6 +369,50 @@ mod tests {
             stdout: vec![],
             stderr: stderr.as_bytes().to_vec(),
         })
+    }
+
+    #[test]
+    fn allocate_window_name_empty_yields_term_1() {
+        assert_eq!(allocate_window_name(&[]), "term-1");
+    }
+
+    #[test]
+    fn allocate_window_name_advances_past_sequential_list() {
+        let existing = vec!["term-1".to_string(), "term-2".to_string()];
+        assert_eq!(allocate_window_name(&existing), "term-3");
+    }
+
+    #[test]
+    fn allocate_window_name_tolerates_gaps_by_picking_max_plus_one() {
+        let existing = vec!["term-2".to_string(), "term-5".to_string()];
+        assert_eq!(allocate_window_name(&existing), "term-6");
+    }
+
+    #[test]
+    fn allocate_window_name_ignores_non_numeric_names() {
+        let existing = vec!["bash".to_string(), "build-watcher".to_string()];
+        assert_eq!(allocate_window_name(&existing), "term-1");
+    }
+
+    #[test]
+    fn allocate_window_name_ignores_mixed_non_numeric_and_term_n_names() {
+        let existing = vec![
+            "term-3".to_string(),
+            "bash".to_string(),
+            "term-1".to_string(),
+            "deploy".to_string(),
+        ];
+        assert_eq!(allocate_window_name(&existing), "term-4");
+    }
+
+    #[test]
+    fn allocate_window_name_ignores_malformed_term_entries() {
+        let existing = vec![
+            "term-".to_string(),
+            "term-abc".to_string(),
+            "term-2".to_string(),
+        ];
+        assert_eq!(allocate_window_name(&existing), "term-3");
     }
 
     #[test]

@@ -29,7 +29,7 @@ use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
 use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
-use crate::tmux_cli::{TmuxCli, TmuxError};
+use crate::tmux_cli::{allocate_window_name, CommandRunner, TmuxCli, TmuxError};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -52,6 +52,35 @@ struct AppState {
     // before any frontend invokes; read by the `tmux_status` command so
     // React can gate terminal/chat tab creation behind a setup screen.
     tmux_status: Mutex<TmuxStatus>,
+    // Per-tmux-session locks. `create_tab` grabs the inner mutex for the
+    // session it's about to touch, then atomically lists existing window
+    // names, computes the next `term-N`, and calls `new-window`. Without
+    // the lock, two concurrent callers in the same session both read
+    // [term-1], both compute term-2, and tmux happily creates two windows
+    // with the same name.
+    session_locks: SessionLocks,
+}
+
+/// Per-tmux-session mutex map. The outer mutex protects the HashMap; the
+/// inner `Arc<Mutex<()>>` is held during the list-windows → compute-name →
+/// new-window critical section in `create_tab`.
+#[derive(Default)]
+struct SessionLocks {
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl SessionLocks {
+    /// Returns the per-session mutex, creating it on first use. The caller
+    /// is expected to drop the returned Arc's MutexGuard before returning
+    /// from its critical section; the outer map mutex is held only long
+    /// enough to insert/get.
+    fn lock_for(&self, session: &str) -> Arc<Mutex<()>> {
+        self.locks
+            .lock()
+            .entry(session.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
 }
 
 /// Result of the one-time `tmux -V` probe. Emitted as a Tauri event and also
@@ -153,28 +182,67 @@ struct CreateTabReq {
     agent_session_id: Option<String>,
 }
 
-/// Inputs for `terminal_list_window_names`. Frontend gives us either a
-/// worktreeId (the normal case) or a profileId (detached fallback); Rust
-/// owns the session-name mapping so the convention stays in one place.
-#[derive(Deserialize)]
+/// Response from `create_tab`. For terminal/chat tabs created with the
+/// `windowName: "auto"` sentinel (or no windowName at all), Rust allocates
+/// the next `term-N` under the per-session mutex and returns it here so the
+/// frontend can persist the resolved name. For the reattach path (explicit
+/// windowName) and for non-terminal kinds, this is `None`.
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ListWindowNamesReq {
-    worktree_id: Option<String>,
-    profile_id: String,
+struct CreateTabResp {
+    window_name: Option<String>,
 }
 
+/// `"auto"` is the explicit sentinel from React asking Rust to allocate the
+/// next `term-N`. We also treat `None` the same way for terminal/chat tabs,
+/// so omitting the field is equivalent.
+const AUTO_WINDOW_NAME: &str = "auto";
+
 #[tauri::command]
-fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
+fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp, String> {
+    let is_terminal_like = matches!(req.kind.as_str(), "terminal" | "chat");
+
     // Belt-and-braces gate: React already hides the new-terminal/new-chat
     // buttons behind `tmux-missing`. This second check makes sure a stale
     // SQLite restore or a scripted invoke can't slip past and spawn a
     // doomed PTY.
-    if matches!(req.kind.as_str(), "terminal" | "chat") {
+    if is_terminal_like {
         let status = app.state::<AppState>().tmux_status.lock().clone();
         if !status.available {
             return Err("tmux-missing".to_string());
         }
     }
+
+    // For terminal/chat tabs, resolve `windowName` server-side under a
+    // per-session mutex when the request asked for "auto" allocation. Doing
+    // it before we build the webview means a failure here surfaces to React
+    // before any client-visible state is created.
+    let asked_for_auto = is_terminal_like
+        && matches!(req.window_name.as_deref(), None | Some(AUTO_WINDOW_NAME));
+    let allocated_window_name: Option<String> = if asked_for_auto {
+        let cwd =
+            resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
+        let session = tmux_session_name(req.worktree_id.as_deref(), &req.profile_id);
+        let locks = &app.state::<AppState>().session_locks;
+        let tmux = TmuxCli::default();
+        Some(
+            allocate_window_under_lock(
+                locks,
+                &tmux,
+                &session,
+                &cwd,
+                req.initial_command.as_deref(),
+            )
+            .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    // Effective name stored on the TabRecord: the freshly allocated one
+    // when asked, otherwise whatever the frontend supplied (explicit name
+    // on the reattach path, or `None` for non-terminal kinds).
+    let effective_window_name = allocated_window_name.clone().or(req.window_name.clone());
 
     let window = app
         .get_window("main")
@@ -220,7 +288,9 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Record it.
+    // Record it. The TabRecord carries the *resolved* window name so the
+    // attach-path lookup (resolve_attach_params) sees the same value the
+    // frontend persists.
     app.state::<AppState>().tabs.lock().insert(
         req.id.clone(),
         TabRecord {
@@ -228,7 +298,7 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
             kind: req.kind,
             worktree_id: req.worktree_id,
             worktree_path: req.worktree_path,
-            window_name: req.window_name,
+            window_name: effective_window_name,
             initial_command: req.initial_command,
             agent_session_id: req.agent_session_id,
         },
@@ -241,7 +311,46 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
     }
     show_webview(&app, &req.id)?;
 
-    Ok(())
+    Ok(CreateTabResp {
+        window_name: allocated_window_name,
+    })
+}
+
+/// Worktree-path resolution shared by `create_tab` (for the auto-allocation
+/// path) and `resolve_attach_params` (for the attach path). Single source of
+/// truth: detached → $HOME; worktree-keyed → the request's path.
+fn resolve_worktree_cwd(
+    worktree_id: Option<&str>,
+    worktree_path: Option<&str>,
+) -> Result<String, String> {
+    match (worktree_id, worktree_path) {
+        (Some(_), Some(path)) => Ok(path.to_string()),
+        (None, _) => std::env::var("HOME").map_err(|_| "HOME not set".to_string()),
+        (Some(_), None) => Err(
+            "worktreeId set without worktreePath — create_tab must carry both".to_string(),
+        ),
+    }
+}
+
+/// The atomic critical section behind `windowName: "auto"`: under the
+/// per-session mutex, ensure the session exists, list existing windows,
+/// compute the next `term-N`, and call `new-window`. Returns the resolved
+/// name. Generic over `CommandRunner` so the concurrency test below can
+/// drive it with a scripted-tmux fixture without spawning real processes.
+fn allocate_window_under_lock<R: CommandRunner>(
+    locks: &SessionLocks,
+    tmux: &TmuxCli<R>,
+    session: &str,
+    cwd: &str,
+    initial_command: Option<&str>,
+) -> Result<String, TmuxError> {
+    let lock = locks.lock_for(session);
+    let _guard = lock.lock();
+    tmux.ensure_session(session, cwd)?;
+    let existing = tmux.list_windows(session)?;
+    let name = allocate_window_name(&existing);
+    tmux.new_window(session, &name, cwd, initial_command)?;
+    Ok(name)
 }
 
 #[tauri::command]
@@ -330,9 +439,9 @@ fn tmux_session_name(worktree_id: Option<&str>, profile_id: &str) -> String {
 /// Resolve identity for a terminal/chat tab. Worktree-keyed tabs (ADR-0012)
 /// attach to `sanctel-wt:<worktreeId>` with the Worktree's path as cwd;
 /// worktree-less tabs attach to `sanctel-detached:<profileId>` and start in
-/// `$HOME`. Window name is allocated by the frontend at create_tab time and
-/// stored on the TabRecord — falling back to "term-1" only when the
-/// frontend omitted it (legacy demo path).
+/// `$HOME`. Window name is allocated server-side at create_tab time (under
+/// a per-session mutex) and stored on the TabRecord — falling back to
+/// "term-1" only when the frontend omitted it (legacy demo path).
 fn resolve_attach_params(
     record: &TabRecord,
     cols: u16,
@@ -343,15 +452,10 @@ fn resolve_attach_params(
         .clone()
         .unwrap_or_else(|| "term-1".to_string());
 
-    let worktree_path = match (&record.worktree_id, &record.worktree_path) {
-        (Some(_), Some(path)) => path.clone(),
-        (None, _) => std::env::var("HOME").map_err(|_| "HOME not set".to_string())?,
-        (Some(_), None) => {
-            return Err(
-                "worktreeId set without worktreePath — create_tab must carry both".into(),
-            );
-        }
-    };
+    let worktree_path = resolve_worktree_cwd(
+        record.worktree_id.as_deref(),
+        record.worktree_path.as_deref(),
+    )?;
 
     Ok(AttachParams {
         session: tmux_session_name(record.worktree_id.as_deref(), &record.profile_id),
@@ -413,21 +517,6 @@ fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(),
     handle.writer.lock().write_all(&bytes).map_err(|e| e.to_string())
 }
 
-/// Return the tmux window names that already exist in the session for the
-/// given worktree (or the detached fallback). Used by the frontend's
-/// `window-name-allocator` to compute the next `term-N` before calling
-/// `create_tab`. Returns an empty list when the session doesn't exist yet
-/// (first tab into a worktree) so the caller doesn't have to special-case it.
-#[tauri::command]
-fn terminal_list_window_names(req: ListWindowNamesReq) -> Result<Vec<String>, String> {
-    let session = tmux_session_name(req.worktree_id.as_deref(), &req.profile_id);
-    let tmux = TmuxCli::default();
-    if !tmux.has_session(&session).map_err(|e| e.to_string())? {
-        return Ok(vec![]);
-    }
-    tmux.list_windows(&session).map_err(|e| e.to_string())
-}
-
 #[tauri::command]
 fn terminal_resize<R: Runtime>(
     webview: Webview<R>,
@@ -457,7 +546,7 @@ fn terminal_resize<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tmux_cli::{CommandOutput, CommandRunner};
+    use crate::tmux_cli::CommandOutput;
 
     fn record(
         worktree_id: Option<&str>,
@@ -549,6 +638,205 @@ mod tests {
         assert_eq!(result.version.as_deref(), Some("tmux 3.4"));
         assert!(result.error.is_none());
     }
+
+    // ─── windowName allocation under the per-session mutex (issue #10) ────
+
+    /// A tmux fixture: maintains a per-session set of window names, services
+    /// has-session / new-session / list-windows / new-window. Each operation
+    /// holds the inner lock just long enough to mutate state, so without the
+    /// per-session mutex inside `allocate_window_under_lock` the
+    /// list-windows → new-window window is wide open and concurrent callers
+    /// would collide on the same `term-N`.
+    struct TmuxStateRunner {
+        windows: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    }
+
+    impl TmuxStateRunner {
+        fn new() -> Self {
+            TmuxStateRunner {
+                windows: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+        fn clone_shared(&self) -> Self {
+            TmuxStateRunner {
+                windows: Arc::clone(&self.windows),
+            }
+        }
+        fn names_for(&self, session: &str) -> Vec<String> {
+            self.windows
+                .lock()
+                .get(session)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn arg_after<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1)).copied()
+    }
+
+    impl CommandRunner for TmuxStateRunner {
+        fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            let sub = args
+                .iter()
+                .find(|a| {
+                    matches!(
+                        **a,
+                        "has-session" | "new-session" | "list-windows" | "new-window"
+                    )
+                })
+                .copied()
+                .unwrap_or("");
+
+            match sub {
+                "has-session" => {
+                    let target = arg_after(args, "-t")
+                        .map(|s| s.trim_start_matches('=').to_string())
+                        .unwrap_or_default();
+                    let exists = self.windows.lock().contains_key(&target);
+                    Ok(CommandOutput {
+                        status: if exists { 0 } else { 1 },
+                        stdout: vec![],
+                        stderr: if exists {
+                            vec![]
+                        } else {
+                            b"can't find session".to_vec()
+                        },
+                    })
+                }
+                "new-session" => {
+                    let name = arg_after(args, "-s").unwrap_or_default().to_string();
+                    let mut map = self.windows.lock();
+                    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(name.clone()) {
+                        // Sessions start with one default window "0"; matches
+                        // tmux behavior closely enough for the allocator test.
+                        e.insert(vec![]);
+                        Ok(CommandOutput {
+                            status: 0,
+                            stdout: vec![],
+                            stderr: vec![],
+                        })
+                    } else {
+                        Ok(CommandOutput {
+                            status: 1,
+                            stdout: vec![],
+                            stderr: format!("duplicate session: {name}").into_bytes(),
+                        })
+                    }
+                }
+                "list-windows" => {
+                    let target = arg_after(args, "-t")
+                        .map(|s| s.trim_start_matches('=').to_string())
+                        .unwrap_or_default();
+                    let body = self
+                        .windows
+                        .lock()
+                        .get(&target)
+                        .cloned()
+                        .unwrap_or_default()
+                        .join("\n");
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: format!("{body}\n").into_bytes(),
+                        stderr: vec![],
+                    })
+                }
+                "new-window" => {
+                    let target = arg_after(args, "-t")
+                        .map(|s| s.trim_start_matches('=').to_string())
+                        .unwrap_or_default();
+                    let name = arg_after(args, "-n").unwrap_or_default().to_string();
+                    let mut map = self.windows.lock();
+                    let windows = map.entry(target).or_default();
+                    windows.push(name);
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
+                }
+                _ => Ok(CommandOutput {
+                    status: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                }),
+            }
+        }
+    }
+
+    /// Spawn N parallel `allocate_window_under_lock` calls against the same
+    /// session. Without the per-session mutex inside the helper, multiple
+    /// callers would race between list-windows and new-window and end up
+    /// computing the same `term-N`. With the mutex, the N callers produce N
+    /// distinct names `term-1`…`term-N`, with no holes.
+    #[test]
+    fn allocate_window_under_lock_serializes_concurrent_callers() {
+        const N: usize = 12;
+        let session = "sanctel-wt:race-test";
+        let cwd = "/tmp";
+
+        let locks = Arc::new(SessionLocks::default());
+        let runner = TmuxStateRunner::new();
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let runner_clone = runner.clone_shared();
+                let locks = Arc::clone(&locks);
+                let session = session.to_string();
+                let cwd = cwd.to_string();
+                std::thread::spawn(move || {
+                    let tmux = TmuxCli::new("test-sock", runner_clone);
+                    allocate_window_under_lock(&locks, &tmux, &session, &cwd, None)
+                })
+            })
+            .collect();
+
+        let mut got: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().expect("allocation must succeed"))
+            .collect();
+        got.sort();
+
+        let expected: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
+        assert_eq!(got, expected, "N concurrent callers must produce N distinct term-N names with no holes");
+
+        // The fixture's stored window list must match too — the mutex makes
+        // the new-window call atomic with the listing that drove the name
+        // choice.
+        let mut tmux_windows = runner.names_for(session);
+        tmux_windows.sort();
+        assert_eq!(tmux_windows, expected);
+    }
+
+    /// Different sessions don't serialize against each other: two callers
+    /// against distinct sessions both get `term-1`. Smoke-test that the
+    /// per-session keying isn't accidentally globalized.
+    #[test]
+    fn allocate_window_under_lock_does_not_serialize_distinct_sessions() {
+        let locks = SessionLocks::default();
+        let runner = TmuxStateRunner::new();
+        let tmux_a = TmuxCli::new("t", runner.clone_shared());
+        let tmux_b = TmuxCli::new("t", runner.clone_shared());
+
+        let a = allocate_window_under_lock(
+            &locks,
+            &tmux_a,
+            "sanctel-wt:a",
+            "/tmp",
+            None,
+        )
+        .unwrap();
+        let b = allocate_window_under_lock(
+            &locks,
+            &tmux_b,
+            "sanctel-wt:b",
+            "/tmp",
+            None,
+        )
+        .unwrap();
+        assert_eq!(a, "term-1");
+        assert_eq!(b, "term-1");
+    }
 }
 
 // ─── tmux probe (Slice 7) ─────────────────────────────────────────────────
@@ -610,7 +898,6 @@ pub fn run() {
             terminal_attach,
             terminal_write,
             terminal_resize,
-            terminal_list_window_names,
             tmux_status,
         ])
         .run(tauri::generate_context!())
