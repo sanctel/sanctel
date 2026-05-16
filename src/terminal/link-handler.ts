@@ -16,13 +16,13 @@ export function createLinkHandler(
   return (_event, url) => {
     try {
       const result = opts.openBrowserTab(url);
-      if (result && typeof (result as Promise<void>).catch === "function") {
-        (result as Promise<void>).catch((err) =>
+      if (result instanceof Promise) {
+        result.catch((err) =>
           console.error("openBrowserTab failed", err),
         );
       }
     } catch (err) {
-      console.error("openBrowserTab threw", err);
+      console.error("openBrowserTab failed", err);
     }
   };
 }
