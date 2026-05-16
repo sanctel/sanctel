@@ -289,6 +289,18 @@ fn set_content_rect(app: tauri::AppHandle, rect: Rect) -> Result<(), String> {
 // calling webview's label by looking up the TabRecord stored at create_tab
 // time. The frontend never passes its own tabId — enforced by the IPC shape.
 
+/// The tmux session name for a (worktreeId, profileId) pair. Worktree-keyed
+/// tabs land on `sanctel-wt:<id>` per ADR-0012; detached tabs share one
+/// `sanctel-detached:<profileId>` session. Single source of truth for the
+/// naming convention — every command that maps to a tmux session goes
+/// through here.
+fn tmux_session_name(worktree_id: Option<&str>, profile_id: &str) -> String {
+    match worktree_id {
+        Some(id) => format!("sanctel-wt:{id}"),
+        None => format!("sanctel-detached:{profile_id}"),
+    }
+}
+
 /// Resolve identity for a terminal/chat tab. Worktree-keyed tabs (ADR-0012)
 /// attach to `sanctel-wt:<worktreeId>` with the Worktree's path as cwd;
 /// worktree-less tabs attach to `sanctel-detached:<profileId>` and start in
@@ -305,12 +317,9 @@ fn resolve_attach_params(
         .clone()
         .unwrap_or_else(|| "term-1".to_string());
 
-    let (session, worktree_path) = match (&record.worktree_id, &record.worktree_path) {
-        (Some(id), Some(path)) => (format!("sanctel-wt:{id}"), path.clone()),
-        (None, _) => {
-            let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-            (format!("sanctel-detached:{}", record.profile_id), home)
-        }
+    let worktree_path = match (&record.worktree_id, &record.worktree_path) {
+        (Some(_), Some(path)) => path.clone(),
+        (None, _) => std::env::var("HOME").map_err(|_| "HOME not set".to_string())?,
         (Some(_), None) => {
             return Err(
                 "worktreeId set without worktreePath — create_tab must carry both".into(),
@@ -319,7 +328,7 @@ fn resolve_attach_params(
     };
 
     Ok(AttachParams {
-        session,
+        session: tmux_session_name(record.worktree_id.as_deref(), &record.profile_id),
         window_name,
         worktree_path,
         initial_command: record.initial_command.clone(),
@@ -377,10 +386,7 @@ fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(),
 /// (first tab into a worktree) so the caller doesn't have to special-case it.
 #[tauri::command]
 fn terminal_list_window_names(req: ListWindowNamesReq) -> Result<Vec<String>, String> {
-    let session = match &req.worktree_id {
-        Some(id) => format!("sanctel-wt:{id}"),
-        None => format!("sanctel-detached:{}", req.profile_id),
-    };
+    let session = tmux_session_name(req.worktree_id.as_deref(), &req.profile_id);
     let tmux = TmuxCli::default();
     if !tmux.has_session(&session).map_err(|e| e.to_string())? {
         return Ok(vec![]);

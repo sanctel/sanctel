@@ -18,7 +18,7 @@ export function allocateWindowName(existing: readonly string[]): string {
     const m = TERM_PREFIX_RE.exec(name);
     if (!m) continue;
     const n = Number.parseInt(m[1], 10);
-    if (Number.isFinite(n) && n > max) max = n;
+    if (n > max) max = n;
   }
   return `term-${max + 1}`;
 }
