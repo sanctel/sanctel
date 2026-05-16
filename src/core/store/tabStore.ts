@@ -8,7 +8,6 @@ import type {
   ContentRect,
   Worktree,
 } from "../types";
-import { allocateWindowName } from "../../terminal/window-name-allocator";
 import { findWorktree } from "../worktrees";
 import { useTmuxStatus } from "./tmuxStatusStore";
 import type {
@@ -17,6 +16,21 @@ import type {
   PersistedTab,
   Persistence,
 } from "../persistence/persistence";
+
+/// Response shape from Rust's `create_tab`. For terminal/chat tabs created
+/// with `windowName: "auto"`, Rust returns the resolved name here so the
+/// frontend can persist it; for reattach (explicit name) and non-terminal
+/// kinds, `windowName` is `null`. See docs/design/terminal-runtime.md
+/// §"windowName assignment".
+interface CreateTabResp {
+  windowName: string | null;
+}
+
+/// Sentinel passed to `create_tab` in place of an explicit windowName. Rust
+/// interprets it as "allocate the next term-N under the per-session mutex
+/// and return the resolved name." Pinned as a const so React never types
+/// the literal twice.
+const AUTO_WINDOW_NAME = "auto";
 
 interface TabState {
   profiles: Profile[];
@@ -318,15 +332,28 @@ export function createTabStore(): TabStoreHook {
         throw new Error(`unknown worktreeId: ${worktreeId}`);
       }
 
-      // Ask Rust for the existing window names in this Worktree's session, then
-      // allocate the next term-N locally. Empty list when the session doesn't
-      // exist yet — first tab into a Worktree.
-      const existing = await invoke<string[]>("terminal_list_window_names", {
-        req: { worktreeId: worktreeId ?? null, profileId },
-      });
-      const windowName = allocateWindowName(existing);
-
+      // Issue #10: windowName allocation moved server-side under a per-session
+      // mutex. React passes the "auto" sentinel; Rust returns the resolved
+      // name in CreateTabResp.windowName, which we then persist.
       const id = crypto.randomUUID();
+      const resp = await invoke<CreateTabResp>("create_tab", {
+        req: {
+          id,
+          kind: "terminal",
+          url: "local://terminal",
+          profileId,
+          worktreeId: worktree?.id ?? null,
+          worktreePath: worktree?.path ?? null,
+          windowName: AUTO_WINDOW_NAME,
+        },
+      });
+      const windowName = resp.windowName;
+      if (!windowName) {
+        throw new Error(
+          "create_tab returned no windowName for an auto-allocated terminal tab",
+        );
+      }
+
       const title = worktree ? `${worktree.branch} · ${windowName}` : windowName;
       const tab: Tab = {
         id,
@@ -339,25 +366,17 @@ export function createTabStore(): TabStoreHook {
         loading: false,
       };
 
-      // Persist first; the SQL row is what survives the restart.
+      // Persist *after* invoke now that the resolved name comes from Rust.
+      // If invoke succeeds but persistence fails, we'll have an orphan tmux
+      // window — acceptable; the user can `tmux kill-server` or close-and-
+      // recreate. The alternative (write a row with null windowName, update
+      // after invoke) buys nothing the user actually sees.
       if (persistence) {
         const sortOrder = get().tabs.filter(
           (t) => t.spaceId === space.id,
         ).length;
         await persistence.saveTab(tabToRow(tab, sortOrder));
       }
-
-      await invoke("create_tab", {
-        req: {
-          id: tab.id,
-          kind: tab.kind,
-          url: tab.url,
-          profileId,
-          worktreeId: worktree?.id ?? null,
-          worktreePath: worktree?.path ?? null,
-          windowName,
-        },
-      });
 
       set((s) => ({
         tabs: [...s.tabs, tab],
@@ -386,11 +405,6 @@ export function createTabStore(): TabStoreHook {
       const worktree = findWorktree(worktreeId);
       if (!worktree) throw new Error(`unknown worktreeId: ${worktreeId}`);
 
-      const existing = await invoke<string[]>("terminal_list_window_names", {
-        req: { worktreeId, profileId },
-      });
-      const windowName = allocateWindowName(existing);
-
       // Slice 6 / issue #7: a prior session means we resume; otherwise plain
       // `claude` creates a fresh transcript on first message. Either way the
       // command only fires on fresh tmux-window creation (Rust's job);
@@ -400,6 +414,26 @@ export function createTabStore(): TabStoreHook {
         : "claude";
 
       const id = crypto.randomUUID();
+      const resp = await invoke<CreateTabResp>("create_tab", {
+        req: {
+          id,
+          kind: "chat",
+          url: "local://chat",
+          profileId,
+          worktreeId: worktree.id,
+          worktreePath: worktree.path,
+          windowName: AUTO_WINDOW_NAME,
+          initialCommand,
+          agentSessionId: agentSessionId ?? null,
+        },
+      });
+      const windowName = resp.windowName;
+      if (!windowName) {
+        throw new Error(
+          "create_tab returned no windowName for an auto-allocated chat tab",
+        );
+      }
+
       const title = `${worktree.branch} · chat`;
       const tab: Tab = {
         id,
@@ -420,20 +454,6 @@ export function createTabStore(): TabStoreHook {
         ).length;
         await persistence.saveTab(tabToRow(tab, sortOrder));
       }
-
-      await invoke("create_tab", {
-        req: {
-          id: tab.id,
-          kind: tab.kind,
-          url: tab.url,
-          profileId,
-          worktreeId: worktree.id,
-          worktreePath: worktree.path,
-          windowName,
-          initialCommand,
-          agentSessionId: agentSessionId ?? null,
-        },
-      });
 
       set((s) => ({
         tabs: [...s.tabs, tab],

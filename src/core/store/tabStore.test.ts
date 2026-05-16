@@ -32,14 +32,33 @@ function markTmuxAvailable() {
   });
 }
 
+// Counter used by the default `create_tab` mock so each auto-allocated tab
+// in a test gets a distinct `term-N`, modelling Rust's server-side
+// allocator. Reset between tests.
+let nextTermN = 1;
+
+function mockCreateTabAutoAllocate(cmd: string, args: unknown): unknown {
+  if (cmd !== "create_tab") return Promise.resolve(undefined);
+  const req = (args as { req?: { kind?: string; windowName?: string | null } })
+    .req;
+  if (!req) return Promise.resolve({ windowName: null });
+  const isTerminalLike = req.kind === "terminal" || req.kind === "chat";
+  const askedForAuto =
+    req.windowName === "auto" || req.windowName == null;
+  if (isTerminalLike && askedForAuto) {
+    const name = `term-${nextTermN++}`;
+    return Promise.resolve({ windowName: name });
+  }
+  return Promise.resolve({ windowName: null });
+}
+
 beforeEach(() => {
   invokeMock.mockReset();
-  // `terminal_list_window_names` must return an array; everything else
-  // resolves to undefined (matches the Rust commands that return `()`).
-  invokeMock.mockImplementation((cmd) => {
-    if (cmd === "terminal_list_window_names") return Promise.resolve([]);
-    return Promise.resolve(undefined);
-  });
+  nextTermN = 1;
+  // Default mock: `create_tab` for an auto-allocated terminal/chat returns
+  // a CreateTabResp with the next `term-N`; everything else (non-terminal
+  // create_tab, close_tab, show_tab …) resolves to undefined.
+  invokeMock.mockImplementation(mockCreateTabAutoAllocate);
   markTmuxAvailable();
 });
 
@@ -180,13 +199,8 @@ describe("tabStore mutations persist", () => {
     expect(createTabCall?.[1].req.id).toBe(snap.tabs[0].id);
   });
 
-  it("newTerminalTab persists windowName + worktreeId", async () => {
+  it("newTerminalTab persists the windowName returned by create_tab", async () => {
     const persistence = new InMemoryPersistence();
-    invokeMock.mockImplementation((cmd) => {
-      if (cmd === "terminal_list_window_names") return Promise.resolve([]);
-      return Promise.resolve(undefined);
-    });
-
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
@@ -197,17 +211,53 @@ describe("tabStore mutations persist", () => {
     expect(snap.tabs[0]).toMatchObject({
       kind: "terminal",
       worktreeId: "sanctel-main",
+      // The default mock simulates server-side allocation by returning
+      // sequential term-N values from CreateTabResp.windowName.
       windowName: "term-1",
     });
   });
 
+  it("newTerminalTab passes windowName: 'auto' to create_tab (no client-side listing)", async () => {
+    const persistence = new InMemoryPersistence();
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    invokeMock.mockClear();
+    await useStore.getState().newTerminalTab("sanctel-main");
+
+    // No client-side listing call exists anymore; the issue removed that
+    // command. The "auto" sentinel is the only thing on the wire.
+    const listCalls = invokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "terminal_list_window_names",
+    );
+    expect(listCalls).toHaveLength(0);
+
+    const createCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "create_tab",
+    );
+    expect(createCall?.[1].req).toMatchObject({
+      kind: "terminal",
+      worktreeId: "sanctel-main",
+      windowName: "auto",
+    });
+  });
+
+  it("two newTerminalTab calls receive distinct term-N names from create_tab", async () => {
+    const persistence = new InMemoryPersistence();
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    const a = await useStore.getState().newTerminalTab("sanctel-main");
+    const b = await useStore.getState().newTerminalTab("sanctel-main");
+
+    expect(a.windowName).toBe("term-1");
+    expect(b.windowName).toBe("term-2");
+    const snap = await persistence.loadAll();
+    expect(snap.tabs.map((t) => t.windowName)).toEqual(["term-1", "term-2"]);
+  });
+
   it("renameTab persists the new title but leaves windowName alone", async () => {
     const persistence = new InMemoryPersistence();
-    invokeMock.mockImplementation((cmd) => {
-      if (cmd === "terminal_list_window_names") return Promise.resolve([]);
-      return Promise.resolve(undefined);
-    });
-
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
     await useStore.getState().newTerminalTab("sanctel-main");
@@ -222,11 +272,6 @@ describe("tabStore mutations persist", () => {
 
   it("newChatTab with a prior agentSessionId persists initialCommand = claude --resume <id>", async () => {
     const persistence = new InMemoryPersistence();
-    invokeMock.mockImplementation((cmd) => {
-      if (cmd === "terminal_list_window_names") return Promise.resolve([]);
-      return Promise.resolve(undefined);
-    });
-
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
@@ -250,7 +295,7 @@ describe("tabStore mutations persist", () => {
     expect(createTabCall?.[1].req).toMatchObject({
       kind: "chat",
       worktreeId: "sanctel-main",
-      windowName: "term-1",
+      windowName: "auto",
       initialCommand: "claude --resume abc-123",
       agentSessionId: "abc-123",
     });
@@ -258,11 +303,6 @@ describe("tabStore mutations persist", () => {
 
   it("newChatTab with no prior session persists plain claude (no --resume)", async () => {
     const persistence = new InMemoryPersistence();
-    invokeMock.mockImplementation((cmd) => {
-      if (cmd === "terminal_list_window_names") return Promise.resolve([]);
-      return Promise.resolve(undefined);
-    });
-
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
