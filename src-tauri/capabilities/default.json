@@ -11,6 +11,13 @@
     "core:event:allow-emit",
     "core:event:allow-emit-to",
     "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    "fs:allow-app-local-data-read",
+    "fs:allow-app-local-data-write",
+    "fs:allow-app-local-data-meta",
+    {
+      "identifier": "fs:scope",
+      "allow": [{ "path": "$APPLOCALDATA/**" }]
+    }
   ]
 }

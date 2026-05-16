@@ -14,9 +14,10 @@
 //   TmuxSession   (a tmux server-side session, outlives the app)
 //
 // Tabs BRIDGE the two worlds:
-//   - tab.spaceId       → Space   (visual grouping)
-//   - tab.worktreeId?   → Worktree (filesystem cwd; optional)
-//   - tab.sessionId?    → AgentSession or TmuxSession handle
+//   - tab.spaceId         → Space   (visual grouping)
+//   - tab.worktreeId?     → Worktree (filesystem cwd; optional)
+//   - tab.windowName?     → TmuxSession window inside the Worktree's session
+//   - tab.agentSessionId? → AgentSession (claude --resume target)
 //
 // The deeper insight: Tabs are ephemeral. Profiles, Worktrees, transcripts,
 // and tmux sessions are durable. On app launch, Tabs are reconstructed by
@@ -85,9 +86,12 @@ export interface Tab {
   // Filesystem attachment. Independent of spaceId — a Space can hold tabs
   // for many worktrees; a worktree can have tabs in many Spaces.
   worktreeId?: Worktree["id"];
-  // For terminal/chat: handle to a backend session (tmux session name,
-  // agent run ID). Reconstructable from worktreeId + tab kind in many cases.
-  sessionId?: string;
+  // Server-held identity for terminal/chat tabs. Persisted across launches
+  // so the broken-tab/recreate flow can replay create_tab with the same
+  // tmux window and agent transcript.
+  windowName?: string;          // tmux window inside the Worktree's session
+  initialCommand?: string;      // first-shell command for chat tabs (Slice 6)
+  agentSessionId?: string;      // claude --resume target for chat tabs (Slice 6)
   loading: boolean;
   favicon?: string;
 }

@@ -6,6 +6,7 @@ import ContentArea from "./core/components/ContentArea";
 import TmuxSetupScreen from "./core/components/TmuxSetupScreen";
 import { useTabStore } from "./core/store/tabStore";
 import { useTmuxStatus } from "./core/store/tmuxStatusStore";
+import { SqlPersistence } from "./core/persistence/sql-persistence";
 import "./styles/app.css";
 
 export default function App() {
@@ -16,6 +17,17 @@ export default function App() {
   useEffect(() => {
     hydrate();
   }, [hydrate]);
+
+  // Hydrate the tab store from SQLite on launch. The store reads the
+  // persisted profiles/spaces/tabs, paints the sidebar, then replays
+  // `create_tab` per row so each Tauri webview reattaches to its
+  // server-held identity (tmux window / agent session).
+  useEffect(() => {
+    const persistence = new SqlPersistence();
+    useTabStore.getState().hydrate(persistence).catch((e) => {
+      console.error("tabStore hydrate failed", e);
+    });
+  }, []);
 
   // Terminal/chat webviews emit `sanctel://open-url` when a user clicks a URL
   // detected by xterm's web-links addon. Route it through the same `newTab`
