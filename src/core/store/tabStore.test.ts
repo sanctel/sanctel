@@ -220,6 +220,77 @@ describe("tabStore mutations persist", () => {
     expect(snap.tabs[0].windowName).toBe("term-1");
   });
 
+  it("newChatTab with a prior agentSessionId persists initialCommand = claude --resume <id>", async () => {
+    const persistence = new InMemoryPersistence();
+    invokeMock.mockImplementation((cmd) => {
+      if (cmd === "terminal_list_window_names") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    await useStore.getState().newChatTab("sanctel-main", "abc-123");
+
+    const snap = await persistence.loadAll();
+    expect(snap.tabs).toHaveLength(1);
+    expect(snap.tabs[0]).toMatchObject({
+      kind: "chat",
+      worktreeId: "sanctel-main",
+      windowName: "term-1",
+      initialCommand: "claude --resume abc-123",
+      agentSessionId: "abc-123",
+    });
+
+    // create_tab carries the same identity so a fresh-window create runs
+    // the resume command (and a reattach skips it — that's Rust's job).
+    const createTabCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "create_tab",
+    );
+    expect(createTabCall?.[1].req).toMatchObject({
+      kind: "chat",
+      worktreeId: "sanctel-main",
+      windowName: "term-1",
+      initialCommand: "claude --resume abc-123",
+      agentSessionId: "abc-123",
+    });
+  });
+
+  it("newChatTab with no prior session persists plain claude (no --resume)", async () => {
+    const persistence = new InMemoryPersistence();
+    invokeMock.mockImplementation((cmd) => {
+      if (cmd === "terminal_list_window_names") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    await useStore.getState().newChatTab("sanctel-main", null);
+
+    const snap = await persistence.loadAll();
+    expect(snap.tabs[0]).toMatchObject({
+      kind: "chat",
+      initialCommand: "claude",
+      agentSessionId: null,
+    });
+  });
+
+  it("newChatTab throws tmux-missing when the probe says tmux is unavailable", async () => {
+    useTmuxStatus.setState({
+      status: { available: false, version: null, error: "missing" },
+      loaded: true,
+    });
+
+    const persistence = new InMemoryPersistence();
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    await expect(
+      useStore.getState().newChatTab("sanctel-main", null),
+    ).rejects.toThrow(/tmux-missing/);
+  });
+
   it("closeTab removes the row", async () => {
     const persistence = new InMemoryPersistence();
     const useStore = createTabStore();

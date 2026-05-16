@@ -37,6 +37,10 @@ interface TabState {
   switchSpace: (id: string) => void;
   newTab: (kind: TabKind, url: string) => Promise<Tab>;
   newTerminalTab: (worktreeId: Worktree["id"] | null) => Promise<Tab>;
+  newChatTab: (
+    worktreeId: Worktree["id"],
+    agentSessionId: string | null,
+  ) => Promise<Tab>;
   closeTab: (id: string) => Promise<void>;
   renameTab: (id: string, title: string) => Promise<void>;
   activateTab: (id: string) => Promise<void>;
@@ -352,6 +356,82 @@ export function createTabStore(): TabStoreHook {
           worktreeId: worktree?.id ?? null,
           worktreePath: worktree?.path ?? null,
           windowName,
+        },
+      });
+
+      set((s) => ({
+        tabs: [...s.tabs, tab],
+        spaces: s.spaces.map((sp) =>
+          sp.id === space.id ? { ...sp, activeTabId: id } : sp,
+        ),
+      }));
+
+      return tab;
+    },
+
+    newChatTab: async (worktreeId, agentSessionId) => {
+      const space = get().activeSpace();
+      if (!space) throw new Error("no active space");
+      const profileId = space.profileId;
+
+      // Same tmux gate as newTerminalTab / newTab — the sidebar already hides
+      // the buttons when tmux is missing; this is the second line of defence.
+      const status = useTmuxStatus.getState().status;
+      if (!status.available) {
+        throw new Error(
+          "tmux-missing: cannot create chat tab without tmux",
+        );
+      }
+
+      const worktree = findWorktree(worktreeId);
+      if (!worktree) throw new Error(`unknown worktreeId: ${worktreeId}`);
+
+      const existing = await invoke<string[]>("terminal_list_window_names", {
+        req: { worktreeId, profileId },
+      });
+      const windowName = allocateWindowName(existing);
+
+      // Slice 6 / issue #7: a prior session means we resume; otherwise plain
+      // `claude` creates a fresh transcript on first message. Either way the
+      // command only fires on fresh tmux-window creation (Rust's job);
+      // reattach after a sanctel restart never re-runs it.
+      const initialCommand = agentSessionId
+        ? `claude --resume ${agentSessionId}`
+        : "claude";
+
+      const id = crypto.randomUUID();
+      const title = `${worktree.branch} · chat`;
+      const tab: Tab = {
+        id,
+        kind: "chat",
+        title,
+        url: "local://chat",
+        spaceId: space.id,
+        worktreeId: worktree.id,
+        windowName,
+        initialCommand,
+        agentSessionId: agentSessionId ?? undefined,
+        loading: false,
+      };
+
+      if (persistence) {
+        const sortOrder = get().tabs.filter(
+          (t) => t.spaceId === space.id,
+        ).length;
+        await persistence.saveTab(tabToRow(tab, sortOrder));
+      }
+
+      await invoke("create_tab", {
+        req: {
+          id: tab.id,
+          kind: tab.kind,
+          url: tab.url,
+          profileId,
+          worktreeId: worktree.id,
+          worktreePath: worktree.path,
+          windowName,
+          initialCommand,
+          agentSessionId: agentSessionId ?? null,
         },
       });
 
