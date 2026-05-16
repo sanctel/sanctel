@@ -29,17 +29,13 @@ USER ${AGENT_UID}:${AGENT_GID}
 # Install Claude Code CLI
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Install bun (handy general-purpose TS/JS runtime; used for ad-hoc scripts
-# and any tools that prefer bun over npm).
-RUN curl -fsSL https://bun.sh/install | bash
-
 # Install Rust toolchain (Sanctel's Tauri backend; required by `cargo check`,
 # `cargo clippy`, `cargo test` in the implement/review/merge feedback loops).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
   && ~/.cargo/bin/rustup component add clippy rustfmt
 
-# Add Claude, bun, and cargo to PATH
-ENV PATH="/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:$PATH"
+# Add Claude and cargo to PATH
+ENV PATH="/home/agent/.local/bin:/home/agent/.cargo/bin:$PATH"
 
 # Tauri's Linux build deps (only needed if you actually build/run the desktop
 # app in this container; the implement/review/merge agents mostly do
