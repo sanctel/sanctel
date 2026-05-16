@@ -15,28 +15,51 @@
 //     frontend computes profile_id via `space.profileId` and sends it.
 // ───────────────────────────────────────────────────────────────────────────
 
+mod terminal_runtime;
+mod tmux_cli;
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
+
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::collections::HashMap;
-use tauri::{LogicalPosition, LogicalSize, Manager, WebviewUrl};
+use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
+use tauri::{LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
+
+use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
+use crate::tmux_cli::TmuxCli;
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct AppState {
-    // tab_id → record (profile_id retained for diagnostics / future ops)
+    // tab_id → record (profile_id retained for diagnostics / future ops;
+    // terminal/chat tabs also carry the server-held identity used by the
+    // terminal_attach lookup path).
     tabs: Mutex<HashMap<String, TabRecord>>,
     // The React shell's content rect (x, y, w, h) inside the window.
     // Updated whenever React resizes its content area.
     content_rect: Mutex<Rect>,
     // ID of the tab currently visible (positioned over the content area).
     active_tab: Mutex<Option<String>>,
+    // Per-tab terminal handles (PTY + tmux session/window names). Populated
+    // by terminal_attach, consumed by terminal_write / terminal_resize /
+    // close_tab.
+    terminals: TerminalRegistry,
 }
 
 #[derive(Clone)]
 struct TabRecord {
     profile_id: String,
+    kind: String,
+    // Server-held terminal identity. Slice 2 always populates these from
+    // hardcoded defaults at create_tab time for terminal/chat kinds. Later
+    // slices (worktree-aware, persistence, chat) will flow real values in.
+    worktree_id: Option<String>,
+    window_name: Option<String>,
+    initial_command: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -96,6 +119,12 @@ struct CreateTabReq {
     /// In Arc terms: this is the Profile, NOT the Space. The frontend
     /// computes it via `space.profileId` and sends it directly.
     profile_id: String,
+    /// Terminal/chat tabs carry server-held identity from create_tab time.
+    /// Slice 2 lets the frontend leave these unset and falls back to
+    /// hardcoded defaults; later slices flow real worktree-aware values.
+    worktree_id: Option<String>,
+    window_name: Option<String>,
+    initial_command: Option<String>,
 }
 
 #[tauri::command]
@@ -149,6 +178,10 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
         req.id.clone(),
         TabRecord {
             profile_id: req.profile_id,
+            kind: req.kind,
+            worktree_id: req.worktree_id,
+            window_name: req.window_name,
+            initial_command: req.initial_command,
         },
     );
 
@@ -170,8 +203,23 @@ fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // its memory until the window closes; revisit this when Tauri ships a
     // proper destroy API.
     let _ = hide_webview(&app, &id);
-    app.state::<AppState>().tabs.lock().remove(&id);
-    let mut active = app.state::<AppState>().active_tab.lock();
+
+    // For terminal/chat tabs, ask tmux to kill the window so the shell dies.
+    // tmux automatically destroys the session when its last window closes,
+    // so we don't have to track that ourselves.
+    let state = app.state::<AppState>();
+    let record = state.tabs.lock().get(&id).cloned();
+    if let Some(rec) = record {
+        if rec.kind == "terminal" || rec.kind == "chat" {
+            if let Some(handle) = state.terminals.remove(&id) {
+                let tmux = TmuxCli::default();
+                let _ = tmux.kill_window(&handle.session, &handle.window_name);
+            }
+        }
+    }
+
+    state.tabs.lock().remove(&id);
+    let mut active = state.active_tab.lock();
     if active.as_deref() == Some(&id) {
         *active = None;
     }
@@ -212,6 +260,108 @@ fn set_content_rect(app: tauri::AppHandle, rect: Rect) -> Result<(), String> {
     Ok(())
 }
 
+// ─── terminal commands ────────────────────────────────────────────────────
+//
+// All three commands derive identity (worktree path, window name) from the
+// calling webview's label by looking up the TabRecord stored at create_tab
+// time. The frontend never passes its own tabId — enforced by the IPC shape.
+
+/// Resolve identity for a terminal/chat tab. Slice 2 falls back to hardcoded
+/// defaults ($HOME + "term-1") when create_tab didn't carry per-Worktree
+/// values, so the demo works without a Worktree UI. Later slices remove the
+/// fallback once create_tab always carries real values.
+fn resolve_attach_params(
+    record: &TabRecord,
+    cols: u16,
+    rows: u16,
+) -> Result<AttachParams, String> {
+    let window_name = record
+        .window_name
+        .clone()
+        .unwrap_or_else(|| "term-1".to_string());
+    let worktree_path = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+
+    let session = match &record.worktree_id {
+        Some(id) => format!("sanctel-wt:{id}"),
+        None => format!("sanctel-detached:{}", record.profile_id),
+    };
+
+    Ok(AttachParams {
+        session,
+        window_name,
+        worktree_path,
+        initial_command: record.initial_command.clone(),
+        cols,
+        rows,
+    })
+}
+
+#[tauri::command]
+fn terminal_attach<R: Runtime>(
+    webview: Webview<R>,
+    cols: u16,
+    rows: u16,
+    on_output: Channel<Vec<u8>>,
+) -> Result<(), String> {
+    let app = webview.app_handle();
+    let label = webview.label().to_string();
+    let record = app
+        .state::<AppState>()
+        .tabs
+        .lock()
+        .get(&label)
+        .cloned()
+        .ok_or_else(|| format!("no TabRecord for webview '{label}'"))?;
+
+    if record.kind != "terminal" && record.kind != "chat" {
+        return Err(format!(
+            "terminal_attach called on non-terminal tab '{label}' (kind={})",
+            record.kind
+        ));
+    }
+
+    let params = resolve_attach_params(&record, cols, rows)?;
+    let tmux = TmuxCli::default();
+    let handle = attach_tab_to_tmux(&tmux, params, on_output).map_err(|e| e.to_string())?;
+    app.state::<AppState>().terminals.insert(label, Arc::new(handle));
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(), String> {
+    let app = webview.app_handle();
+    let handle = app
+        .state::<AppState>()
+        .terminals
+        .get(webview.label())
+        .ok_or_else(|| "terminal not attached".to_string())?;
+    handle.writer.lock().write_all(&bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn terminal_resize<R: Runtime>(
+    webview: Webview<R>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let app = webview.app_handle();
+    let handle = app
+        .state::<AppState>()
+        .terminals
+        .get(webview.label())
+        .ok_or_else(|| "terminal not attached".to_string())?;
+    handle
+        .master
+        .lock()
+        .resize(portable_pty::PtySize {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
+}
+
 // ─── entry ────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -224,6 +374,9 @@ pub fn run() {
             show_tab,
             hide_all,
             set_content_rect,
+            terminal_attach,
+            terminal_write,
+            terminal_resize,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
