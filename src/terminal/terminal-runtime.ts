@@ -15,11 +15,16 @@
 // The webview's label IS the tabId.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { parseAttachError } from "./attach-error";
+
+export { parseAttachError } from "./attach-error";
+export type { ParsedAttachError } from "./attach-error";
 
 import { type ClipboardApi, installClipboard } from "./clipboard";
 
@@ -123,10 +128,18 @@ export function mount(
     rows: term.rows,
     onOutput,
   }).catch((e) => {
-    // Surface attach failures (e.g., tmux missing, worktree gone) inline.
-    // Slice 6 turns this into a proper broken-tab UI; Slice 2 just writes
-    // the error into the terminal so the demo still tells you what failed.
-    term.write(`\r\n\x1b[31mterminal_attach failed: ${e}\x1b[0m\r\n`);
+    const parsed = parseAttachError(e);
+    if (parsed.kind === "worktree-missing") {
+      renderBrokenTab(container, parsed.path);
+      onDataDisposable.dispose();
+      term.dispose();
+      return;
+    }
+    // Other failures (tmux missing, spawn errors) — render inline in the
+    // terminal so the user sees what went wrong. tmux-missing should not
+    // reach here in practice because React gates create_tab on the startup
+    // probe, but defensive surfacing is cheap.
+    term.write(`\r\n\x1b[31mterminal_attach failed: ${parsed.message}\x1b[0m\r\n`);
   });
 
   return {
@@ -138,4 +151,102 @@ export function mount(
       term.dispose();
     },
   };
+}
+
+// Inline broken-tab panel for the worktree-missing case. Replaces the xterm
+// canvas inside the container, leaves the sidebar entry untouched. "Recreate
+// from main" is a v0.3.x follow-up — for now the button is wired to a no-op
+// handler so the UI is complete and the click target is real. "Remove this
+// tab" invokes close_tab and lets React clean up the row.
+function renderBrokenTab(container: HTMLElement, path: string): void {
+  // Wipe xterm's DOM. The Terminal.dispose() call from the caller releases
+  // the addon/renderer; this just clears the visual residue.
+  container.innerHTML = "";
+  const panel = document.createElement("div");
+  panel.className = "broken-tab";
+  panel.setAttribute("role", "alert");
+  panel.style.cssText = [
+    "position: absolute",
+    "inset: 0",
+    "display: flex",
+    "flex-direction: column",
+    "align-items: center",
+    "justify-content: center",
+    "gap: 12px",
+    "padding: 24px",
+    "color: #e4e4e7",
+    "background: #0e0e10",
+    "font-family: ui-sans-serif, system-ui, sans-serif",
+    "text-align: center",
+  ].join(";");
+
+  const heading = document.createElement("div");
+  heading.style.cssText = "font-size: 15px; font-weight: 600; color: #fca5a5;";
+  heading.textContent = "Worktree no longer exists";
+
+  const detail = document.createElement("div");
+  detail.style.cssText = "font-size: 13px; color: #a1a1aa; max-width: 480px;";
+  detail.textContent = path;
+
+  const buttons = document.createElement("div");
+  buttons.style.cssText = "display: flex; gap: 8px;";
+
+  const recreate = document.createElement("button");
+  recreate.type = "button";
+  recreate.className = "recreate";
+  recreate.textContent = "Recreate from main";
+  recreate.style.cssText = buttonCss();
+  // Recreate-from-main needs a Worktree manager (planned v0.3.x). Until
+  // then the button is wired but no-ops with a tooltip rather than silently
+  // doing nothing.
+  recreate.title = "Worktree recreation lands in the Worktree manager";
+  recreate.addEventListener("click", () => {
+    recreate.disabled = true;
+    recreate.textContent = "Not yet available";
+  });
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "remove";
+  remove.textContent = "Remove this tab";
+  remove.style.cssText = buttonCss();
+  remove.addEventListener("click", () => {
+    // close_tab takes the webview label as id; the webview's label IS the
+    // tabId by construction (see src-tauri/src/lib.rs `create_tab`).
+    const id = labelFromWebview();
+    if (id) {
+      invoke("close_tab", { id }).catch((err) =>
+        console.error("close_tab failed", err),
+      );
+    }
+  });
+
+  buttons.append(recreate, remove);
+  panel.append(heading, detail, buttons);
+  container.append(panel);
+}
+
+function buttonCss(): string {
+  return [
+    "padding: 6px 12px",
+    "background: #27272a",
+    "color: #e4e4e7",
+    "border: 1px solid #3f3f46",
+    "border-radius: 4px",
+    "font-size: 13px",
+    "cursor: pointer",
+  ].join(";");
+}
+
+// The webview's label IS the tabId by construction (see
+// src-tauri/src/lib.rs `create_tab`). Tauri 2 exposes it via
+// getCurrentWebview().label. Returns null if Tauri isn't reachable (e.g.,
+// running under Vitest), which lets unit tests render the broken-tab UI
+// without invoking close_tab.
+function labelFromWebview(): string | null {
+  try {
+    return getCurrentWebview().label;
+  } catch {
+    return null;
+  }
 }

@@ -281,7 +281,7 @@ impl<R: CommandRunner> TmuxCli<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// Scripted runner: each `run` call shifts the front of an expectation
     /// queue and returns its canned output. Records the args it saw.
@@ -541,5 +541,137 @@ mod tests {
         }]);
         let cli = TmuxCli::new("s", mock);
         cli.kill_window("sess", "term-1").unwrap();
+    }
+
+    /// A runner that models a tiny piece of "real tmux": a shared set of
+    /// existing session names. has-session reads it; new-session writes it
+    /// atomically (compare-and-set) and returns the duplicate-session
+    /// stderr if the name was already there. Lets us write thread-based
+    /// concurrency tests without spawning real tmux.
+    struct StateRunner {
+        sessions: Arc<Mutex<std::collections::HashSet<String>>>,
+        new_session_wins: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StateRunner {
+        fn new() -> Self {
+            StateRunner {
+                sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                new_session_wins: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+        fn clone_shared(&self) -> Self {
+            StateRunner {
+                sessions: Arc::clone(&self.sessions),
+                new_session_wins: Arc::clone(&self.new_session_wins),
+            }
+        }
+    }
+
+    impl CommandRunner for StateRunner {
+        fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            let sub = args
+                .iter()
+                .find(|a| {
+                    matches!(
+                        **a,
+                        "has-session" | "new-session" | "list-windows" | "kill-window"
+                    )
+                })
+                .copied()
+                .unwrap_or("");
+
+            match sub {
+                "has-session" => {
+                    // Find the target after -t, strip leading "=".
+                    let target: String = args
+                        .iter()
+                        .position(|a| *a == "-t")
+                        .and_then(|i| args.get(i + 1))
+                        .map(|s| s.trim_start_matches('=').to_string())
+                        .unwrap_or_default();
+                    let exists = self.sessions.lock().unwrap().contains(&target);
+                    Ok(CommandOutput {
+                        status: if exists { 0 } else { 1 },
+                        stdout: vec![],
+                        stderr: if exists {
+                            vec![]
+                        } else {
+                            b"can't find session".to_vec()
+                        },
+                    })
+                }
+                "new-session" => {
+                    let name: String = args
+                        .iter()
+                        .position(|a| *a == "-s")
+                        .and_then(|i| args.get(i + 1))
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    // Compare-and-set: only the first inserter wins.
+                    let inserted = self.sessions.lock().unwrap().insert(name.clone());
+                    if inserted {
+                        self.new_session_wins
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(CommandOutput {
+                            status: 0,
+                            stdout: vec![],
+                            stderr: vec![],
+                        })
+                    } else {
+                        Ok(CommandOutput {
+                            status: 1,
+                            stdout: vec![],
+                            stderr: format!("duplicate session: {name}").into_bytes(),
+                        })
+                    }
+                }
+                _ => Ok(CommandOutput {
+                    status: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                }),
+            }
+        }
+    }
+
+    /// Multiple threads calling ensure_session for the same session must all
+    /// succeed, and exactly one `new-session` call must "win" (compare-and-set
+    /// at the simulated tmux layer). Models the real race the issue calls out:
+    /// "multiple tabs in the same Worktree call terminal_attach simultaneously".
+    #[test]
+    fn ensure_session_is_concurrent_safe_under_real_race() {
+        let shared = StateRunner::new();
+        let session = "sanctel-wt:race-test";
+        let cwd = "/tmp";
+        const THREADS: usize = 16;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let runner = shared.clone_shared();
+                let session = session.to_string();
+                let cwd = cwd.to_string();
+                std::thread::spawn(move || {
+                    let cli = TmuxCli::new("s", runner);
+                    cli.ensure_session(&session, &cwd)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().expect("ensure_session must succeed");
+        }
+
+        // Exactly one new-session call wins; the rest see "duplicate session"
+        // and recover via the has-session re-check inside ensure_session.
+        assert_eq!(
+            shared
+                .new_session_wins
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one thread should win new-session"
+        );
+        // The session must end up created.
+        assert!(shared.sessions.lock().unwrap().contains(session));
     }
 }

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -23,6 +24,37 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use tauri::ipc::Channel;
 
 use crate::tmux_cli::{TmuxCli, TmuxError};
+
+// ─── attach errors ────────────────────────────────────────────────────────
+
+/// Errors surfaced from `attach_tab_to_tmux`. The string form is what the
+/// frontend pattern-matches on for the broken-tab UI (see
+/// docs/design/terminal-runtime.md §"Broken-tab UX").
+#[derive(Debug)]
+pub enum AttachError {
+    /// The worktree path stored on the TabRecord does not exist on disk.
+    /// Frontend renders the inline "worktree-missing" panel.
+    WorktreeMissing(String),
+    /// Anything else — tmux invocation failed, spawn failed, etc.
+    Other(String),
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The exact "worktree-missing:" prefix is the wire contract the
+            // frontend matches on. Keep it stable.
+            AttachError::WorktreeMissing(path) => write!(f, "worktree-missing: {path}"),
+            AttachError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl From<TmuxError> for AttachError {
+    fn from(e: TmuxError) -> Self {
+        AttachError::Other(e.to_string())
+    }
+}
 
 // ─── per-tab handle and store ─────────────────────────────────────────────
 
@@ -71,6 +103,17 @@ pub struct AttachParams {
     pub rows: u16,
 }
 
+/// Worktree-existence preflight, extracted so it's unit-testable without
+/// constructing a Tauri Channel. Called first by `attach_tab_to_tmux` so
+/// the broken-tab UI path runs even when tmux is unreachable.
+pub fn check_worktree_exists(worktree_path: &str) -> Result<(), AttachError> {
+    if Path::new(worktree_path).is_dir() {
+        Ok(())
+    } else {
+        Err(AttachError::WorktreeMissing(worktree_path.to_string()))
+    }
+}
+
 /// Ensure (session, window) exist in tmux, then spawn a portable-pty client
 /// that runs `tmux attach-session -t <session> \; select-window -t :<window>`.
 /// Reads from the PTY in a background thread and pushes raw bytes into
@@ -80,7 +123,13 @@ pub fn attach_tab_to_tmux(
     tmux: &TmuxCli,
     params: AttachParams,
     on_output: Channel<Vec<u8>>,
-) -> Result<TerminalHandle, TmuxError> {
+) -> Result<TerminalHandle, AttachError> {
+    // 0. The Worktree directory may have been deleted between sanctel
+    //    sessions. We surface this as a structured error so the frontend can
+    //    render the broken-tab UI (recreate / remove) instead of letting tmux
+    //    fail downstream with an opaque "-c <cwd> not found".
+    check_worktree_exists(&params.worktree_path)?;
+
     // 1. Ensure the tmux session exists (with race retry).
     tmux.ensure_session(&params.session, &params.worktree_path)?;
 
@@ -105,10 +154,7 @@ pub fn attach_tab_to_tmux(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| TmuxError::Command {
-            command: "openpty".into(),
-            stderr: e.to_string(),
-        })?;
+        .map_err(|e| AttachError::Other(format!("openpty: {e}")))?;
 
     let mut cmd = CommandBuilder::new("tmux");
     cmd.args([
@@ -129,26 +175,20 @@ pub fn attach_tab_to_tmux(
     let _child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|e| TmuxError::Command {
-            command: "spawn tmux attach".into(),
-            stderr: e.to_string(),
-        })?;
+        .map_err(|e| AttachError::Other(format!("spawn tmux attach: {e}")))?;
 
     // The slave side is owned by the child once spawned; drop our handle so
     // EOF on the master propagates correctly when the child exits.
     drop(pair.slave);
 
-    let writer = pair.master.take_writer().map_err(|e| TmuxError::Command {
-        command: "take_writer".into(),
-        stderr: e.to_string(),
-    })?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| AttachError::Other(format!("take_writer: {e}")))?;
     let reader = pair
         .master
         .try_clone_reader()
-        .map_err(|e| TmuxError::Command {
-            command: "try_clone_reader".into(),
-            stderr: e.to_string(),
-        })?;
+        .map_err(|e| AttachError::Other(format!("try_clone_reader: {e}")))?;
 
     // Forward bytes from the PTY to the channel. Raw bytes only — no UTF-8
     // transcoding on the data path (design invariant).
@@ -197,6 +237,38 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// AttachError must format its WorktreeMissing variant with the
+    /// `worktree-missing:` prefix — the frontend matches on this string to
+    /// route the broken-tab UI. Keep the wire shape stable.
+    #[test]
+    fn attach_error_worktree_missing_serializes_with_prefix() {
+        let e = AttachError::WorktreeMissing("/gone".into());
+        assert!(
+            e.to_string().starts_with("worktree-missing:"),
+            "got: {e}"
+        );
+    }
+
+    /// The worktree preflight (used by attach_tab_to_tmux's first step) must
+    /// return WorktreeMissing for a path that doesn't exist on disk, so the
+    /// broken-tab UI fires even when tmux is unreachable.
+    #[test]
+    fn check_worktree_exists_flags_missing_path() {
+        match check_worktree_exists("/this/path/should/not/exist/sanctel-test") {
+            Err(AttachError::WorktreeMissing(p)) => {
+                assert!(p.contains("sanctel-test"), "path: {p}")
+            }
+            other => panic!("expected WorktreeMissing, got: {other:?}"),
+        }
+    }
+
+    /// And succeeds for any path that does exist; HOME is always present.
+    #[test]
+    fn check_worktree_exists_accepts_extant_path() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        check_worktree_exists(&home).expect("HOME exists");
     }
 
     /// Real-tmux integration test for the idempotent attach algorithm.
