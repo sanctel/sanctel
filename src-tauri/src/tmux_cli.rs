@@ -281,7 +281,7 @@ impl<R: CommandRunner> TmuxCli<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// Scripted runner: each `run` call shifts the front of an expectation
     /// queue and returns its canned output. Records the args it saw.
@@ -549,25 +549,20 @@ mod tests {
     /// stderr if the name was already there. Lets us write thread-based
     /// concurrency tests without spawning real tmux.
     struct StateRunner {
-        sessions: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-        new_session_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        sessions: Arc<Mutex<std::collections::HashSet<String>>>,
         new_session_wins: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StateRunner {
         fn new() -> Self {
             StateRunner {
-                sessions: Arc::new(std::sync::Mutex::new(
-                    std::collections::HashSet::new(),
-                )),
-                new_session_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 new_session_wins: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
         fn clone_shared(&self) -> Self {
             StateRunner {
                 sessions: Arc::clone(&self.sessions),
-                new_session_attempts: Arc::clone(&self.new_session_attempts),
                 new_session_wins: Arc::clone(&self.new_session_wins),
             }
         }
@@ -575,18 +570,13 @@ mod tests {
 
     impl CommandRunner for StateRunner {
         fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
-            // Find the subcommand (first arg after the -L/-f prefix block).
             let sub = args
                 .iter()
-                .position(|a| !a.starts_with('-') && *a != "/dev/null")
-                .and_then(|i| {
-                    // Skip socket name and `/dev/null` config arg.
-                    args.iter().skip(i).find(|a| {
-                        matches!(
-                            **a,
-                            "has-session" | "new-session" | "list-windows" | "kill-window"
-                        )
-                    })
+                .find(|a| {
+                    matches!(
+                        **a,
+                        "has-session" | "new-session" | "list-windows" | "kill-window"
+                    )
                 })
                 .copied()
                 .unwrap_or("");
@@ -612,8 +602,6 @@ mod tests {
                     })
                 }
                 "new-session" => {
-                    self.new_session_attempts
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let name: String = args
                         .iter()
                         .position(|a| *a == "-s")
@@ -646,8 +634,6 @@ mod tests {
             }
         }
     }
-
-    use std::sync::Arc;
 
     /// Multiple threads calling ensure_session for the same session must all
     /// succeed, and exactly one `new-session` call must "win" (compare-and-set

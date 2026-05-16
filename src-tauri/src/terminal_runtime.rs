@@ -103,11 +103,6 @@ pub struct AttachParams {
     pub rows: u16,
 }
 
-/// Ensure (session, window) exist in tmux, then spawn a portable-pty client
-/// that runs `tmux attach-session -t <session> \; select-window -t :<window>`.
-/// Reads from the PTY in a background thread and pushes raw bytes into
-/// `on_output`. Returns the handle holding the master/writer so subsequent
-/// terminal_write / terminal_resize / close_tab calls can drive it.
 /// Worktree-existence preflight, extracted so it's unit-testable without
 /// constructing a Tauri Channel. Called first by `attach_tab_to_tmux` so
 /// the broken-tab UI path runs even when tmux is unreachable.
@@ -119,6 +114,11 @@ pub fn check_worktree_exists(worktree_path: &str) -> Result<(), AttachError> {
     }
 }
 
+/// Ensure (session, window) exist in tmux, then spawn a portable-pty client
+/// that runs `tmux attach-session -t <session> \; select-window -t :<window>`.
+/// Reads from the PTY in a background thread and pushes raw bytes into
+/// `on_output`. Returns the handle holding the master/writer so subsequent
+/// terminal_write / terminal_resize / close_tab calls can drive it.
 pub fn attach_tab_to_tmux(
     tmux: &TmuxCli,
     params: AttachParams,

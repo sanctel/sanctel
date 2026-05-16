@@ -1,9 +1,9 @@
 import { useTmuxStatus } from "../store/tmuxStatusStore";
 
-/// Shown when the Rust-side `tmux -V` startup probe could not find a usable
-/// tmux. Issue #8: replaces tab-by-tab failures with one clear setup screen
-/// at app launch. React stays in this state until the user installs tmux
-/// and restarts sanctel — the probe runs once per app launch.
+// Shown when the Rust-side `tmux -V` startup probe could not find a usable
+// tmux. Issue #8: replaces tab-by-tab failures with one clear setup screen
+// at app launch. React stays in this state until the user installs tmux
+// and restarts sanctel — the probe runs once per app launch.
 export default function TmuxSetupScreen() {
   const error = useTmuxStatus((s) => s.status.error);
 

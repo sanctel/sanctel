@@ -110,11 +110,11 @@ export function mount(
   };
 }
 
-/// Inline broken-tab panel for the worktree-missing case. Replaces the
-/// xterm canvas inside the container, leaves the sidebar entry untouched.
-/// "Recreate from main" is a v0.3.x follow-up — for now the button is wired
-/// to a no-op handler so the UI is complete and the click target is real.
-/// "Remove this tab" invokes close_tab and lets React clean up the row.
+// Inline broken-tab panel for the worktree-missing case. Replaces the xterm
+// canvas inside the container, leaves the sidebar entry untouched. "Recreate
+// from main" is a v0.3.x follow-up — for now the button is wired to a no-op
+// handler so the UI is complete and the click target is real. "Remove this
+// tab" invokes close_tab and lets React clean up the row.
 function renderBrokenTab(container: HTMLElement, path: string): void {
   // Wipe xterm's DOM. The Terminal.dispose() call from the caller releases
   // the addon/renderer; this just clears the visual residue.
@@ -195,11 +195,11 @@ function buttonCss(): string {
   ].join(";");
 }
 
-/// The webview's label IS the tabId by construction (see
-/// src-tauri/src/lib.rs `create_tab`). Tauri 2 exposes it via
-/// getCurrentWebview().label. Returns null if Tauri isn't reachable (e.g.,
-/// running under Vitest), which lets unit tests render the broken-tab UI
-/// without invoking close_tab.
+// The webview's label IS the tabId by construction (see
+// src-tauri/src/lib.rs `create_tab`). Tauri 2 exposes it via
+// getCurrentWebview().label. Returns null if Tauri isn't reachable (e.g.,
+// running under Vitest), which lets unit tests render the broken-tab UI
+// without invoking close_tab.
 function labelFromWebview(): string | null {
   try {
     return getCurrentWebview().label;
