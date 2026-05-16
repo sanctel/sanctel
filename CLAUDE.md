@@ -142,6 +142,10 @@ ADRs; violations are blockers.
   [ADR-0008](./docs/adr/0008-tuicommander-style-plugin-system.md). New
   plugin APIs MUST declare a capability tier (1/2/3/4). Tier 3/4
   operations require manifest-declared capabilities, enforced in Rust.
+- **tmux session/window mapping** —
+  [ADR-0012](./docs/adr/0012-tmux-session-per-worktree-window-per-tab.md).
+  One tmux session per Worktree (`sanctel-wt:<worktreeId>`), one window
+  per Tab. Sanctel runs on a dedicated tmux server (`-L sanctel`).
 
 ## When you add something new
 

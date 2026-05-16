@@ -40,7 +40,7 @@ code for it gets a directory. Until then, the design lives in
 | Context | Status | Glossary | Design |
 |---|---|---|---|
 | Plugin runtime | planned v0.5 | _(lazy — `src/plugin/CONTEXT.md` and `src-tauri/src/plugin/CONTEXT.md`)_ | [docs/design/plugin-system.md](./docs/design/plugin-system.md) |
-| Terminal runtime | planned v0.3 | _(lazy)_ | — |
+| Terminal runtime | planned v0.3 | _(lazy)_ | [docs/design/terminal-runtime.md](./docs/design/terminal-runtime.md) |
 | File editor | planned v0.4 | _(lazy)_ | [docs/design/file-editor.md](./docs/design/file-editor.md) |
 | Agent runtime | planned v0.3 | _(lazy)_ | — |
 | Agent ↔ browser control | planned v0.6 | _(lazy)_ | [docs/design/agent-browser-control.md](./docs/design/agent-browser-control.md) |
