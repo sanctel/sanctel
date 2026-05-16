@@ -54,12 +54,17 @@ struct AppState {
 struct TabRecord {
     profile_id: String,
     kind: String,
-    // Server-held terminal identity. Slice 2 always populates these from
-    // hardcoded defaults at create_tab time for terminal/chat kinds. Later
-    // slices (worktree-aware, persistence, chat) will flow real values in.
+    // Server-held terminal identity. Populated at create_tab time for
+    // terminal/chat kinds (Slice 4 — worktree-aware). `worktree_id` keys
+    // the tmux session per ADR-0012; `worktree_path` is the cwd passed
+    // to `-c` so the shell starts in the right directory.
     worktree_id: Option<String>,
+    worktree_path: Option<String>,
     window_name: Option<String>,
     initial_command: Option<String>,
+    /// Forward-compat slot for chat tabs (Slice 6): the AgentSession id used
+    /// by `claude --resume`. Stored on the record but not yet consumed.
+    agent_session_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -120,11 +125,27 @@ struct CreateTabReq {
     /// computes it via `space.profileId` and sends it directly.
     profile_id: String,
     /// Terminal/chat tabs carry server-held identity from create_tab time.
-    /// Slice 2 lets the frontend leave these unset and falls back to
-    /// hardcoded defaults; later slices flow real worktree-aware values.
+    /// `worktreeId` keys the tmux session (`sanctel-wt:<id>` per ADR-0012);
+    /// `worktreePath` is the cwd passed to `tmux -c` so the shell starts in
+    /// the right directory. Both are None for detached terminal tabs.
     worktree_id: Option<String>,
+    worktree_path: Option<String>,
     window_name: Option<String>,
     initial_command: Option<String>,
+    /// Forward-compat slot for chat tabs (Slice 6). Stored on the TabRecord
+    /// but not consumed in this slice — Slice 6's chat-tab flow turns it
+    /// into `initial_command = "claude --resume <agentSessionId>"`.
+    agent_session_id: Option<String>,
+}
+
+/// Inputs for `terminal_list_window_names`. Frontend gives us either a
+/// worktreeId (the normal case) or a profileId (detached fallback); Rust
+/// owns the session-name mapping so the convention stays in one place.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListWindowNamesReq {
+    worktree_id: Option<String>,
+    profile_id: String,
 }
 
 #[tauri::command]
@@ -180,8 +201,10 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
             profile_id: req.profile_id,
             kind: req.kind,
             worktree_id: req.worktree_id,
+            worktree_path: req.worktree_path,
             window_name: req.window_name,
             initial_command: req.initial_command,
+            agent_session_id: req.agent_session_id,
         },
     );
 
@@ -266,10 +289,12 @@ fn set_content_rect(app: tauri::AppHandle, rect: Rect) -> Result<(), String> {
 // calling webview's label by looking up the TabRecord stored at create_tab
 // time. The frontend never passes its own tabId — enforced by the IPC shape.
 
-/// Resolve identity for a terminal/chat tab. Slice 2 falls back to hardcoded
-/// defaults ($HOME + "term-1") when create_tab didn't carry per-Worktree
-/// values, so the demo works without a Worktree UI. Later slices remove the
-/// fallback once create_tab always carries real values.
+/// Resolve identity for a terminal/chat tab. Worktree-keyed tabs (ADR-0012)
+/// attach to `sanctel-wt:<worktreeId>` with the Worktree's path as cwd;
+/// worktree-less tabs attach to `sanctel-detached:<profileId>` and start in
+/// `$HOME`. Window name is allocated by the frontend at create_tab time and
+/// stored on the TabRecord — falling back to "term-1" only when the
+/// frontend omitted it (legacy demo path).
 fn resolve_attach_params(
     record: &TabRecord,
     cols: u16,
@@ -279,11 +304,18 @@ fn resolve_attach_params(
         .window_name
         .clone()
         .unwrap_or_else(|| "term-1".to_string());
-    let worktree_path = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
 
-    let session = match &record.worktree_id {
-        Some(id) => format!("sanctel-wt:{id}"),
-        None => format!("sanctel-detached:{}", record.profile_id),
+    let (session, worktree_path) = match (&record.worktree_id, &record.worktree_path) {
+        (Some(id), Some(path)) => (format!("sanctel-wt:{id}"), path.clone()),
+        (None, _) => {
+            let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+            (format!("sanctel-detached:{}", record.profile_id), home)
+        }
+        (Some(_), None) => {
+            return Err(
+                "worktreeId set without worktreePath — create_tab must carry both".into(),
+            );
+        }
     };
 
     Ok(AttachParams {
@@ -338,6 +370,24 @@ fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(),
     handle.writer.lock().write_all(&bytes).map_err(|e| e.to_string())
 }
 
+/// Return the tmux window names that already exist in the session for the
+/// given worktree (or the detached fallback). Used by the frontend's
+/// `window-name-allocator` to compute the next `term-N` before calling
+/// `create_tab`. Returns an empty list when the session doesn't exist yet
+/// (first tab into a worktree) so the caller doesn't have to special-case it.
+#[tauri::command]
+fn terminal_list_window_names(req: ListWindowNamesReq) -> Result<Vec<String>, String> {
+    let session = match &req.worktree_id {
+        Some(id) => format!("sanctel-wt:{id}"),
+        None => format!("sanctel-detached:{}", req.profile_id),
+    };
+    let tmux = TmuxCli::default();
+    if !tmux.has_session(&session).map_err(|e| e.to_string())? {
+        return Ok(vec![]);
+    }
+    tmux.list_windows(&session).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn terminal_resize<R: Runtime>(
     webview: Webview<R>,
@@ -362,6 +412,58 @@ fn terminal_resize<R: Runtime>(
         .map_err(|e| e.to_string())
 }
 
+// ─── tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(
+        worktree_id: Option<&str>,
+        worktree_path: Option<&str>,
+        window_name: Option<&str>,
+    ) -> TabRecord {
+        TabRecord {
+            profile_id: "profile-default".into(),
+            kind: "terminal".into(),
+            worktree_id: worktree_id.map(str::to_string),
+            worktree_path: worktree_path.map(str::to_string),
+            window_name: window_name.map(str::to_string),
+            initial_command: None,
+            agent_session_id: None,
+        }
+    }
+
+    #[test]
+    fn worktree_keyed_record_yields_sanctel_wt_session_and_cwd() {
+        let rec = record(Some("sanctel-main"), Some("/home/me/code/sanctel"), Some("term-2"));
+        let p = resolve_attach_params(&rec, 80, 24).unwrap();
+        assert_eq!(p.session, "sanctel-wt:sanctel-main");
+        assert_eq!(p.worktree_path, "/home/me/code/sanctel");
+        assert_eq!(p.window_name, "term-2");
+    }
+
+    #[test]
+    fn detached_record_yields_detached_session_and_home_cwd() {
+        let rec = record(None, None, Some("term-1"));
+        // $HOME is reliably set in dev/CI environments; if not, the test
+        // documents the contract by erroring out — `resolve_attach_params`
+        // would surface the same error to the user.
+        let p = resolve_attach_params(&rec, 80, 24).unwrap();
+        assert_eq!(p.session, "sanctel-detached:profile-default");
+        assert_eq!(p.worktree_path, std::env::var("HOME").unwrap());
+    }
+
+    #[test]
+    fn worktree_id_without_path_is_an_error() {
+        let rec = record(Some("sanctel-main"), None, Some("term-1"));
+        match resolve_attach_params(&rec, 80, 24) {
+            Err(msg) => assert!(msg.contains("worktreeId"), "got: {msg}"),
+            Ok(_) => panic!("expected an error when worktreeId is set without worktreePath"),
+        }
+    }
+}
+
 // ─── entry ────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -377,6 +479,7 @@ pub fn run() {
             terminal_attach,
             terminal_write,
             terminal_resize,
+            terminal_list_window_names,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
