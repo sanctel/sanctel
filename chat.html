@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Chat</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0e0e10; color: #e4e4e7; font-family: ui-sans-serif, system-ui, sans-serif; }
+      header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid #27272a; }
+      header .title { font-weight: 600; }
+      header .agent { color: #71717a; font-size: 12px; }
+      header .stop { margin-left: auto; }
+      #term { position: absolute; top: 41px; left: 0; right: 0; bottom: 0; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="title">Chat</span>
+      <span class="agent">claude</span>
+      <button class="stop" type="button">Stop</button>
+    </header>
+    <div id="term"></div>
+    <script type="module">
+      import { mount } from "/src/terminal/terminal-runtime.ts";
+      mount(document.getElementById("term"));
+    </script>
+  </body>
+</html>
