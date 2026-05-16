@@ -583,6 +583,11 @@ fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Issue #6 / Slice 5: SQLite persistence lives entirely in the
+        // frontend (sql.js + this fs plugin reading/writing the .db file).
+        // Rust never imports a SQLite library or reads the .db directly —
+        // every per-Tab fact arrives via `create_tab` arguments.
+        .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
         .setup(|app| {
             // One-time tmux startup probe (issue #8 / Slice 7). React listens

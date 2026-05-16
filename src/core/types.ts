@@ -85,9 +85,12 @@ export interface Tab {
   // Filesystem attachment. Independent of spaceId — a Space can hold tabs
   // for many worktrees; a worktree can have tabs in many Spaces.
   worktreeId?: Worktree["id"];
-  // For terminal/chat: handle to a backend session (tmux session name,
-  // agent run ID). Reconstructable from worktreeId + tab kind in many cases.
-  sessionId?: string;
+  // Server-held identity for terminal/chat tabs. Persisted across launches
+  // so the broken-tab/recreate flow can replay create_tab with the same
+  // tmux window and agent transcript.
+  windowName?: string;          // tmux window inside the Worktree's session
+  initialCommand?: string;      // first-shell command for chat tabs (Slice 6)
+  agentSessionId?: string;      // claude --resume target for chat tabs (Slice 6)
   loading: boolean;
   favicon?: string;
 }
