@@ -281,14 +281,13 @@ impl<R: CommandRunner> TmuxCli<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::sync::Mutex;
 
     /// Scripted runner: each `run` call shifts the front of an expectation
     /// queue and returns its canned output. Records the args it saw.
     struct MockRunner {
-        scripted: Mutex<RefCell<Vec<MockCall>>>,
-        seen: Mutex<RefCell<Vec<Vec<String>>>>,
+        scripted: Mutex<Vec<MockCall>>,
+        seen: Mutex<Vec<Vec<String>>>,
     }
 
     struct MockCall {
@@ -300,13 +299,13 @@ mod tests {
     impl MockRunner {
         fn new(calls: Vec<MockCall>) -> Self {
             MockRunner {
-                scripted: Mutex::new(RefCell::new(calls)),
-                seen: Mutex::new(RefCell::new(Vec::new())),
+                scripted: Mutex::new(calls),
+                seen: Mutex::new(Vec::new()),
             }
         }
 
         fn seen_args(&self) -> Vec<Vec<String>> {
-            self.seen.lock().unwrap().borrow().clone()
+            self.seen.lock().unwrap().clone()
         }
     }
 
@@ -315,14 +314,8 @@ mod tests {
             self.seen
                 .lock()
                 .unwrap()
-                .borrow_mut()
                 .push(args.iter().map(|s| s.to_string()).collect());
-            let next = self
-                .scripted
-                .lock()
-                .unwrap()
-                .borrow_mut()
-                .remove(0);
+            let next = self.scripted.lock().unwrap().remove(0);
             if let Some(expected) = &next.expect_args_contain {
                 for sub in expected {
                     assert!(

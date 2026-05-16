@@ -31,7 +31,7 @@ pub struct TerminalHandle {
     /// The PTY master end — writer side for keystrokes / resizes.
     pub writer: Mutex<Box<dyn Write + Send>>,
     /// Master so we can call `resize()` on it.
-    pub master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    pub master: Mutex<Box<dyn MasterPty + Send>>,
     /// Server-held identity used by terminal_attach lookups.
     pub session: String,
     pub window_name: String,
