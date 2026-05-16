@@ -32,6 +32,8 @@ const defaultUrl = (kind: TabKind): string => {
     case "browser":  return "https://duckduckgo.com";
     case "terminal": return "local://terminal";
     case "chat":     return "local://chat";
+    case "file":     return "local://file";
+    case "diff":     return "local://diff";
   }
 };
 

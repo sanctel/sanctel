@@ -5,6 +5,8 @@ const kindGlyph: Record<TabKind, string> = {
   browser: "○",
   terminal: ">",
   chat: "✱",
+  file: "▤",
+  diff: "±",
 };
 
 export default function Sidebar() {
