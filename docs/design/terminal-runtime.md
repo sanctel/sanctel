@@ -106,10 +106,21 @@ Stable, monotonic per Worktree:
 windowName = "term-N"   where N = 1 + max(existing term-N in this session)
 ```
 
-Read existing names via `tmux list-windows -t sanctel-wt:<wt> -F '#{window_name}'`
-on create. Persist `windowName` in the SQLite Tab record. The name is
-**immutable for the Tab's lifetime** — the Tab's display title is a
+**Allocation is server-side and atomic.** React passes `window_name: "auto"`
+(or omits the field) on `create_tab` for terminal/chat Tabs. Inside
+`create_tab`, Rust takes a per-session mutex, reads existing names via
+`tmux list-windows -t sanctel-wt:<wt> -F '#{window_name}'`, computes the
+next `term-N`, calls `tmux new-window -n <name>`, releases the mutex,
+and returns the resolved name in `CreateTabResp.window_name`. React
+reads the resolved name back and persists it in SQLite. The window name
+is **immutable for the Tab's lifetime** — the Tab's display title is a
 separate field (see Two-layer durability below).
+
+The mutex matters: tmux allows duplicate window names by default, so a
+client-side "read names, compute next, call new-window" sequence races
+when two callers run it in parallel against the same session. The
+per-session mutex is the smallest critical section that closes that
+window.
 
 ### Comparison to references
 
@@ -129,15 +140,30 @@ Three commands and one streaming channel between the terminal webview
 
 Per-tab parameters (`worktreeId`, `windowName`, `initialCommand`) are
 passed by React to Rust **once** in `create_tab` and stored in
-`TabRecord`. `terminal_attach` then needs only runtime args:
+`TabRecord`. `terminal_attach` then needs only runtime args.
+
+**The `create_tab` extension lands in Step 1 (Slice 2).** The IPC shape
+below is the final shape; later slices only change the *values* React
+passes (Slice 3 wires real `worktreeId`s; Slice 5 wires
+`initialCommand` for chat). Pinning the shape up front prevents
+Slice 2's hardcoded-worktree path from becoming a different IPC
+contract than the one the rest of the ladder relies on:
 
 ```rust
 // Extended create_tab (existing command — adds optional terminal fields)
 #[tauri::command]
-fn create_tab(app, req: CreateTabReq) -> Result<(), String>;
-//   CreateTabReq: { id, kind, url, profile_id,
-//                   worktree_id?, window_name?, initial_command?,
-//                   agent_session_id? }
+fn create_tab(app, req: CreateTabReq) -> Result<CreateTabResp, String>;
+//   CreateTabReq:  { id, kind, url, profile_id,
+//                    worktree_id?, window_name?, initial_command?,
+//                    agent_session_id? }
+//   CreateTabResp: { window_name? }   ← Rust returns the resolved
+//                                       window name when the request
+//                                       passed window_name: "auto".
+
+// window_name sentinel: pass "auto" (or omit) to delegate allocation to
+// Rust. Rust holds a per-session mutex, runs the allocator under the
+// lock, and returns the resolved name in CreateTabResp.window_name —
+// see "Window-name allocation" below.
 
 // First mount or post-restart reattach. Idempotent: creates session/window
 // if missing, attaches if present. Same call path either way.
@@ -463,6 +489,12 @@ simultaneously; everything after is incremental.
 ### Step 1 — One terminal, hardcoded worktree, tmux from day one (~1 day) ⚠ keystone
 
 - Rust commands: `terminal_attach`, `terminal_write`, `terminal_resize`.
+- **`create_tab`'s final IPC shape lands here.** `CreateTabReq` is
+  extended now with the optional per-kind fields (`worktreeId`,
+  `windowName`, `initialCommand`, `agentSessionId`) and `CreateTabResp`
+  carries back the resolved `windowName`. Slice 2 passes constants
+  (`worktreeId: "default"`, `windowName: "term-1"`, the rest `None`);
+  later slices change only the *values*, never the shape.
 - Idempotent attach algorithm against tmux (not raw portable-pty).
 - Hardcoded worktree path (e.g., `$HOME`); no SQLite, no Worktree object.
 - `terminal-runtime.ts` fully wired: xterm + fit + webgl + Channel.
@@ -485,7 +517,11 @@ opens a browser tab.
 ### Step 3 — Worktree-aware (~½ day)
 
 - React holds a hardcoded list of Worktrees with real paths.
-- `create_tab` accepts `worktreeId`; Rust stores it on `TabRecord`.
+- React passes a real `worktreeId` (the IPC shape was already extended
+  in Step 1; this step changes only the *value*).
+- React passes `windowName: "auto"`; Rust allocates `term-N` under a
+  per-session mutex and returns the resolved name in `CreateTabResp`.
+  React persists the resolved name in SQLite.
 - tmux session name = `sanctel-wt:<worktreeId>`, `-c <worktree.path>`.
 
 **Demo:** two terminals in same worktree = same session, different
