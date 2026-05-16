@@ -17,19 +17,19 @@ import type {
   Persistence,
 } from "../persistence/persistence";
 
-/// Response shape from Rust's `create_tab`. For terminal/chat tabs created
-/// with `windowName: "auto"`, Rust returns the resolved name here so the
-/// frontend can persist it; for reattach (explicit name) and non-terminal
-/// kinds, `windowName` is `null`. See docs/design/terminal-runtime.md
-/// §"windowName assignment".
+// Response shape from Rust's `create_tab`. For terminal/chat tabs created
+// with `windowName: "auto"`, Rust returns the resolved name here so the
+// frontend can persist it; for reattach (explicit name) and non-terminal
+// kinds, `windowName` is `null`. See docs/design/terminal-runtime.md
+// §"windowName assignment".
 interface CreateTabResp {
   windowName: string | null;
 }
 
-/// Sentinel passed to `create_tab` in place of an explicit windowName. Rust
-/// interprets it as "allocate the next term-N under the per-session mutex
-/// and return the resolved name." Pinned as a const so React never types
-/// the literal twice.
+// Sentinel passed to `create_tab` in place of an explicit windowName. Rust
+// interprets it as "allocate the next term-N under the per-session mutex
+// and return the resolved name." Pinned as a const so React never types
+// the literal twice.
 const AUTO_WINDOW_NAME = "auto";
 
 interface TabState {

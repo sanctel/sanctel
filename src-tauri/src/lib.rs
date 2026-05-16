@@ -217,29 +217,24 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
     // per-session mutex when the request asked for "auto" allocation. Doing
     // it before we build the webview means a failure here surfaces to React
     // before any client-visible state is created.
-    let allocated_window_name: Option<String> = if is_terminal_like {
-        let asked_for_auto = match req.window_name.as_deref() {
-            None | Some(AUTO_WINDOW_NAME) => true,
-            Some(_) => false,
-        };
-        if asked_for_auto {
-            let cwd = resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
-            let session = tmux_session_name(req.worktree_id.as_deref(), &req.profile_id);
-            let locks = &app.state::<AppState>().session_locks;
-            let tmux = TmuxCli::default();
-            Some(
-                allocate_window_under_lock(
-                    locks,
-                    &tmux,
-                    &session,
-                    &cwd,
-                    req.initial_command.as_deref(),
-                )
-                .map_err(|e| e.to_string())?,
+    let asked_for_auto = is_terminal_like
+        && matches!(req.window_name.as_deref(), None | Some(AUTO_WINDOW_NAME));
+    let allocated_window_name: Option<String> = if asked_for_auto {
+        let cwd =
+            resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
+        let session = tmux_session_name(req.worktree_id.as_deref(), &req.profile_id);
+        let locks = &app.state::<AppState>().session_locks;
+        let tmux = TmuxCli::default();
+        Some(
+            allocate_window_under_lock(
+                locks,
+                &tmux,
+                &session,
+                &cwd,
+                req.initial_command.as_deref(),
             )
-        } else {
-            None
-        }
+            .map_err(|e| e.to_string())?,
+        )
     } else {
         None
     };
