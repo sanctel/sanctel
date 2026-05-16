@@ -14,9 +14,10 @@
 //   TmuxSession   (a tmux server-side session, outlives the app)
 //
 // Tabs BRIDGE the two worlds:
-//   - tab.spaceId       → Space   (visual grouping)
-//   - tab.worktreeId?   → Worktree (filesystem cwd; optional)
-//   - tab.sessionId?    → AgentSession or TmuxSession handle
+//   - tab.spaceId         → Space   (visual grouping)
+//   - tab.worktreeId?     → Worktree (filesystem cwd; optional)
+//   - tab.windowName?     → TmuxSession window inside the Worktree's session
+//   - tab.agentSessionId? → AgentSession (claude --resume target)
 //
 // The deeper insight: Tabs are ephemeral. Profiles, Worktrees, transcripts,
 // and tmux sessions are durable. On app launch, Tabs are reconstructed by

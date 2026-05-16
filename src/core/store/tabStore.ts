@@ -91,7 +91,7 @@ function profileFromRow(p: PersistedProfile): Profile {
   };
 }
 
-function profileToRow(p: Profile, _sortOrder = 0): PersistedProfile {
+function profileToRow(p: Profile): PersistedProfile {
   return {
     id: p.id,
     name: p.name,
