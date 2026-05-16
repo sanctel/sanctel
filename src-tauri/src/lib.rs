@@ -23,13 +23,13 @@ use std::io::Write;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
-use tauri::{LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
+use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
 use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
-use crate::tmux_cli::TmuxCli;
+use crate::tmux_cli::{TmuxCli, TmuxError};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -48,6 +48,21 @@ struct AppState {
     // by terminal_attach, consumed by terminal_write / terminal_resize /
     // close_tab.
     terminals: TerminalRegistry,
+    // Result of the one-time `tmux -V` startup probe. Populated by `run()`
+    // before any frontend invokes; read by the `tmux_status` command so
+    // React can gate terminal/chat tab creation behind a setup screen.
+    tmux_status: Mutex<TmuxStatus>,
+}
+
+/// Result of the one-time `tmux -V` probe. Emitted as a Tauri event and also
+/// readable via the `tmux_status` command so React can render synchronously
+/// on first paint without waiting for the event.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TmuxStatus {
+    available: bool,
+    version: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -129,6 +144,17 @@ struct CreateTabReq {
 
 #[tauri::command]
 fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<(), String> {
+    // Belt-and-braces gate: React already hides the new-terminal/new-chat
+    // buttons behind `tmux-missing`. This second check makes sure a stale
+    // SQLite restore or a scripted invoke can't slip past and spawn a
+    // doomed PTY.
+    if matches!(req.kind.as_str(), "terminal" | "chat") {
+        let status = app.state::<AppState>().tmux_status.lock().clone();
+        if !status.available {
+            return Err("tmux-missing".to_string());
+        }
+    }
+
     let window = app
         .get_window("main")
         .ok_or_else(|| "main window not found".to_string())?;
@@ -322,9 +348,17 @@ fn terminal_attach<R: Runtime>(
 
     let params = resolve_attach_params(&record, cols, rows)?;
     let tmux = TmuxCli::default();
+    // AttachError::Display emits `worktree-missing: <path>` for the broken-tab
+    // case, which the frontend pattern-matches in terminal-runtime.ts. Don't
+    // wrap or rephrase — the prefix is the wire contract.
     let handle = attach_tab_to_tmux(&tmux, params, on_output).map_err(|e| e.to_string())?;
     app.state::<AppState>().terminals.insert(label, Arc::new(handle));
     Ok(())
+}
+
+#[tauri::command]
+fn tmux_status(app: tauri::AppHandle) -> TmuxStatus {
+    app.state::<AppState>().tmux_status.lock().clone()
 }
 
 #[tauri::command]
@@ -364,10 +398,48 @@ fn terminal_resize<R: Runtime>(
 
 // ─── entry ────────────────────────────────────────────────────────────────
 
+/// Run the one-time `tmux -V` probe and seed AppState.tmux_status. Pure
+/// over a TmuxCli so unit tests can inject a mock runner.
+fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
+    status: &Mutex<TmuxStatus>,
+    tmux: &TmuxCli<R>,
+) {
+    let resolved = match tmux.version() {
+        Ok(v) => TmuxStatus {
+            available: true,
+            version: Some(v),
+            error: None,
+        },
+        Err(TmuxError::NotFound(msg)) => TmuxStatus {
+            available: false,
+            version: None,
+            error: Some(format!("tmux not installed: {msg}")),
+        },
+        Err(other) => TmuxStatus {
+            available: false,
+            version: None,
+            error: Some(other.to_string()),
+        },
+    };
+    *status.lock() = resolved;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            // One-time tmux startup probe (issue #8 / Slice 7). React listens
+            // for `tmux-status` once and gates terminal/chat tab creation
+            // behind a setup screen if tmux is unavailable. The status is
+            // also exposed via the `tmux_status` command for synchronous
+            // first-paint reads.
+            let state = app.state::<AppState>();
+            probe_tmux_into(&state.tmux_status, &TmuxCli::default());
+            let snapshot = state.tmux_status.lock().clone();
+            let _ = app.emit("tmux-status", snapshot);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             create_tab,
             close_tab,
@@ -377,7 +449,60 @@ pub fn run() {
             terminal_attach,
             terminal_write,
             terminal_resize,
+            tmux_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tmux_cli::{CommandOutput, CommandRunner};
+
+    struct FailingRunner;
+    impl CommandRunner for FailingRunner {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CommandOutput> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "tmux: command not found",
+            ))
+        }
+    }
+
+    struct OkRunner;
+    impl CommandRunner for OkRunner {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: b"tmux 3.4\n".to_vec(),
+                stderr: vec![],
+            })
+        }
+    }
+
+    /// Probe with a runner that fails to spawn tmux must surface
+    /// `available: false` + an error. This is what triggers the React
+    /// setup screen on a machine without tmux installed.
+    #[test]
+    fn probe_marks_unavailable_when_tmux_missing() {
+        let status = Mutex::new(TmuxStatus::default());
+        let tmux = TmuxCli::new("test", FailingRunner);
+        probe_tmux_into(&status, &tmux);
+        let result = status.lock().clone();
+        assert!(!result.available);
+        assert!(result.error.is_some());
+    }
+
+    /// Probe with a runner that prints `tmux 3.4` reports available + version.
+    #[test]
+    fn probe_marks_available_when_tmux_present() {
+        let status = Mutex::new(TmuxStatus::default());
+        let tmux = TmuxCli::new("test", OkRunner);
+        probe_tmux_into(&status, &tmux);
+        let result = status.lock().clone();
+        assert!(result.available);
+        assert_eq!(result.version.as_deref(), Some("tmux 3.4"));
+        assert!(result.error.is_none());
+    }
 }

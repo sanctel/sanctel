@@ -1,4 +1,5 @@
 import { useTabStore } from "../store/tabStore";
+import { useTmuxStatus } from "../store/tmuxStatusStore";
 import type { Tab, TabKind } from "../types";
 
 const kindGlyph: Record<TabKind, string> = {
@@ -24,6 +25,11 @@ export default function Sidebar() {
   const switchSpace = useTabStore((s) => s.switchSpace);
   const addSpace = useTabStore((s) => s.addSpace);
   const addProfile = useTabStore((s) => s.addProfile);
+
+  // Hide terminal/chat buttons when tmux isn't available. App.tsx already
+  // routes to TmuxSetupScreen in that case, but the hidden buttons keep
+  // the gate intact if the routing changes later.
+  const tmuxAvailable = useTmuxStatus((s) => s.status.available);
 
   // Only show profile UI when there's more than one profile (Arc-style hide-when-trivial).
   const showProfiles = profiles.length > 1;
@@ -96,8 +102,12 @@ export default function Sidebar() {
 
       <div className="new-buttons">
         <button onClick={() => newTab("browser", "")}>+ Browser</button>
-        <button onClick={() => newTab("terminal", "")}>+ Terminal</button>
-        <button onClick={() => newTab("chat", "")}>+ Chat</button>
+        {tmuxAvailable && (
+          <>
+            <button onClick={() => newTab("terminal", "")}>+ Terminal</button>
+            <button onClick={() => newTab("chat", "")}>+ Chat</button>
+          </>
+        )}
       </div>
 
       <ul className="tab-list">

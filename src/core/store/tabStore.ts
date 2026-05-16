@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { Tab, Space, Profile, TabKind, ContentRect } from "../types";
+import { useTmuxStatus } from "./tmuxStatusStore";
 
 interface TabState {
   profiles: Profile[];
@@ -121,6 +122,19 @@ export const useTabStore = create<TabState>((set, get) => ({
     const space = get().activeSpace();
     if (!space) throw new Error("no active space");
     const profileId = space.profileId;
+
+    // Issue #8 / Slice 7: gate terminal/chat tab creation on the tmux
+    // startup probe. If tmux is missing, the sidebar buttons are already
+    // hidden by App.tsx — this is the defensive second check so a stale
+    // SQLite restore or a scripted call cannot bypass the setup screen.
+    if (kind === "terminal" || kind === "chat") {
+      const status = useTmuxStatus.getState().status;
+      if (!status.available) {
+        throw new Error(
+          "tmux-missing: cannot create terminal or chat tab without tmux",
+        );
+      }
+    }
 
     const id = crypto.randomUUID();
     const tab: Tab = {
