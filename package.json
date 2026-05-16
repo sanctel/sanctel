@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@ai-hero/sandcastle": "^0.5.10",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-clipboard-manager": "^2.2.2",
     "@xterm/addon-fit": "^0.10.0",
