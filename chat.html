@@ -21,7 +21,21 @@
     <div id="term"></div>
     <script type="module">
       import { mount } from "/src/terminal/terminal-runtime.ts";
-      mount(document.getElementById("term"));
+      import { createLinkHandler } from "/src/terminal/link-handler.ts";
+      import {
+        readText,
+        writeText,
+      } from "@tauri-apps/plugin-clipboard-manager";
+      import { emit } from "@tauri-apps/api/event";
+
+      const linkHandler = createLinkHandler({
+        openBrowserTab: (url) => emit("sanctel://open-url", { url }),
+      });
+
+      mount(document.getElementById("term"), {
+        linkHandler,
+        clipboard: { readText, writeText },
+      });
     </script>
   </body>
 </html>

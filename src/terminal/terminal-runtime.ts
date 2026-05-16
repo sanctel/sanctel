@@ -4,19 +4,31 @@
 // flows over a Tauri Channel as raw bytes (no UTF-8 transcoding on the data
 // path — see docs/design/terminal-runtime.md §"IPC contract").
 //
+// Slice 3 adds the polish layer:
+//   - ResizeObserver on the container → fit.fit() → terminal_resize.
+//   - Optional clipboard glue (Cmd/Ctrl+C copy, Cmd/Ctrl+V paste).
+//   - Optional web-links addon firing an injected link handler so the
+//     runtime stays decoupled from the rest of the app.
+//
 // Per-tab identity (worktreeId, windowName, initialCommand) is server-held
 // in the Rust TabRecord, so mount() takes no arguments beyond the container.
 // The webview's label IS the tabId.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
+import { type ClipboardApi, installClipboard } from "./clipboard";
+
 export interface MountOptions {
-  // Reserved for chat.html to mount with a header above; the data path
-  // does not vary by tab kind.
+  /** Wired by the host page to call `create_tab` for the URL. When omitted,
+   * the web-links addon is not loaded and URLs render as plain text. */
+  linkHandler?: (event: MouseEvent, url: string) => void;
+  /** Clipboard plugin bridge. Omit to disable copy/paste shortcuts. */
+  clipboard?: ClipboardApi;
 }
 
 export interface MountedTerminal {
@@ -26,7 +38,7 @@ export interface MountedTerminal {
 
 export function mount(
   container: HTMLElement,
-  _options: MountOptions = {},
+  options: MountOptions = {},
 ): MountedTerminal {
   const term = new Terminal({
     cursorBlink: true,
@@ -39,6 +51,10 @@ export function mount(
   const fit = new FitAddon();
   term.loadAddon(fit);
 
+  if (options.linkHandler) {
+    term.loadAddon(new WebLinksAddon(options.linkHandler));
+  }
+
   term.open(container);
 
   // WebGL renderer for throughput. Falls back to canvas silently if WebGL
@@ -48,6 +64,10 @@ export function mount(
     term.loadAddon(webgl);
   } catch {
     // No WebGL — xterm will use its canvas renderer.
+  }
+
+  if (options.clipboard) {
+    installClipboard(term, { clipboard: options.clipboard });
   }
 
   // Compute the initial viewport size from the container's actual dimensions
@@ -75,6 +95,27 @@ export function mount(
     );
   });
 
+  // Forward xterm size changes (driven by fit.fit() below) to tmux via Rust.
+  // term.onResize fires whenever the cell grid actually changes — duplicate
+  // ResizeObserver callbacks at the same dimensions don't cost an IPC.
+  const onResizeDisposable = term.onResize(({ cols, rows }) => {
+    invoke("terminal_resize", { cols, rows }).catch((e) =>
+      console.error("terminal_resize failed", e),
+    );
+  });
+
+  // Reflow on container size changes. fit.fit() re-measures the container,
+  // computes cell dimensions, and resizes the terminal (which fires the
+  // term.onResize above).
+  const resizeObserver = new ResizeObserver(() => {
+    try {
+      fit.fit();
+    } catch {
+      // fit can throw if the container is briefly 0×0 during layout.
+    }
+  });
+  resizeObserver.observe(container);
+
   // Attach. Rust looks up worktreeId / windowName / initialCommand by this
   // webview's label from the TabRecord that create_tab stored.
   invoke("terminal_attach", {
@@ -91,6 +132,8 @@ export function mount(
   return {
     term,
     dispose: () => {
+      resizeObserver.disconnect();
+      onResizeDisposable.dispose();
       onDataDisposable.dispose();
       term.dispose();
     },
