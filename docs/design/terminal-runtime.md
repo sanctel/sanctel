@@ -163,7 +163,7 @@ fn create_tab(app, req: CreateTabReq) -> Result<CreateTabResp, String>;
 // window_name sentinel: pass "auto" (or omit) to delegate allocation to
 // Rust. Rust holds a per-session mutex, runs the allocator under the
 // lock, and returns the resolved name in CreateTabResp.window_name —
-// see "Window-name allocation" below.
+// see "`windowName` assignment" above.
 
 // First mount or post-restart reattach. Idempotent: creates session/window
 // if missing, attaches if present. Same call path either way.
@@ -534,7 +534,6 @@ confirms.
   windowName, agentSessionId).
 - React loads on launch and replays `create_tab` per row.
 - React writes on every mutation.
-- `windowName` allocated via per-Worktree monotonic counter at create.
 
 **Demo:** create 3 terminal tabs, rename one, quit, reopen — all three
 return with titles intact and shells reattached. Laptop reboot — tabs
