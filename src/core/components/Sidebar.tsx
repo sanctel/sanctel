@@ -1,5 +1,6 @@
 import { useTabStore } from "../store/tabStore";
 import type { Tab, TabKind } from "../types";
+import { DEMO_WORKTREES } from "../worktrees";
 
 const kindGlyph: Record<TabKind, string> = {
   browser: "○",
@@ -19,6 +20,7 @@ export default function Sidebar() {
   const spacesForProfile = useTabStore((s) => s.spacesForProfile);
 
   const newTab = useTabStore((s) => s.newTab);
+  const newTerminalTab = useTabStore((s) => s.newTerminalTab);
   const closeTab = useTabStore((s) => s.closeTab);
   const activateTab = useTabStore((s) => s.activateTab);
   const switchSpace = useTabStore((s) => s.switchSpace);
@@ -96,8 +98,23 @@ export default function Sidebar() {
 
       <div className="new-buttons">
         <button onClick={() => newTab("browser", "")}>+ Browser</button>
-        <button onClick={() => newTab("terminal", "")}>+ Terminal</button>
         <button onClick={() => newTab("chat", "")}>+ Chat</button>
+      </div>
+
+      <div className="new-terminals">
+        <span className="new-terminals-label">+ Terminal in</span>
+        {DEMO_WORKTREES.map((w) => (
+          <button
+            key={w.id}
+            onClick={() => newTerminalTab(w.id)}
+            title={w.path}
+          >
+            {w.branch}
+          </button>
+        ))}
+        <button onClick={() => newTerminalTab(null)} title="$HOME, no worktree">
+          detached
+        </button>
       </div>
 
       <ul className="tab-list">

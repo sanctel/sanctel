@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { Tab, Space, Profile, TabKind, ContentRect } from "../types";
+import type { Tab, Space, Profile, TabKind, ContentRect, Worktree } from "../types";
+import { allocateWindowName } from "../../terminal/window-name-allocator";
+import { findWorktree } from "../worktrees";
 
 interface TabState {
   profiles: Profile[];
@@ -20,6 +22,7 @@ interface TabState {
   addSpace: (name: string, profileId?: string, color?: string) => Promise<Space>;
   switchSpace: (id: string) => void;
   newTab: (kind: TabKind, url: string) => Promise<Tab>;
+  newTerminalTab: (worktreeId: Worktree["id"] | null) => Promise<Tab>;
   closeTab: (id: string) => Promise<void>;
   activateTab: (id: string) => Promise<void>;
   setContentRect: (rect: ContentRect) => Promise<void>;
@@ -147,6 +150,62 @@ export const useTabStore = create<TabState>((set, get) => ({
       tabs: [...s.tabs, tab],
       spaces: s.spaces.map((sp) =>
         sp.id === space.id ? { ...sp, activeTabId: id } : sp
+      ),
+    }));
+
+    return tab;
+  },
+
+  newTerminalTab: async (worktreeId) => {
+    const space = get().activeSpace();
+    if (!space) throw new Error("no active space");
+    const profileId = space.profileId;
+
+    // For Worktree-keyed tabs we need both worktreeId (session key) and
+    // worktreePath (`-c` cwd). For detached tabs both are null/undefined and
+    // Rust falls back to $HOME on `sanctel-detached:<profileId>`.
+    const worktree = worktreeId ? findWorktree(worktreeId) : undefined;
+    if (worktreeId && !worktree) {
+      throw new Error(`unknown worktreeId: ${worktreeId}`);
+    }
+
+    // Ask Rust for the existing window names in this Worktree's session, then
+    // allocate the next term-N locally. Empty list when the session doesn't
+    // exist yet — first tab into a Worktree.
+    const existing = await invoke<string[]>("terminal_list_window_names", {
+      req: { worktreeId: worktreeId ?? null, profileId },
+    });
+    const windowName = allocateWindowName(existing);
+
+    const id = crypto.randomUUID();
+    const title = worktree ? `${worktree.branch} · ${windowName}` : windowName;
+    const tab: Tab = {
+      id,
+      kind: "terminal",
+      title,
+      url: "local://terminal",
+      spaceId: space.id,
+      worktreeId: worktree?.id,
+      sessionId: windowName,
+      loading: false,
+    };
+
+    await invoke("create_tab", {
+      req: {
+        id: tab.id,
+        kind: tab.kind,
+        url: tab.url,
+        profileId,
+        worktreeId: worktree?.id ?? null,
+        worktreePath: worktree?.path ?? null,
+        windowName,
+      },
+    });
+
+    set((s) => ({
+      tabs: [...s.tabs, tab],
+      spaces: s.spaces.map((sp) =>
+        sp.id === space.id ? { ...sp, activeTabId: id } : sp,
       ),
     }));
 
