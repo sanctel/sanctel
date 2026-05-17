@@ -339,10 +339,13 @@ fn resolve_worktree_cwd(
 }
 
 /// The atomic critical section behind `windowName: "auto"`: under the
-/// per-session mutex, ensure the session exists, list existing windows,
-/// compute the next `term-N`, and call `new-window`. Returns the resolved
-/// name. Generic over `CommandRunner` so the concurrency test below can
-/// drive it with a scripted-tmux fixture without spawning real processes.
+/// per-session mutex, peek at existing windows (empty list when the session
+/// doesn't exist yet), compute the next `term-N`, and let
+/// `ensure_session_window` either create the session with that window as
+/// its first child or add a fresh window to an existing session.
+/// Returns the resolved name. Generic over `CommandRunner` so the
+/// concurrency test below can drive it with a scripted-tmux fixture
+/// without spawning real processes.
 fn allocate_window_under_lock<R: CommandRunner>(
     locks: &SessionLocks,
     tmux: &TmuxCli<R>,
@@ -352,10 +355,13 @@ fn allocate_window_under_lock<R: CommandRunner>(
 ) -> Result<String, TmuxError> {
     let lock = locks.lock_for(session);
     let _guard = lock.lock();
-    tmux.ensure_session(session, cwd)?;
-    let existing = tmux.list_windows(session)?;
+    let existing = if tmux.has_session(session)? {
+        tmux.list_windows(session)?
+    } else {
+        Vec::new()
+    };
     let name = allocate_window_name(&existing);
-    tmux.new_window(session, &name, cwd, initial_command)?;
+    tmux.ensure_session_window(session, &name, cwd, initial_command)?;
     Ok(name)
 }
 
@@ -807,11 +813,18 @@ mod tests {
                 }
                 "new-session" => {
                     let name = arg_after(args, "-s").unwrap_or_default().to_string();
+                    // The new primitive always carries `-n <window_name>`,
+                    // so the simulated session is created with exactly that
+                    // window — no phantom, no separate `new-window` step.
+                    let window_name = arg_after(args, "-n").unwrap_or_default().to_string();
                     let mut map = self.windows.lock();
                     if let std::collections::hash_map::Entry::Vacant(e) = map.entry(name.clone()) {
-                        // Sessions start with one default window "0"; matches
-                        // tmux behavior closely enough for the allocator test.
-                        e.insert(vec![]);
+                        let initial = if window_name.is_empty() {
+                            vec![]
+                        } else {
+                            vec![window_name]
+                        };
+                        e.insert(initial);
                         Ok(CommandOutput {
                             status: 0,
                             stdout: vec![],

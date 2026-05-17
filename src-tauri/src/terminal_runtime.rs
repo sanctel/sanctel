@@ -165,19 +165,21 @@ pub fn attach_tab_to_tmux(
     //    fail downstream with an opaque "-c <cwd> not found".
     check_worktree_exists(&params.worktree_path)?;
 
-    // 1. Ensure the tmux session exists (with race retry).
-    tmux.ensure_session(&params.session, &params.worktree_path)?;
-
-    // 2. Ensure the named window exists. initial_command only fires here, for
-    //    fresh windows — reattach paths never re-run the shell command.
-    tmux.ensure_window(
+    // 1. Ensure the (session, window) pair exists in tmux. Atomic in one
+    //    primitive so a missing session is created with the desired window
+    //    as its FIRST and ONLY window (`new-session -n …`), preventing the
+    //    phantom-`zsh-` orphan that previously kept sessions alive after
+    //    sanctel killed its term-N. See ADR-0012 / issue #14. The
+    //    initial_command only fires when the window is genuinely new —
+    //    reattach paths never re-run the shell command.
+    tmux.ensure_session_window(
         &params.session,
         &params.window_name,
         &params.worktree_path,
         params.initial_command.as_deref(),
     )?;
 
-    // 3. Spawn the portable-pty client. The PTY runs:
+    // 2. Spawn the portable-pty client. The PTY runs:
     //      tmux -L <socket> -f /dev/null attach-session -t <session> \
     //                                  \; select-window -t :<window>
     //    portable-pty's `;` argument is the same `;` tmux uses to chain.
@@ -403,6 +405,11 @@ mod tests {
     /// Skips if tmux isn't installed (sandcastle CI doesn't ship it). Runs on
     /// a temp socket so it never touches the user's tmux or sanctel's prod
     /// socket.
+    ///
+    /// Asserts the *exact* window list (length plus contents), not just
+    /// "contains term-1". This is what catches the phantom-window regression
+    /// from issue #14 — a bare `new-session` leaves a `zsh-` window in the
+    /// session, which would extend the list and fail this assertion.
     #[test]
     fn idempotent_attach_against_real_tmux() {
         if !tmux_available() {
@@ -418,32 +425,57 @@ mod tests {
             .args(["-L", &socket, "kill-server"])
             .output();
 
-        // 1. Fresh create.
+        // 1. Fresh create: session contains EXACTLY the requested window.
         let session = "sanctel_wt_test-wt";
         let window = "term-1";
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
 
-        tmux.ensure_session(session, &cwd).unwrap();
-        tmux.ensure_window(session, window, &cwd, None).unwrap();
+        tmux.ensure_session_window(session, window, &cwd, None).unwrap();
         assert!(tmux.has_session(session).unwrap());
-        let windows = tmux.list_windows(session).unwrap();
-        assert!(windows.contains(&window.to_string()));
+        assert_eq!(
+            tmux.list_windows(session).unwrap(),
+            vec![window.to_string()],
+            "fresh session must contain ONLY the requested window — no phantom shell window",
+        );
 
-        // 2. Reattach (second ensure_*) is a no-op — no duplicate window.
-        tmux.ensure_session(session, &cwd).unwrap();
-        tmux.ensure_window(session, window, &cwd, None).unwrap();
-        let windows = tmux.list_windows(session).unwrap();
-        let term1_count = windows.iter().filter(|w| *w == window).count();
-        assert_eq!(term1_count, 1, "reattach must not duplicate window");
+        // 2. Reattach (second ensure_session_window) is a no-op — no
+        //    duplicate window, no extra anything.
+        tmux.ensure_session_window(session, window, &cwd, None).unwrap();
+        assert_eq!(
+            tmux.list_windows(session).unwrap(),
+            vec![window.to_string()],
+            "reattach must not duplicate or add windows",
+        );
 
-        // 3. Externally kill the window — next ensure recreates it.
+        // 3. A second tab in the same session: the per-Worktree session
+        //    grows by exactly one window.
+        let window2 = "term-2";
+        tmux.ensure_session_window(session, window2, &cwd, None).unwrap();
+        let mut after_two = tmux.list_windows(session).unwrap();
+        after_two.sort();
+        assert_eq!(
+            after_two,
+            vec![window.to_string(), window2.to_string()],
+            "session must contain exactly the two requested windows",
+        );
+
+        // 4. Kill the last sanctel window — tmux must destroy the session
+        //    automatically. This is the ADR-0012 "tmux destroys the session
+        //    when its last window dies" promise the phantom-window bug broke.
         tmux.kill_window(session, window).unwrap();
-        // After last window dies, tmux destroys the session. ensure_session
-        // recreates both.
-        tmux.ensure_session(session, &cwd).unwrap();
-        tmux.ensure_window(session, window, &cwd, None).unwrap();
-        let windows = tmux.list_windows(session).unwrap();
-        assert!(windows.contains(&window.to_string()));
+        tmux.kill_window(session, window2).unwrap();
+        assert!(
+            !tmux.has_session(session).unwrap(),
+            "session must be destroyed after its last sanctel window is killed",
+        );
+
+        // 5. Re-creating after auto-destruction puts us back to exactly one
+        //    window, not two (no resurrection of stale state).
+        tmux.ensure_session_window(session, window, &cwd, None).unwrap();
+        assert_eq!(
+            tmux.list_windows(session).unwrap(),
+            vec![window.to_string()],
+        );
 
         // Cleanup.
         let _ = Command::new("tmux")

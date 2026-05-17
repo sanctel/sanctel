@@ -62,10 +62,20 @@ whether Tab id has to become durable.
   same window), not the default.
 - **Cleanup is automatic.** `close_tab` for `kind=terminal` runs
   `tmux kill-window`; tmux destroys the session when its last window
-  dies. No bookkeeping in Rust.
-- **Reconnect is idempotent.** `tmux has-session || new-session`,
-  `list-windows | grep || new-window`. Same code path for first
-  creation and reattach-after-restart.
+  dies. No bookkeeping in Rust. **Caveat (issue #14):** this only
+  holds if sanctel never lets a phantom window sneak into the session.
+  A bare `tmux new-session -d -s <s> -c <cwd>` auto-creates an initial
+  window named after the user's shell (`zsh-`, `bash-`, …), which is
+  not one sanctel will ever kill. Sanctel therefore creates sessions
+  exclusively through `TmuxCli::ensure_session_window`, which folds
+  the session-creation and first-window-creation into a single
+  `tmux new-session -d -s <s> -n <window_name> -c <cwd>` call. The
+  session is born with exactly one window — the one sanctel asked
+  for — and dies the moment that window dies.
+- **Reconnect is idempotent.** `ensure_session_window` is the single
+  primitive: it creates the session+window when missing and is a
+  pure no-op when both exist. Same code path for first creation and
+  reattach-after-restart.
 - **No daemon to write.** Superset.sh's pty-daemon (~30k LOC + fd
   handoff) is avoided. Sanctel uses tmux as tmux was designed.
 - **`-L sanctel -f /dev/null`** isolates sanctel from the user's

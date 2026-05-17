@@ -199,13 +199,31 @@ impl<R: CommandRunner> TmuxCli<R> {
         Ok(out.status == 0)
     }
 
-    /// `tmux new-session -d -s <session> -c <cwd>`.
+    /// `tmux new-session -d -s <session> -n <window_name> -c <cwd> [shell-cmd]`.
+    ///
+    /// **Always** passes `-n <window_name>` so the session's initial window IS
+    /// the one sanctel wants — without `-n`, tmux silently creates a phantom
+    /// `zsh-` (or `$SHELL-`) window first and the session's lifecycle is then
+    /// pinned by that phantom rather than the term-N sanctel will later kill.
+    /// See ADR-0012 and issue #14.
     ///
     /// Returns `Err(SessionAlreadyExists)` if tmux reports a name collision
-    /// (concurrent caller won the race). Caller should re-check
-    /// `has_session` and proceed.
-    pub fn new_session(&self, session: &str, cwd: &str) -> Result<(), TmuxError> {
-        let out = self.run(&["new-session", "-d", "-s", session, "-c", cwd])?;
+    /// (concurrent caller won the race). Callers should normally go through
+    /// `ensure_session_window`, which handles that retry internally.
+    fn new_session_with_window(
+        &self,
+        session: &str,
+        window_name: &str,
+        cwd: &str,
+        initial_command: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        let mut args: Vec<&str> = vec![
+            "new-session", "-d", "-s", session, "-n", window_name, "-c", cwd,
+        ];
+        if let Some(cmd) = initial_command {
+            args.push(cmd);
+        }
+        let out = self.run(&args)?;
         if out.status == 0 {
             return Ok(());
         }
@@ -214,35 +232,74 @@ impl<R: CommandRunner> TmuxCli<R> {
             return Err(TmuxError::SessionAlreadyExists(session.into()));
         }
         Err(TmuxError::Command {
-            command: format!("new-session -s {session}"),
+            command: format!("new-session -s {session} -n {window_name}"),
             stderr: stderr.into_owned(),
         })
     }
 
-    /// Idempotent: creates the session if missing, retries once on the
-    /// race-with-concurrent-caller case. This is the only method callers
-    /// should normally use to ensure a session exists.
-    pub fn ensure_session(&self, session: &str, cwd: &str) -> Result<(), TmuxError> {
+    /// Atomic "session contains this named window, nothing else implicit"
+    /// primitive. This is the only method `create_tab` / `attach_tab_to_tmux`
+    /// use to bring a (session, window) into existence.
+    ///
+    /// Algorithm:
+    ///   - `has-session`?
+    ///     - **Yes**: list windows; if `window_name` is already there, return
+    ///       Ok (idempotent reattach). Otherwise `new-window -n`.
+    ///     - **No**: `new-session -d -s <session> -n <window_name> -c <cwd>
+    ///       [initial_command]`. Race-retry once on `duplicate session`: the
+    ///       winner's session now exists, so re-check `has-session` and fall
+    ///       through to the session-exists branch.
+    ///
+    /// Why a single primitive: doing `new-session` without `-n` leaves a
+    /// phantom `zsh-` window in the session (tmux's default initial window).
+    /// That phantom keeps the session alive forever after sanctel kills its
+    /// `term-N`, breaking ADR-0012's "tmux destroys the session when its
+    /// last window dies" promise. Merging the two operations into one
+    /// `new-session -n` call is the fix and is encoded here so no caller
+    /// can forget. See issue #14.
+    pub fn ensure_session_window(
+        &self,
+        session: &str,
+        window_name: &str,
+        cwd: &str,
+        initial_command: Option<&str>,
+    ) -> Result<(), TmuxError> {
         if self.has_session(session)? {
-            return Ok(());
+            return self.add_window_if_absent(session, window_name, cwd, initial_command);
         }
-        match self.new_session(session, cwd) {
+        match self.new_session_with_window(session, window_name, cwd, initial_command) {
             Ok(()) => Ok(()),
             Err(TmuxError::SessionAlreadyExists(_)) => {
-                // Another caller created it between has-session and new-session.
-                // One re-check is enough; if it still says missing, something else
-                // is wrong (e.g., the session died) — surface that as an error.
-                if self.has_session(session)? {
-                    Ok(())
-                } else {
-                    Err(TmuxError::Command {
-                        command: format!("new-session -s {session}"),
+                // Race winner created the session between our has-session and
+                // new-session. The winner may or may not have created the same
+                // window_name; fall through to the session-exists branch.
+                if !self.has_session(session)? {
+                    return Err(TmuxError::Command {
+                        command: format!("new-session -s {session} -n {window_name}"),
                         stderr: "session reported as duplicate but does not exist".into(),
-                    })
+                    });
                 }
+                self.add_window_if_absent(session, window_name, cwd, initial_command)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Internal: list windows in `session`, add `window_name` only if it's
+    /// not already there. Idempotent. The caller must have already confirmed
+    /// the session exists.
+    fn add_window_if_absent(
+        &self,
+        session: &str,
+        window_name: &str,
+        cwd: &str,
+        initial_command: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        let existing = self.list_windows(session)?;
+        if existing.iter().any(|w| w == window_name) {
+            return Ok(());
+        }
+        self.new_window(session, window_name, cwd, initial_command)
     }
 
     /// Returns the window names in `session`, parsed from
@@ -292,23 +349,6 @@ impl<R: CommandRunner> TmuxCli<R> {
             command: format!("new-window -t {session} -n {name}"),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
-    }
-
-    /// Idempotent: lists existing windows, creates only if absent. The
-    /// `initial_command` only runs when the window is genuinely new — by
-    /// design, reattach paths never re-run the shell command.
-    pub fn ensure_window(
-        &self,
-        session: &str,
-        name: &str,
-        cwd: &str,
-        initial_command: Option<&str>,
-    ) -> Result<(), TmuxError> {
-        let existing = self.list_windows(session)?;
-        if existing.iter().any(|w| w == name) {
-            return Ok(());
-        }
-        self.new_window(session, name, cwd, initial_command)
     }
 
     /// `tmux kill-window -t <session>:<name>`. Used by close_tab for
@@ -562,55 +602,109 @@ mod tests {
         assert_eq!(cli.list_windows("sess").unwrap(), vec!["term-1", "term-2"]);
     }
 
+    /// Session is missing. The fix for issue #14: `new-session` must carry
+    /// `-n <window_name>` so the session's initial window is the one sanctel
+    /// asked for — no phantom `zsh-` window left in the session. Crucially,
+    /// no separate `new-window` call follows.
     #[test]
-    fn new_session_recognizes_duplicate_session_stderr() {
-        let mock = MockRunner::new(vec![MockCall {
-            expect_args_contain: Some(vec!["new-session"]),
-            result: err("duplicate session: foo"),
-        }]);
-        let cli = TmuxCli::new("s", mock);
-        match cli.new_session("foo", "/tmp") {
-            Err(TmuxError::SessionAlreadyExists(name)) => assert_eq!(name, "foo"),
-            other => panic!("expected SessionAlreadyExists, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ensure_session_returns_ok_when_already_present() {
-        let mock = MockRunner::new(vec![MockCall {
-            // has-session → exit 0
-            expect_args_contain: Some(vec!["has-session"]),
-            result: ok(""),
-        }]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session("foo", "/tmp").unwrap();
-        // No new-session call should have fired.
-        assert_eq!(cli.runner.seen_args().len(), 1);
-    }
-
-    #[test]
-    fn ensure_session_creates_when_missing() {
+    fn ensure_session_window_creates_session_with_n_flag_when_missing() {
         let mock = MockRunner::new(vec![
             MockCall {
-                // has-session → nonzero (missing)
                 expect_args_contain: Some(vec!["has-session"]),
                 result: err("no session"),
             },
             MockCall {
-                // new-session → success
-                expect_args_contain: Some(vec!["new-session", "foo", "/tmp"]),
+                // Verify `-n term-1` is in the new-session call. This is the
+                // assertion that prevents the phantom-window regression.
+                expect_args_contain: Some(vec![
+                    "new-session", "-d", "-s", "foo", "-n", "term-1", "-c", "/tmp",
+                ]),
                 result: ok(""),
             },
         ]);
         let cli = TmuxCli::new("s", mock);
-        cli.ensure_session("foo", "/tmp").unwrap();
-        assert_eq!(cli.runner.seen_args().len(), 2);
+        cli.ensure_session_window("foo", "term-1", "/tmp", None).unwrap();
+        let seen = cli.runner.seen_args();
+        // Exactly two tmux invocations: has-session + new-session. No
+        // trailing new-window. The phantom-window bug was created precisely
+        // by an extra new-window call after a bare `new-session`.
+        assert_eq!(seen.len(), 2, "expected has-session + new-session only, got: {seen:?}");
+        assert!(
+            !seen[1].iter().any(|a| a == "new-window"),
+            "must not invoke new-window when session is created with -n",
+        );
     }
 
+    /// The initial-command pass-through still works in the new primitive:
+    /// `new-session -d -s … -n … -c … <cmd>`.
     #[test]
-    fn ensure_session_retries_on_race() {
-        // Sequence simulated: has-session miss → new-session loses race →
-        // has-session hit → Ok.
+    fn ensure_session_window_creates_session_with_initial_command() {
+        let mock = MockRunner::new(vec![
+            MockCall {
+                expect_args_contain: Some(vec!["has-session"]),
+                result: err("no session"),
+            },
+            MockCall {
+                expect_args_contain: Some(vec![
+                    "new-session", "-n", "term-1", "claude --resume abc",
+                ]),
+                result: ok(""),
+            },
+        ]);
+        let cli = TmuxCli::new("s", mock);
+        cli.ensure_session_window("foo", "term-1", "/tmp", Some("claude --resume abc"))
+            .unwrap();
+    }
+
+    /// Session exists, window absent. Must call `new-window -n` and only
+    /// one `new-window` call.
+    #[test]
+    fn ensure_session_window_adds_window_when_session_exists_without_it() {
+        let mock = MockRunner::new(vec![
+            MockCall {
+                expect_args_contain: Some(vec!["has-session"]),
+                result: ok(""),
+            },
+            MockCall {
+                expect_args_contain: Some(vec!["list-windows"]),
+                result: ok("term-1\n"),
+            },
+            MockCall {
+                expect_args_contain: Some(vec!["new-window", "-n", "term-2", "-c", "/tmp"]),
+                result: ok(""),
+            },
+        ]);
+        let cli = TmuxCli::new("s", mock);
+        cli.ensure_session_window("foo", "term-2", "/tmp", None).unwrap();
+        assert_eq!(cli.runner.seen_args().len(), 3);
+    }
+
+    /// Session exists, window present. Pure no-op aside from the
+    /// has-session + list-windows probe.
+    #[test]
+    fn ensure_session_window_is_noop_when_window_already_exists() {
+        let mock = MockRunner::new(vec![
+            MockCall {
+                expect_args_contain: Some(vec!["has-session"]),
+                result: ok(""),
+            },
+            MockCall {
+                expect_args_contain: Some(vec!["list-windows"]),
+                result: ok("term-1\nterm-2\n"),
+            },
+        ]);
+        let cli = TmuxCli::new("s", mock);
+        cli.ensure_session_window("foo", "term-1", "/tmp", None).unwrap();
+        let seen = cli.runner.seen_args();
+        assert_eq!(seen.len(), 2, "no new-window expected; got: {seen:?}");
+        assert!(!seen.iter().any(|args| args.iter().any(|a| a == "new-window")));
+    }
+
+    /// Race: `has-session` says no, `new-session` loses to a concurrent
+    /// caller, we re-check `has-session` (now yes), list windows, and add
+    /// our window since the race winner created a different one.
+    #[test]
+    fn ensure_session_window_recovers_from_lost_race_by_adding_window() {
         let mock = MockRunner::new(vec![
             MockCall {
                 expect_args_contain: Some(vec!["has-session"]),
@@ -624,44 +718,49 @@ mod tests {
                 expect_args_contain: Some(vec!["has-session"]),
                 result: ok(""),
             },
-        ]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session("foo", "/tmp").unwrap();
-        assert_eq!(cli.runner.seen_args().len(), 3);
-    }
-
-    #[test]
-    fn ensure_window_skips_create_when_present() {
-        let mock = MockRunner::new(vec![MockCall {
-            expect_args_contain: Some(vec!["list-windows"]),
-            result: ok("term-1\nterm-2\n"),
-        }]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_window("sess", "term-1", "/tmp", None).unwrap();
-        assert_eq!(cli.runner.seen_args().len(), 1);
-    }
-
-    #[test]
-    fn ensure_window_creates_when_absent_with_initial_command() {
-        let mock = MockRunner::new(vec![
             MockCall {
                 expect_args_contain: Some(vec!["list-windows"]),
                 result: ok("term-1\n"),
             },
             MockCall {
-                expect_args_contain: Some(vec![
-                    "new-window",
-                    "term-2",
-                    "/tmp",
-                    "claude --resume",
-                ]),
+                expect_args_contain: Some(vec!["new-window", "-n", "term-2"]),
                 result: ok(""),
             },
         ]);
         let cli = TmuxCli::new("s", mock);
-        cli.ensure_window("sess", "term-2", "/tmp", Some("claude --resume abc"))
-            .unwrap();
-        assert_eq!(cli.runner.seen_args().len(), 2);
+        cli.ensure_session_window("foo", "term-2", "/tmp", None).unwrap();
+        assert_eq!(cli.runner.seen_args().len(), 5);
+    }
+
+    /// Race with same-window winner: the race winner asked for the same
+    /// window name as we did. After the duplicate-session error, the
+    /// list-windows shows our target already present and we return Ok
+    /// without a new-window call.
+    #[test]
+    fn ensure_session_window_recovers_from_lost_race_when_winner_created_same_window() {
+        let mock = MockRunner::new(vec![
+            MockCall {
+                expect_args_contain: Some(vec!["has-session"]),
+                result: err("no session"),
+            },
+            MockCall {
+                expect_args_contain: Some(vec!["new-session"]),
+                result: err("duplicate session: foo"),
+            },
+            MockCall {
+                expect_args_contain: Some(vec!["has-session"]),
+                result: ok(""),
+            },
+            MockCall {
+                expect_args_contain: Some(vec!["list-windows"]),
+                result: ok("term-1\n"),
+            },
+        ]);
+        let cli = TmuxCli::new("s", mock);
+        cli.ensure_session_window("foo", "term-1", "/tmp", None).unwrap();
+        let seen = cli.runner.seen_args();
+        assert_eq!(seen.len(), 4);
+        assert!(!seen.iter().any(|args| args.iter().any(|a| a == "new-window")));
     }
 
     #[test]
@@ -674,29 +773,37 @@ mod tests {
         cli.kill_window("sess", "term-1").unwrap();
     }
 
-    /// A runner that models a tiny piece of "real tmux": a shared set of
-    /// existing session names. has-session reads it; new-session writes it
-    /// atomically (compare-and-set) and returns the duplicate-session
-    /// stderr if the name was already there. Lets us write thread-based
-    /// concurrency tests without spawning real tmux.
+    /// A runner that models a tiny piece of "real tmux": a shared map from
+    /// session name to its window-name list. has-session / list-windows
+    /// read it; new-session (with -n) and new-window write it atomically
+    /// (the new-session compare-and-set returns duplicate-session if the
+    /// session already exists). Lets us write thread-based concurrency
+    /// tests without spawning real tmux.
     struct StateRunner {
-        sessions: Arc<Mutex<std::collections::HashSet<String>>>,
+        windows: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
         new_session_wins: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StateRunner {
         fn new() -> Self {
             StateRunner {
-                sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                windows: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 new_session_wins: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
         fn clone_shared(&self) -> Self {
             StateRunner {
-                sessions: Arc::clone(&self.sessions),
+                windows: Arc::clone(&self.windows),
                 new_session_wins: Arc::clone(&self.new_session_wins),
             }
         }
+        fn windows_for(&self, session: &str) -> Vec<String> {
+            self.windows.lock().unwrap().get(session).cloned().unwrap_or_default()
+        }
+    }
+
+    fn arg_after_<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1)).copied()
     }
 
     impl CommandRunner for StateRunner {
@@ -706,7 +813,11 @@ mod tests {
                 .find(|a| {
                     matches!(
                         **a,
-                        "has-session" | "new-session" | "list-windows" | "kill-window"
+                        "has-session"
+                            | "new-session"
+                            | "list-windows"
+                            | "new-window"
+                            | "kill-window"
                     )
                 })
                 .copied()
@@ -714,41 +825,33 @@ mod tests {
 
             match sub {
                 "has-session" => {
-                    // Find the target after -t, strip leading "=".
-                    let target: String = args
-                        .iter()
-                        .position(|a| *a == "-t")
-                        .and_then(|i| args.get(i + 1))
+                    let target = arg_after_(args, "-t")
                         .map(|s| s.trim_start_matches('=').to_string())
                         .unwrap_or_default();
-                    let exists = self.sessions.lock().unwrap().contains(&target);
+                    let exists = self.windows.lock().unwrap().contains_key(&target);
                     Ok(CommandOutput {
                         status: if exists { 0 } else { 1 },
                         stdout: vec![],
-                        stderr: if exists {
-                            vec![]
-                        } else {
-                            b"can't find session".to_vec()
-                        },
+                        stderr: if exists { vec![] } else { b"can't find session".to_vec() },
                     })
                 }
                 "new-session" => {
-                    let name: String = args
-                        .iter()
-                        .position(|a| *a == "-s")
-                        .and_then(|i| args.get(i + 1))
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    // Compare-and-set: only the first inserter wins.
-                    let inserted = self.sessions.lock().unwrap().insert(name.clone());
-                    if inserted {
+                    let name = arg_after_(args, "-s").unwrap_or_default().to_string();
+                    // The fix for issue #14: the new primitive ALWAYS passes
+                    // `-n <window_name>`. Capture it so the simulated session
+                    // starts with exactly that one window, never a phantom.
+                    let window_name = arg_after_(args, "-n").unwrap_or_default().to_string();
+                    let mut map = self.windows.lock().unwrap();
+                    if let std::collections::hash_map::Entry::Vacant(e) = map.entry(name.clone()) {
+                        let initial = if window_name.is_empty() {
+                            vec![]
+                        } else {
+                            vec![window_name]
+                        };
+                        e.insert(initial);
                         self.new_session_wins
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(CommandOutput {
-                            status: 0,
-                            stdout: vec![],
-                            stderr: vec![],
-                        })
+                        Ok(CommandOutput { status: 0, stdout: vec![], stderr: vec![] })
                     } else {
                         Ok(CommandOutput {
                             status: 1,
@@ -757,23 +860,48 @@ mod tests {
                         })
                     }
                 }
-                _ => Ok(CommandOutput {
-                    status: 0,
-                    stdout: vec![],
-                    stderr: vec![],
-                }),
+                "list-windows" => {
+                    let target = arg_after_(args, "-t")
+                        .map(|s| s.trim_start_matches('=').to_string())
+                        .unwrap_or_default();
+                    let body = self
+                        .windows
+                        .lock()
+                        .unwrap()
+                        .get(&target)
+                        .cloned()
+                        .unwrap_or_default()
+                        .join("\n");
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: format!("{body}\n").into_bytes(),
+                        stderr: vec![],
+                    })
+                }
+                "new-window" => {
+                    let target = arg_after_(args, "-t")
+                        .map(|s| s.trim_start_matches('=').to_string())
+                        .unwrap_or_default();
+                    let name = arg_after_(args, "-n").unwrap_or_default().to_string();
+                    let mut map = self.windows.lock().unwrap();
+                    let windows = map.entry(target).or_default();
+                    windows.push(name);
+                    Ok(CommandOutput { status: 0, stdout: vec![], stderr: vec![] })
+                }
+                _ => Ok(CommandOutput { status: 0, stdout: vec![], stderr: vec![] }),
             }
         }
     }
 
-    /// Multiple threads calling ensure_session for the same session must all
-    /// succeed, and exactly one `new-session` call must "win" (compare-and-set
-    /// at the simulated tmux layer). Models the real race the issue calls out:
-    /// "multiple tabs in the same Worktree call terminal_attach simultaneously".
+    /// Multiple threads calling `ensure_session_window` for the same
+    /// (session, window) must all succeed; exactly one `new-session` call
+    /// wins the race, and the session ends up with exactly one window
+    /// matching the requested name — no phantom, no duplicate.
     #[test]
-    fn ensure_session_is_concurrent_safe_under_real_race() {
+    fn ensure_session_window_is_concurrent_safe_under_real_race() {
         let shared = StateRunner::new();
         let session = "sanctel_wt_race-test";
+        let window = "term-1";
         let cwd = "/tmp";
         const THREADS: usize = 16;
 
@@ -781,28 +909,32 @@ mod tests {
             .map(|_| {
                 let runner = shared.clone_shared();
                 let session = session.to_string();
+                let window = window.to_string();
                 let cwd = cwd.to_string();
                 std::thread::spawn(move || {
                     let cli = TmuxCli::new("s", runner);
-                    cli.ensure_session(&session, &cwd)
+                    cli.ensure_session_window(&session, &window, &cwd, None)
                 })
             })
             .collect();
 
         for h in handles {
-            h.join().unwrap().expect("ensure_session must succeed");
+            h.join().unwrap().expect("ensure_session_window must succeed");
         }
 
-        // Exactly one new-session call wins; the rest see "duplicate session"
-        // and recover via the has-session re-check inside ensure_session.
         assert_eq!(
-            shared
-                .new_session_wins
-                .load(std::sync::atomic::Ordering::SeqCst),
+            shared.new_session_wins.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "exactly one thread should win new-session"
         );
-        // The session must end up created.
-        assert!(shared.sessions.lock().unwrap().contains(session));
+        // The session must end up with exactly one window: the one we asked
+        // for. The phantom-window regression would show up here as a second
+        // entry; the duplicate-window regression as two `term-1`s.
+        let windows = shared.windows_for(session);
+        assert_eq!(
+            windows,
+            vec![window.to_string()],
+            "session must contain exactly the requested window — no phantom, no duplicate",
+        );
     }
 }

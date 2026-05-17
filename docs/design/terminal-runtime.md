@@ -209,10 +209,15 @@ of truth.
   webviews; channels are a private pipe to one. Avoids cross-webview
   fan-out, gives backpressure semantics from the runtime.
 - **`terminal_attach` is the single mount entry point** for both fresh
-  tabs and reattach-on-launch. The Rust side does
-  `tmux has-session || new-session ; list-windows | grep || new-window`
-  and either spawns or reattaches a `portable-pty` client running
-  `tmux attach-session -t <session> \; select-window -t :<window>`.
+  tabs and reattach-on-launch. The Rust side runs the single
+  `ensure_session_window` primitive — `tmux has-session` then either
+  `new-session -d -s <session> -n <window> -c <cwd>` (when the session
+  is missing) or `new-window -t <session> -n <window>` (when it
+  exists and the window is absent) — and either spawns or reattaches
+  a `portable-pty` client running `tmux attach-session -t <session>
+  \; select-window -t :<window>`. The `-n` on `new-session` matters:
+  without it tmux auto-creates a phantom shell window that keeps the
+  session alive after sanctel kills its `term-N` (issue #14).
 
 ## Two-layer durability
 
@@ -304,13 +309,16 @@ fn attach_tab_to_tmux(webview, worktreeId, initialCommand) -> Result:
   session = "sanctel_wt_" + worktreeId          # or sanctel_detached_<profileId>
   windowName = window_name_for(webview.label)   # from Tab record via attach args
 
-  # ensure session (race-safe: retry once on "session exists" from concurrent caller)
-  tmux has-session -t <session>
-    || tmux new-session -d -s <session> -c <worktreePath>
-
-  # ensure window — initialCommand only fires here, only for fresh windows
-  tmux list-windows -t <session> -F '#{window_name}' | grep -qx <windowName>
-    || tmux new-window -t <session> -n <windowName> -c <worktreePath> [initialCommand]
+  # ensure (session, window) in one atomic primitive (race-safe: retry once on
+  # "session exists" from concurrent caller). initialCommand only fires on the
+  # new-session / new-window branches — reattach is a pure no-op.
+  if tmux has-session -t <session>:
+    tmux list-windows -t <session> | grep -qx <windowName>
+      || tmux new-window -t <session> -n <windowName> -c <worktreePath> [initialCommand]
+  else:
+    tmux new-session -d -s <session> -n <windowName> -c <worktreePath> [initialCommand]
+    # -n is critical: without it tmux creates a phantom shell window that
+    # outlives sanctel's term-N and leaks the session forever (issue #14).
 
   # spawn pty client; wire to channel
   pty = portable_pty::spawn(["tmux", "attach-session", "-t", session,
