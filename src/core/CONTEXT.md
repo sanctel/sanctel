@@ -80,9 +80,7 @@ target specs as session/window/pane delimiters; the suffix separator is
   Worktree as name prefix. A terminal **Tab** points at exactly one
   TmuxSession, which contains exactly one window. Many Tabs on the
   same Worktree have **separate TmuxSessions sharing a name prefix**;
-  `tmux kill-session` is the one-shot close path. (This wording is
-  post-issue-#15; pre-#15 the model was one shared TmuxSession per
-  Worktree with multiple windows.)
+  `tmux kill-session` is the one-shot close path.
 - An **AgentSession** belongs to one Worktree (key = cwd path), not to a Tab.
   Multiple Tabs in the same Worktree see the same `claude --resume` history.
 
