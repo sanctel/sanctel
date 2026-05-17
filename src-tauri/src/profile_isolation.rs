@@ -48,9 +48,11 @@ pub fn profile_data_store_id(profile_id: &str) -> [u8; 16] {
 /// Apply per-platform Profile isolation to a `WebviewBuilder`. The only place
 /// in the codebase that branches on `target_os` for this concern.
 ///
-/// - **macOS / iOS:** `data_store_identifier(profile_data_store_id(...))`.
-///   The WKWebsiteDataStore is keyed to those bytes, so cookies / IndexedDB
-///   / localStorage are fully isolated per Profile and survive restart.
+/// - **macOS:** `data_store_identifier(profile_data_store_id(...))`. The
+///   WKWebsiteDataStore is keyed to those bytes, so cookies / IndexedDB /
+///   localStorage are fully isolated per Profile and survive restart. The
+///   same API works on iOS ≥ 17; when sanctel ever ships a mobile bridge,
+///   extend the cfg below to include `target_os = "ios"`.
 /// - **Windows / Linux:** `data_directory(<app-local>/profiles/<profile_id>)`.
 ///   WebView2 and WebKitGTK both honor this for cookies / IndexedDB /
 ///   localStorage. The path is computed via `app.path().app_local_data_dir()`
@@ -114,9 +116,13 @@ mod tests {
     /// explicit migration plan.
     #[test]
     fn profile_data_store_id_pinned_for_default_profile() {
+        // Literal — NOT re-derived from SANCTEL_PROFILE_NAMESPACE — so a
+        // namespace edit fails this assertion instead of sliding through.
+        let expected: [u8; 16] = [
+            0x46, 0x88, 0x68, 0xe8, 0x6a, 0x7a, 0x55, 0x78,
+            0x91, 0x69, 0x49, 0xf0, 0x79, 0x79, 0xe7, 0x19,
+        ];
         let id = profile_data_store_id("profile-default");
-        let expected =
-            Uuid::new_v5(&SANCTEL_PROFILE_NAMESPACE, b"profile-default").into_bytes();
         assert_eq!(id, expected);
         // Sanity: UUIDv5 sets version bits (byte 6 high nibble == 0x5) and
         // variant bits (byte 8 high two bits == 0b10).
