@@ -54,32 +54,36 @@ struct AppState {
     // before any frontend invokes; read by the `tmux_status` command so
     // React can gate terminal/chat tab creation behind a setup screen.
     tmux_status: Mutex<TmuxStatus>,
-    // Per-tmux-session locks. `create_tab` grabs the inner mutex for the
-    // session it's about to touch, then atomically lists existing window
-    // names, computes the next `term-N`, and calls `new-window`. Without
-    // the lock, two concurrent callers in the same session both read
-    // [term-1], both compute term-2, and tmux happily creates two windows
-    // with the same name.
-    session_locks: SessionLocks,
+    // Per-Worktree-prefix locks. `create_tab` grabs the inner mutex for
+    // the (worktreeId | detachedProfileId) base it's about to allocate
+    // against, then atomically scans existing sessions for that base,
+    // computes the next `term-N`, and calls `new-session`. Without the
+    // lock, two concurrent callers in the same Worktree both see no
+    // existing sessions and both pick `term-1`, racing on `new-session`
+    // for the same name. Per-tab session model (issue #15) means each
+    // tab is its own session — the lock now serializes the allocator
+    // across the *group* of sessions sharing a Worktree base.
+    allocation_locks: AllocationLocks,
 }
 
-/// Per-tmux-session mutex map. The outer mutex protects the HashMap; the
-/// inner `Arc<Mutex<()>>` is held during the list-windows → compute-name →
-/// new-window critical section in `create_tab`.
+/// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
+/// inner `Arc<Mutex<()>>` is held during the list-sessions → compute-name →
+/// new-session critical section in `create_tab`. Keyed by the Worktree (or
+/// detached-profile) base prefix that groups all of a tab-set's sessions.
 #[derive(Default)]
-struct SessionLocks {
+struct AllocationLocks {
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
-impl SessionLocks {
-    /// Returns the per-session mutex, creating it on first use. The caller
-    /// is expected to drop the returned Arc's MutexGuard before returning
-    /// from its critical section; the outer map mutex is held only long
-    /// enough to insert/get.
-    fn lock_for(&self, session: &str) -> Arc<Mutex<()>> {
+impl AllocationLocks {
+    /// Returns the per-base mutex, creating it on first use. The caller is
+    /// expected to drop the returned Arc's MutexGuard before returning from
+    /// its critical section; the outer map mutex is held only long enough
+    /// to insert/get.
+    fn lock_for(&self, base: &str) -> Arc<Mutex<()>> {
         self.locks
             .lock()
-            .entry(session.to_string())
+            .entry(base.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -174,9 +178,11 @@ struct CreateTabReq {
     /// and sends it directly.
     profile_id: String,
     /// Terminal/chat tabs carry server-held identity from create_tab time.
-    /// `worktreeId` keys the tmux session (`sanctel_wt_<id>` per ADR-0012);
-    /// `worktreePath` is the cwd passed to `tmux -c` so the shell starts in
-    /// the right directory. Both are None for detached terminal tabs.
+    /// `worktreeId` is the Worktree-prefix component of the tmux session
+    /// name (`sanctel_wt_<id>__<windowName>` per ADR-0012 revised by
+    /// issue #15); `worktreePath` is the cwd passed to `tmux -c` so the
+    /// shell starts in the right directory. Both are None for detached
+    /// terminal tabs.
     worktree_id: Option<String>,
     worktree_path: Option<String>,
     window_name: Option<String>,
@@ -219,7 +225,7 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
     }
 
     // For terminal/chat tabs, resolve `windowName` server-side under a
-    // per-session mutex when the request asked for "auto" allocation. Doing
+    // per-Worktree mutex when the request asked for "auto" allocation. Doing
     // it before we build the webview means a failure here surfaces to React
     // before any client-visible state is created.
     let asked_for_auto = is_terminal_like
@@ -227,14 +233,14 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
     let allocated_window_name: Option<String> = if asked_for_auto {
         let cwd =
             resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
-        let session = tmux_session_name(req.worktree_id.as_deref(), &req.profile_id);
-        let locks = &app.state::<AppState>().session_locks;
+        let base = tmux_session_base(req.worktree_id.as_deref(), &req.profile_id);
+        let locks = &app.state::<AppState>().allocation_locks;
         let tmux = TmuxCli::default();
         Some(
-            allocate_window_under_lock(
+            allocate_session_for_tab(
                 locks,
                 &tmux,
-                &session,
+                &base,
                 &cwd,
                 req.initial_command.as_deref(),
             )
@@ -339,30 +345,37 @@ fn resolve_worktree_cwd(
 }
 
 /// The atomic critical section behind `windowName: "auto"`: under the
-/// per-session mutex, peek at existing windows (empty list when the session
-/// doesn't exist yet), compute the next `term-N`, and let
-/// `ensure_session_window` either create the session with that window as
-/// its first child or add a fresh window to an existing session.
-/// Returns the resolved name. Generic over `CommandRunner` so the
-/// concurrency test below can drive it with a scripted-tmux fixture
-/// without spawning real processes.
-fn allocate_window_under_lock<R: CommandRunner>(
-    locks: &SessionLocks,
+/// per-Worktree-base mutex, scan existing sessions whose name starts with
+/// `<base>__`, extract the suffix as the candidate window-name set, compute
+/// the next `term-N`, and let `ensure_session_window` create the session
+/// `<base>__<term-N>` with that window as its first and only child.
+/// Returns the resolved window name (the session-name suffix). Generic
+/// over `CommandRunner` so the concurrency test below can drive it with a
+/// scripted-tmux fixture without spawning real processes.
+///
+/// Per-tab session model (ADR-0012 revised by issue #15): each terminal /
+/// chat tab is its own tmux session. The allocator picks a fresh
+/// `term-N` by scanning the sibling sessions sharing a Worktree base, not
+/// by scanning windows inside one session.
+fn allocate_session_for_tab<R: CommandRunner>(
+    locks: &AllocationLocks,
     tmux: &TmuxCli<R>,
-    session: &str,
+    base: &str,
     cwd: &str,
     initial_command: Option<&str>,
 ) -> Result<String, TmuxError> {
-    let lock = locks.lock_for(session);
+    let lock = locks.lock_for(base);
     let _guard = lock.lock();
-    let existing = if tmux.has_session(session)? {
-        tmux.list_windows(session)?
-    } else {
-        Vec::new()
-    };
-    let name = allocate_window_name(&existing);
-    tmux.ensure_session_window(session, &name, cwd, initial_command)?;
-    Ok(name)
+    let prefix = format!("{base}__");
+    let existing_suffixes: Vec<String> = tmux
+        .list_sessions()?
+        .into_iter()
+        .filter_map(|s| s.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    let window_name = allocate_window_name(&existing_suffixes);
+    let session = format!("{base}__{window_name}");
+    tmux.ensure_session_window(&session, &window_name, cwd, initial_command)?;
+    Ok(window_name)
 }
 
 #[tauri::command]
@@ -374,16 +387,17 @@ fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // proper destroy API.
     let _ = hide_webview(&app, &id);
 
-    // For terminal/chat tabs, ask tmux to kill the window so the shell dies.
-    // tmux automatically destroys the session when its last window closes,
-    // so we don't have to track that ourselves.
+    // For terminal/chat tabs, kill the per-tab tmux session so the shell
+    // dies. Each tab owns its own session (`sanctel_wt_<wt>__term-N`) per
+    // ADR-0012 revised by issue #15, so a single `kill-session` is the
+    // complete cleanup — no two-level `kill-window` + base-survival dance.
     let state = app.state::<AppState>();
     let record = state.tabs.lock().get(&id).cloned();
     if let Some(rec) = record {
         if rec.kind == "terminal" || rec.kind == "chat" {
             if let Some(handle) = state.terminals.remove(&id) {
                 let tmux = TmuxCli::default();
-                let _ = tmux.kill_window(&handle.session, &handle.window_name);
+                let _ = tmux.kill_session(&handle.session);
             }
         }
     }
@@ -436,11 +450,10 @@ fn set_content_rect(app: tauri::AppHandle, rect: Rect) -> Result<(), String> {
 // calling webview's label by looking up the TabRecord stored at create_tab
 // time. The frontend never passes its own tabId — enforced by the IPC shape.
 
-/// The tmux session name for a (worktreeId, profileId) pair. Worktree-keyed
-/// tabs land on `sanctel_wt_<id>` per ADR-0012; detached tabs share one
-/// `sanctel_detached_<profileId>` session. Single source of truth for the
-/// naming convention — every command that maps to a tmux session goes
-/// through here.
+/// The Worktree-base prefix that groups all sessions belonging to the same
+/// Worktree (or detached-profile fallback). The full per-tab session name
+/// is `<base>__<windowName>`; the allocator scans existing sessions by this
+/// prefix to find the next `term-N`.
 ///
 /// `_` (not `:`) is the separator because tmux parses `:` and `.` as the
 /// session/window/pane delimiters in target specs — `tmux list-windows -t
@@ -448,19 +461,44 @@ fn set_content_rect(app: tauri::AppHandle, rect: Rect) -> Result<(), String> {
 /// to address the session sanctel created. Both `<id>` components are
 /// passed through `tmux_safe` so a branch name with `/`, `.`, or whitespace
 /// (e.g., a Worktree built from `feature/foo`) cannot reintroduce the bug.
-fn tmux_session_name(worktree_id: Option<&str>, profile_id: &str) -> String {
+fn tmux_session_base(worktree_id: Option<&str>, profile_id: &str) -> String {
     match worktree_id {
         Some(id) => format!("sanctel_wt_{}", tmux_safe(id)),
         None => format!("sanctel_detached_{}", tmux_safe(profile_id)),
     }
 }
 
+/// The full tmux session name for one terminal/chat tab. Worktree-keyed
+/// tabs land on `sanctel_wt_<worktreeId>__<windowName>`; detached tabs on
+/// `sanctel_detached_<profileId>__<windowName>`. One tab → one tmux session
+/// (per ADR-0012 revised by issue #15). The Worktree prefix preserves
+/// "all tabs for one Worktree grouped together" in `tmux ls` for power
+/// users while making sure two clients never attach to the same session
+/// (the bug class issue #15 closes).
+///
+/// `__` is the suffix separator: every sanctel-built id flows through
+/// `tmux_safe`, which only ever produces single-`_` runs, so `__`
+/// unambiguously marks where the base ends and the window name begins.
+fn tmux_session_name(
+    worktree_id: Option<&str>,
+    profile_id: &str,
+    window_name: &str,
+) -> String {
+    format!(
+        "{}__{}",
+        tmux_session_base(worktree_id, profile_id),
+        window_name
+    )
+}
+
 /// Resolve identity for a terminal/chat tab. Worktree-keyed tabs (ADR-0012)
-/// attach to `sanctel_wt_<worktreeId>` with the Worktree's path as cwd;
-/// worktree-less tabs attach to `sanctel_detached_<profileId>` and start in
-/// `$HOME`. Window name is allocated server-side at create_tab time (under
-/// a per-session mutex) and stored on the TabRecord — falling back to
-/// "term-1" only when the frontend omitted it (legacy demo path).
+/// attach to `sanctel_wt_<worktreeId>__<windowName>` with the Worktree's
+/// path as cwd; worktree-less tabs attach to
+/// `sanctel_detached_<profileId>__<windowName>` and start in `$HOME`.
+/// Per-tab session model (issue #15): the window name is the session-name
+/// suffix, allocated server-side at create_tab time under the per-Worktree
+/// mutex and stored on the TabRecord. Falls back to `term-1` only when the
+/// frontend omitted it (legacy demo path).
 fn resolve_attach_params(
     record: &TabRecord,
     cols: u16,
@@ -477,7 +515,11 @@ fn resolve_attach_params(
     )?;
 
     Ok(AttachParams {
-        session: tmux_session_name(record.worktree_id.as_deref(), &record.profile_id),
+        session: tmux_session_name(
+            record.worktree_id.as_deref(),
+            &record.profile_id,
+            &window_name,
+        ),
         window_name,
         worktree_path,
         initial_command: record.initial_command.clone(),
@@ -651,7 +693,9 @@ mod tests {
     fn worktree_keyed_record_yields_sanctel_wt_session_and_cwd() {
         let rec = record(Some("sanctel-main"), Some("/home/me/code/sanctel"), Some("term-2"));
         let p = resolve_attach_params(&rec, 80, 24).unwrap();
-        assert_eq!(p.session, "sanctel_wt_sanctel-main");
+        // Per-tab session model (issue #15): the session name carries the
+        // window-name suffix. One tab → one session → one window.
+        assert_eq!(p.session, "sanctel_wt_sanctel-main__term-2");
         assert_eq!(p.worktree_path, "/home/me/code/sanctel");
         assert_eq!(p.window_name, "term-2");
     }
@@ -663,32 +707,52 @@ mod tests {
         // documents the contract by erroring out — `resolve_attach_params`
         // would surface the same error to the user.
         let p = resolve_attach_params(&rec, 80, 24).unwrap();
-        assert_eq!(p.session, "sanctel_detached_profile-default");
+        assert_eq!(p.session, "sanctel_detached_profile-default__term-1");
         assert_eq!(p.worktree_path, std::env::var("HOME").unwrap());
+    }
+
+    /// Two tabs in the same Worktree but with different windowNames must
+    /// land on **distinct** session names. This is the structural reason
+    /// the issue-#15 bug class (shared `curw` between two clients on one
+    /// session) becomes impossible — the two tabs are never two clients
+    /// on one session in the first place. The Worktree prefix is still
+    /// shared so `tmux ls` groups them visually.
+    #[test]
+    fn two_tabs_in_same_worktree_get_distinct_sessions() {
+        let a = tmux_session_name(Some("sanctel-main"), "profile-default", "term-1");
+        let b = tmux_session_name(Some("sanctel-main"), "profile-default", "term-2");
+        assert_ne!(a, b);
+        // Both share the Worktree base so a `tmux ls` filter on
+        // `sanctel_wt_sanctel-main__` lists exactly this tab-set.
+        let base = tmux_session_base(Some("sanctel-main"), "profile-default");
+        assert!(a.starts_with(&format!("{base}__")));
+        assert!(b.starts_with(&format!("{base}__")));
     }
 
     /// A worktreeId containing `:` or `.` (e.g., a Worktree built from a
     /// branch like `feature/foo` or `release.2025-05`) must NOT produce a
     /// session name with those characters — tmux would parse them as
     /// target separators and the session would be unreachable. This is the
-    /// regression test for issue #13.
+    /// regression test for issue #13, carried through the per-tab session
+    /// rename in issue #15.
     #[test]
     fn session_name_sanitizes_unsafe_characters_in_worktree_id() {
-        let session = tmux_session_name(Some("feature/foo:bar.baz"), "profile-default");
+        let session =
+            tmux_session_name(Some("feature/foo:bar.baz"), "profile-default", "term-1");
         assert!(!session.contains(':'), "session must not contain ':'");
         assert!(!session.contains('.'), "session must not contain '.'");
         assert!(!session.contains('/'), "session must not contain '/'");
-        assert_eq!(session, "sanctel_wt_feature_foo_bar_baz");
+        assert_eq!(session, "sanctel_wt_feature_foo_bar_baz__term-1");
     }
 
     /// Same regression test for the detached fallback: a profileId with
     /// `:` or `.` cannot produce an unreachable session name.
     #[test]
     fn session_name_sanitizes_unsafe_characters_in_profile_id() {
-        let session = tmux_session_name(None, "work:profile.1");
+        let session = tmux_session_name(None, "work:profile.1", "term-1");
         assert!(!session.contains(':'));
         assert!(!session.contains('.'));
-        assert_eq!(session, "sanctel_detached_work_profile_1");
+        assert_eq!(session, "sanctel_detached_work_profile_1__term-1");
     }
 
     #[test]
@@ -746,14 +810,16 @@ mod tests {
         assert!(result.error.is_none());
     }
 
-    // ─── windowName allocation under the per-session mutex (issue #10) ────
+    // ─── windowName allocation under the per-Worktree mutex (issue #10/#15) ───
 
     /// A tmux fixture: maintains a per-session set of window names, services
-    /// has-session / new-session / list-windows / new-window. Each operation
-    /// holds the inner lock just long enough to mutate state, so without the
-    /// per-session mutex inside `allocate_window_under_lock` the
-    /// list-windows → new-window window is wide open and concurrent callers
-    /// would collide on the same `term-N`.
+    /// has-session / new-session / list-sessions / list-windows / new-window.
+    /// Per-tab session model (issue #15) means the allocator drives
+    /// `list-sessions` (then filters by prefix), so this fixture grew a
+    /// `list-sessions` handler. Each operation holds the inner lock just
+    /// long enough to mutate state — without the per-base mutex inside
+    /// `allocate_session_for_tab`, concurrent callers would race between
+    /// list-sessions and new-session and collide on the same `term-N`.
     struct TmuxStateRunner {
         windows: Arc<Mutex<HashMap<String, Vec<String>>>>,
     }
@@ -769,12 +835,8 @@ mod tests {
                 windows: Arc::clone(&self.windows),
             }
         }
-        fn names_for(&self, session: &str) -> Vec<String> {
-            self.windows
-                .lock()
-                .get(session)
-                .cloned()
-                .unwrap_or_default()
+        fn session_names(&self) -> Vec<String> {
+            self.windows.lock().keys().cloned().collect()
         }
     }
 
@@ -789,7 +851,11 @@ mod tests {
                 .find(|a| {
                     matches!(
                         **a,
-                        "has-session" | "new-session" | "list-windows" | "new-window"
+                        "has-session"
+                            | "new-session"
+                            | "list-sessions"
+                            | "list-windows"
+                            | "new-window"
                     )
                 })
                 .copied()
@@ -838,6 +904,16 @@ mod tests {
                         })
                     }
                 }
+                "list-sessions" => {
+                    let mut names: Vec<String> =
+                        self.windows.lock().keys().cloned().collect();
+                    names.sort();
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: format!("{}\n", names.join("\n")).into_bytes(),
+                        stderr: vec![],
+                    })
+                }
                 "list-windows" => {
                     let target = arg_after(args, "-t")
                         .map(|s| s.trim_start_matches('=').to_string())
@@ -878,38 +954,43 @@ mod tests {
         }
     }
 
-    /// Spawn N parallel `allocate_window_under_lock` calls against the same
-    /// session. Without the per-session mutex inside the helper, multiple
-    /// callers would race between list-windows and new-window and end up
-    /// computing the same `term-N`. With the mutex, the N callers produce N
-    /// distinct names `term-1`…`term-N`, with no holes.
+    /// Spawn N parallel `allocate_session_for_tab` calls against the same
+    /// Worktree base. Without the per-base mutex inside the helper,
+    /// multiple callers would race between list-sessions and new-session
+    /// and end up computing the same `term-N` (then either collide on the
+    /// same session name or split into wrong N-counts). With the mutex,
+    /// the N callers produce N distinct names `term-1`…`term-N` AND N
+    /// distinct session names `<base>__term-1`…`<base>__term-N`, with
+    /// no holes. The distinct-session property is the load-bearing
+    /// invariant from issue #15.
     #[test]
-    fn allocate_window_under_lock_serializes_concurrent_callers() {
+    fn allocate_session_for_tab_serializes_concurrent_callers() {
         const N: usize = 12;
-        let session = "sanctel_wt_race-test";
+        let base = "sanctel_wt_race-test";
         let cwd = "/tmp";
 
-        let locks = Arc::new(SessionLocks::default());
+        let locks = Arc::new(AllocationLocks::default());
         let runner = TmuxStateRunner::new();
 
         let handles: Vec<_> = (0..N)
             .map(|_| {
                 let runner_clone = runner.clone_shared();
                 let locks = Arc::clone(&locks);
-                let session = session.to_string();
+                let base = base.to_string();
                 let cwd = cwd.to_string();
                 std::thread::spawn(move || {
                     let tmux = TmuxCli::new("test-sock", runner_clone);
-                    allocate_window_under_lock(&locks, &tmux, &session, &cwd, None)
+                    allocate_session_for_tab(&locks, &tmux, &base, &cwd, None)
                 })
             })
             .collect();
 
         let sort_by_term_index = |v: &mut Vec<String>| {
             v.sort_by_key(|s| {
-                s.strip_prefix("term-")
+                s.rsplit("term-")
+                    .next()
                     .and_then(|n| n.parse::<usize>().ok())
-                    .expect("allocated names match term-N")
+                    .expect("name ends in term-N")
             });
         };
 
@@ -919,44 +1000,74 @@ mod tests {
             .collect();
         sort_by_term_index(&mut got);
 
-        let expected: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
-        assert_eq!(got, expected, "N concurrent callers must produce N distinct term-N names with no holes");
+        let expected_names: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
+        assert_eq!(
+            got, expected_names,
+            "N concurrent callers must produce N distinct term-N names with no holes"
+        );
 
-        // The fixture's stored window list must match too — the mutex makes
-        // the new-window call atomic with the listing that drove the name
-        // choice.
-        let mut tmux_windows = runner.names_for(session);
-        sort_by_term_index(&mut tmux_windows);
-        assert_eq!(tmux_windows, expected);
+        // The fixture must have N distinct sessions, one per tab — this is
+        // the load-bearing invariant from issue #15. A pre-fix build would
+        // have created one shared session with N windows; the new model
+        // creates N sessions with one window each.
+        let mut sessions = runner.session_names();
+        sort_by_term_index(&mut sessions);
+        let expected_sessions: Vec<String> = (1..=N)
+            .map(|i| format!("{base}__term-{i}"))
+            .collect();
+        assert_eq!(sessions, expected_sessions);
     }
 
-    /// Different sessions don't serialize against each other: two callers
-    /// against distinct sessions both get `term-1`. Smoke-test that the
-    /// per-session keying isn't accidentally globalized.
+    /// Different Worktree bases don't serialize against each other: two
+    /// callers against distinct bases both get `term-1` for their first
+    /// tab. Smoke-test that the per-base keying isn't accidentally
+    /// globalized.
     #[test]
-    fn allocate_window_under_lock_does_not_serialize_distinct_sessions() {
-        let locks = SessionLocks::default();
+    fn allocate_session_for_tab_does_not_serialize_distinct_worktrees() {
+        let locks = AllocationLocks::default();
         let runner = TmuxStateRunner::new();
         let tmux_a = TmuxCli::new("t", runner.clone_shared());
         let tmux_b = TmuxCli::new("t", runner.clone_shared());
 
-        let a = allocate_window_under_lock(
-            &locks,
-            &tmux_a,
-            "sanctel_wt_a",
-            "/tmp",
-            None,
-        )
-        .unwrap();
-        let b = allocate_window_under_lock(
-            &locks,
-            &tmux_b,
-            "sanctel_wt_b",
-            "/tmp",
-            None,
-        )
-        .unwrap();
+        let a =
+            allocate_session_for_tab(&locks, &tmux_a, "sanctel_wt_a", "/tmp", None).unwrap();
+        let b =
+            allocate_session_for_tab(&locks, &tmux_b, "sanctel_wt_b", "/tmp", None).unwrap();
         assert_eq!(a, "term-1");
         assert_eq!(b, "term-1");
+    }
+
+    /// Allocator scan correctness: when sibling sessions with the same
+    /// base prefix already exist, the next allocation continues the
+    /// monotonic `term-N` counter — picking max + 1, not lowest free.
+    /// The scan must IGNORE sessions on other bases (a different
+    /// Worktree) and sessions whose suffix doesn't match the `term-N`
+    /// pattern.
+    #[test]
+    fn allocate_session_for_tab_scans_existing_sibling_sessions() {
+        let locks = AllocationLocks::default();
+        let runner = TmuxStateRunner::new();
+        // Seed: two prior tabs on this Worktree + one on a different
+        // Worktree. The unrelated session must not perturb the counter.
+        {
+            let mut map = runner.windows.lock();
+            map.insert("sanctel_wt_target__term-1".into(), vec!["term-1".into()]);
+            map.insert("sanctel_wt_target__term-3".into(), vec!["term-3".into()]);
+            map.insert("sanctel_wt_other__term-1".into(), vec!["term-1".into()]);
+        }
+
+        let tmux = TmuxCli::new("t", runner.clone_shared());
+        let next =
+            allocate_session_for_tab(&locks, &tmux, "sanctel_wt_target", "/tmp", None)
+                .unwrap();
+        // Max term-N on the target base is 3 → next is term-4. The
+        // unrelated `sanctel_wt_other__term-1` must NOT push us to 5.
+        assert_eq!(next, "term-4");
+
+        // The new session is `sanctel_wt_target__term-4` — visible in the
+        // fixture, isolated from the other Worktree's sessions.
+        let sessions = runner.session_names();
+        assert!(sessions.contains(&"sanctel_wt_target__term-4".to_string()));
+        assert!(sessions.contains(&"sanctel_wt_other__term-1".to_string()));
     }
 }

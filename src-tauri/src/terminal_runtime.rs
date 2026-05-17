@@ -70,9 +70,12 @@ pub struct TerminalHandle {
     writer: Mutex<Box<dyn Write + Send>>,
     /// Master so we can call `resize()` on it.
     master: Mutex<Box<dyn MasterPty + Send>>,
-    /// Server-held identity used by terminal_attach lookups.
+    /// Per-tab tmux session name (`sanctel_wt_<wt>__term-N` per ADR-0012
+    /// revised by issue #15). `close_tab` passes it to
+    /// `TmuxCli::kill_session` to tear down the tab's tmux server-side
+    /// state in one shot. The window name is encoded in the session name
+    /// suffix so it is not stored separately.
     pub session: String,
-    pub window_name: String,
 }
 
 impl TerminalHandle {
@@ -150,7 +153,11 @@ pub fn check_worktree_exists(worktree_path: &str) -> Result<(), AttachError> {
 }
 
 /// Ensure (session, window) exist in tmux, then spawn a portable-pty client
-/// that runs `tmux attach-session -t <session> \; select-window -t :<window>`.
+/// that runs `tmux attach-session -t <session>`. Per-tab session model
+/// (ADR-0012 revised by issue #15): each tab owns its own tmux session
+/// (`sanctel_wt_<wt>__term-N`) containing exactly one window, so there is
+/// never anything to `select-window` to and the attach is byte-isolated
+/// from other tabs in the same Worktree by construction.
 /// Reads from the PTY in a background thread and pushes raw bytes into
 /// `on_output`. Returns the handle holding the master/writer so subsequent
 /// terminal_write / terminal_resize / close_tab calls can drive it.
@@ -180,9 +187,12 @@ pub fn attach_tab_to_tmux(
     )?;
 
     // 2. Spawn the portable-pty client. The PTY runs:
-    //      tmux -L <socket> -f /dev/null attach-session -t <session> \
-    //                                  \; select-window -t :<window>
-    //    portable-pty's `;` argument is the same `;` tmux uses to chain.
+    //      tmux -L <socket> -f /dev/null attach-session -t <session>
+    //    No `select-window` clause: the session has exactly one window
+    //    (created with `new-session -n`) and tmux's session-scoped `curw`
+    //    pointer is therefore unique to this tab — two tabs in the same
+    //    Worktree don't share their active-window pointer, which is the
+    //    bug class issue #15 closes.
     let pty_system = NativePtySystem::default();
     let pair = pty_system
         .openpty(PtySize {
@@ -202,10 +212,6 @@ pub fn attach_tab_to_tmux(
         "attach-session",
         "-t",
         &format!("={}", params.session),
-        ";",
-        "select-window",
-        "-t",
-        &format!(":{}", params.window_name),
     ]);
     cmd.cwd(&params.worktree_path);
 
@@ -235,7 +241,6 @@ pub fn attach_tab_to_tmux(
         writer: Mutex::new(writer),
         master: Mutex::new(pair.master),
         session: params.session,
-        window_name: params.window_name,
     })
 }
 
@@ -325,7 +330,6 @@ mod tests {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             session: "test-session".into(),
-            window_name: "term-1".into(),
         }
     }
 
@@ -388,7 +392,6 @@ mod tests {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             session: "test-session".into(),
-            window_name: "term-1".into(),
         };
 
         handle
@@ -400,16 +403,20 @@ mod tests {
         assert_eq!(&buf, b"hello");
     }
 
-    /// Real-tmux integration test for the idempotent attach algorithm.
+    /// Real-tmux integration test for the per-tab session model (issue #15).
     ///
     /// Skips if tmux isn't installed (sandcastle CI doesn't ship it). Runs on
     /// a temp socket so it never touches the user's tmux or sanctel's prod
     /// socket.
     ///
     /// Asserts the *exact* window list (length plus contents), not just
-    /// "contains term-1". This is what catches the phantom-window regression
-    /// from issue #14 — a bare `new-session` leaves a `zsh-` window in the
+    /// "contains term-1". This catches the phantom-window regression from
+    /// issue #14 — a bare `new-session` leaves a `zsh-` window in the
     /// session, which would extend the list and fail this assertion.
+    ///
+    /// The two-tabs-share-Worktree regression guard for issue #15 lives in
+    /// `two_tabs_in_same_worktree_have_independent_output_against_real_tmux`
+    /// below — kept separate so each test exercises one invariant.
     #[test]
     fn idempotent_attach_against_real_tmux() {
         if !tmux_available() {
@@ -425,8 +432,10 @@ mod tests {
             .args(["-L", &socket, "kill-server"])
             .output();
 
-        // 1. Fresh create: session contains EXACTLY the requested window.
-        let session = "sanctel_wt_test-wt";
+        // 1. Fresh create: per-tab session contains EXACTLY the requested
+        //    window. The session name itself encodes the windowName per
+        //    issue #15's new naming.
+        let session = "sanctel_wt_test-wt__term-1";
         let window = "term-1";
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
 
@@ -447,35 +456,147 @@ mod tests {
             "reattach must not duplicate or add windows",
         );
 
-        // 3. A second tab in the same session: the per-Worktree session
-        //    grows by exactly one window.
-        let window2 = "term-2";
-        tmux.ensure_session_window(session, window2, &cwd, None).unwrap();
-        let mut after_two = tmux.list_windows(session).unwrap();
-        after_two.sort();
-        assert_eq!(
-            after_two,
-            vec![window.to_string(), window2.to_string()],
-            "session must contain exactly the two requested windows",
-        );
-
-        // 4. Kill the last sanctel window — tmux must destroy the session
-        //    automatically. This is the ADR-0012 "tmux destroys the session
-        //    when its last window dies" promise the phantom-window bug broke.
-        tmux.kill_window(session, window).unwrap();
-        tmux.kill_window(session, window2).unwrap();
+        // 3. `kill_session` is the one-shot cleanup `close_tab` uses for
+        //    terminal/chat tabs in the per-tab session model. Must be
+        //    idempotent on a missing session so reattach paths never
+        //    error out from a redundant call.
+        tmux.kill_session(session).unwrap();
         assert!(
             !tmux.has_session(session).unwrap(),
-            "session must be destroyed after its last sanctel window is killed",
+            "session must be gone after kill_session",
         );
+        tmux.kill_session(session).unwrap();
 
-        // 5. Re-creating after auto-destruction puts us back to exactly one
-        //    window, not two (no resurrection of stale state).
+        // 4. Re-creating after kill puts us back to exactly one window
+        //    (no resurrected stale state).
         tmux.ensure_session_window(session, window, &cwd, None).unwrap();
         assert_eq!(
             tmux.list_windows(session).unwrap(),
             vec![window.to_string()],
         );
+
+        // Cleanup.
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .output();
+    }
+
+    /// Regression guard for the bug class issue #15 closes: two terminal
+    /// tabs in the same Worktree must NOT share xterm output. The cause
+    /// was structural in tmux — `struct session` carries the `curw`
+    /// (current window) pointer, so two clients attached to one session
+    /// always render the same window. The fix is one tmux session per
+    /// tab, named with the Worktree as prefix.
+    ///
+    /// This test exercises the fix end-to-end against a real tmux server:
+    /// two sessions for the same Worktree base, a distinct marker sent
+    /// to each, then `capture-pane` asserts each session captured ONLY
+    /// its own marker. A pre-fix build (one shared session) would see
+    /// both markers in both captures.
+    ///
+    /// Skips if tmux isn't installed.
+    #[test]
+    fn two_tabs_in_same_worktree_have_independent_output_against_real_tmux() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not installed");
+            return;
+        }
+
+        let socket = format!("sanctel-test-{}", std::process::id());
+        let tmux = TmuxCli::new(socket.clone(), crate::tmux_cli::RealCommandRunner);
+        let _ = Command::new("tmux")
+            .args(["-L", &socket, "kill-server"])
+            .output();
+
+        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+
+        // Two sibling per-tab sessions. Same Worktree base, distinct
+        // windowName suffixes — exactly the post-fix naming convention.
+        let session_a = "sanctel_wt_test-wt__term-1";
+        let session_b = "sanctel_wt_test-wt__term-2";
+        tmux.ensure_session_window(session_a, "term-1", &cwd, None).unwrap();
+        tmux.ensure_session_window(session_b, "term-2", &cwd, None).unwrap();
+
+        // Both sessions exist and contain exactly one window each — the
+        // load-bearing structural invariant from the fix.
+        assert!(tmux.has_session(session_a).unwrap());
+        assert!(tmux.has_session(session_b).unwrap());
+        assert_eq!(tmux.list_windows(session_a).unwrap().len(), 1);
+        assert_eq!(tmux.list_windows(session_b).unwrap().len(), 1);
+
+        // Send a distinct marker into each session. `send-keys` writes
+        // into the session's current window — and because each session
+        // has its OWN `curw` (the bug fix), writing to A lands only in
+        // A's pane. Pre-fix, A and B would have been one shared session
+        // with one `curw`, so both writes would target the same pane.
+        let marker_a = "SANCTEL_TAB_A_MARKER";
+        let marker_b = "SANCTEL_TAB_B_MARKER";
+        let _ = Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "send-keys",
+                "-t",
+                &format!("={session_a}"),
+                &format!("printf '{marker_a}\\n'"),
+                "Enter",
+            ])
+            .output()
+            .unwrap();
+        let _ = Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "send-keys",
+                "-t",
+                &format!("={session_b}"),
+                &format!("printf '{marker_b}\\n'"),
+                "Enter",
+            ])
+            .output()
+            .unwrap();
+
+        // Give the shells a beat to render. Short sleep is fine — the
+        // assertion is structural (which session saw which marker), not
+        // timing-sensitive.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let capture = |session: &str| -> String {
+            let out = Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "capture-pane",
+                    "-t",
+                    &format!("={session}"),
+                    "-p",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let cap_a = capture(session_a);
+        let cap_b = capture(session_b);
+
+        // The post-fix invariant: each session sees only its own marker.
+        // A failing assertion here means the sessions are sharing state —
+        // i.e., the bug is back.
+        assert!(cap_a.contains(marker_a), "tab A must see A's marker: {cap_a}");
+        assert!(!cap_a.contains(marker_b), "tab A must NOT see B's marker: {cap_a}");
+        assert!(cap_b.contains(marker_b), "tab B must see B's marker: {cap_b}");
+        assert!(!cap_b.contains(marker_a), "tab B must NOT see A's marker: {cap_b}");
+
+        // close_tab path (one `kill_session` per tab). Each kill must
+        // affect only its own tab; the sibling stays up.
+        tmux.kill_session(session_a).unwrap();
+        assert!(!tmux.has_session(session_a).unwrap());
+        assert!(
+            tmux.has_session(session_b).unwrap(),
+            "killing tab A must not affect tab B (sibling session)",
+        );
+        tmux.kill_session(session_b).unwrap();
+        assert!(!tmux.has_session(session_b).unwrap());
 
         // Cleanup.
         let _ = Command::new("tmux")

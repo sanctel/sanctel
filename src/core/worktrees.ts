@@ -3,8 +3,9 @@
 // branches) is out of scope for the v0.3 terminal-runtime PRD and is
 // tracked separately. The values here are pointers to real on-disk
 // directories so `tmux -c <path>` lands somewhere shells can actually
-// chdir into; tabs in the same Worktree share a `sanctel_wt_<id>` tmux
-// session per ADR-0012.
+// chdir into; tabs in the same Worktree get sibling
+// `sanctel_wt_<id>__<windowName>` tmux sessions per ADR-0012 (revised
+// by issue #15).
 
 import type { Worktree } from "./types";
 
