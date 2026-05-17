@@ -8,13 +8,15 @@
 //   - The active webview is positioned to overlay the React "content area".
 //   - Inactive webviews are moved far off-screen (-9999, -9999) — they keep
 //     running but aren't visible. Switching tabs is instant.
-//   - Identity isolation (Arc's "Profile" concept): each webview is created
-//     with `with_profile_name(profile_id)`, giving it a cookie /
-//     localStorage / IndexedDB store keyed to that profile. All tabs across
-//     all Spaces that share a profile_id share the same cookies. The
-//     frontend computes profile_id via `space.profileId` and sends it.
+//   - Identity isolation (Arc's "Profile" concept, ADR-0003): each webview
+//     is configured via `profile_isolation::apply_profile_isolation`, which
+//     picks the right per-platform Tauri 2.11 API — `data_directory` on
+//     Windows/Linux, `data_store_identifier` on macOS WKWebView. All tabs
+//     across all Spaces that share a `profile_id` share cookies; different
+//     `profile_id`s are fully isolated.
 // ───────────────────────────────────────────────────────────────────────────
 
+mod profile_isolation;
 mod terminal_runtime;
 mod tmux_cli;
 
@@ -27,6 +29,7 @@ use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
+use crate::profile_isolation::apply_profile_isolation;
 use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
 use crate::tmux_cli::{allocate_window_name, CommandRunner, TmuxCli, TmuxError};
 
@@ -162,10 +165,12 @@ struct CreateTabReq {
     id: String,
     kind: String,   // "browser" | "terminal" | "chat"
     url: String,    // external URL for "browser"; "local://terminal" etc. for the others
-    /// Maps directly to Tauri's `WebviewBuilder::with_profile_name`.
-    /// All tabs sharing this `profile_id` share cookies/localStorage.
-    /// In Arc terms: this is the Profile, NOT the Space. The frontend
-    /// computes it via `space.profileId` and sends it directly.
+    /// Drives Profile cookie / localStorage isolation per ADR-0003. Threaded
+    /// through `profile_isolation::apply_profile_isolation`, which picks the
+    /// right Tauri 2.11 API per platform (data_directory on Windows/Linux,
+    /// data_store_identifier on macOS WKWebView). In Arc terms: this is the
+    /// Profile, NOT the Space. The frontend computes it via `space.profileId`
+    /// and sends it directly.
     profile_id: String,
     /// Terminal/chat tabs carry server-held identity from create_tab time.
     /// `worktreeId` keys the tmux session (`sanctel-wt:<id>` per ADR-0012);
@@ -264,18 +269,19 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
         other => return Err(format!("unknown tab kind: {other}")),
     };
 
-    // Build the webview. `with_profile_name` gives this webview a data store
-    // scoped to the given profile_id. ALL tabs across ALL spaces that share a
-    // profile_id share cookies/localStorage. This is the Arc model: Profile is
-    // the cookie boundary; Space is purely organizational.
-    //
-    // Platform notes:
-    //   - Windows (WebView2): profile_name cleanly isolates user data.
-    //   - macOS (WKWebView): mapped to a separate WKWebsiteDataStore per name.
-    //   - Linux (WebKitGTK): isolated per WebContext keyed by name.
-    let builder = WebviewBuilder::new(&req.id, webview_url)
-        .with_profile_name(&req.profile_id)
-        .auto_resize();
+    // Build the webview. Profile isolation lives in `apply_profile_isolation`
+    // — the single place that branches per-platform on the right Tauri 2.11
+    // API (data_directory on Windows/Linux, data_store_identifier on macOS
+    // WKWebView). ALL tabs across ALL Spaces that share a profile_id share
+    // cookies/localStorage; different profile_ids are fully isolated. This
+    // is the Arc model encoded in ADR-0003: Profile is the cookie boundary,
+    // Space is purely organizational.
+    let builder = apply_profile_isolation(
+        WebviewBuilder::new(&req.id, webview_url),
+        &req.profile_id,
+        &app,
+    )?
+    .auto_resize();
 
     // Initial position: off-screen, then we'll show_webview to bring it on.
     let rect = *app.state::<AppState>().content_rect.lock();
