@@ -32,9 +32,9 @@ impl Backend {
     }
 
     /// Pure resolver — separated so unit tests can drive it without touching
-    /// process env. Recognized values are `"zellij"` (case-sensitive, matches
-    /// the issue spec) and `"tmux"`; anything else (None, empty string,
-    /// typo, unset) maps to the safe default `Tmux`.
+    /// process env. Trimmed `"zellij"` (case-sensitive) selects the spike;
+    /// every other value (None, empty string, typo, explicit `"tmux"`) maps
+    /// to the safe default `Tmux`.
     ///
     /// The "unknown → tmux" branch is deliberate: a misspelled env var must
     /// NOT silently switch to the spike backend, nor must it surface a
@@ -80,7 +80,6 @@ mod tests {
     fn unknown_value_falls_back_to_tmux() {
         assert_eq!(Backend::from_env_value(Some("zelli")), Backend::Tmux);
         assert_eq!(Backend::from_env_value(Some("TMUX")), Backend::Tmux);
-        assert_eq!(Backend::from_env_value(Some("zellij ")), Backend::Zellij);
         assert_eq!(Backend::from_env_value(Some("")), Backend::Tmux);
     }
 
@@ -88,6 +87,7 @@ mod tests {
     /// pads env values when they're built up by string concatenation.
     #[test]
     fn whitespace_around_value_is_trimmed() {
+        assert_eq!(Backend::from_env_value(Some("zellij ")), Backend::Zellij);
         assert_eq!(Backend::from_env_value(Some("  zellij  ")), Backend::Zellij);
         assert_eq!(Backend::from_env_value(Some("\tzellij\n")), Backend::Zellij);
     }

@@ -225,11 +225,9 @@ fn supervisor_loop<L: Launcher>(
                 attempt = 0; // healthy spawn — reset the schedule
             }
             Err(_) => {
-                // Loop iteration kicks us back into the backoff sleep
-                // by constructing a "dead" placeholder child; simpler is
-                // to just continue the outer loop with a one-shot zombie
-                // child. Since watch_child would immediately observe it
-                // as exited, fall through with a no-op child.
+                // Substitute a zombie placeholder so the next loop iteration
+                // re-enters watch+backoff without special-casing the
+                // spawn-failed path.
                 child = Box::new(ZombieChild);
             }
         }
@@ -323,13 +321,15 @@ mod tests {
                 live_handles: Arc::new(Mutex::new(Vec::new())),
             }
         }
-        /// Mark the most recent child as dead so the supervisor observes
-        /// the "external kill" condition.
-        fn kill_latest(&self) {
-            let handles = self.live_handles.lock().unwrap();
-            if let Some(h) = handles.last() {
-                h.store(false, Ordering::SeqCst);
-            }
+    }
+
+    /// Mark the most recent scripted child as dead so the supervisor
+    /// observes the "external kill" condition. Free function (not a method
+    /// on MockLauncher) because the launcher is moved into
+    /// `ZellijDaemon::start` and the tests hold the handles Arc separately.
+    fn kill_latest(handles: &Mutex<Vec<Arc<AtomicBool>>>) {
+        if let Some(h) = handles.lock().unwrap().last() {
+            h.store(false, Ordering::SeqCst);
         }
     }
 
@@ -385,11 +385,7 @@ mod tests {
         let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
         assert_eq!(launches.load(Ordering::SeqCst), 1);
 
-        // Simulate external kill.
-        {
-            let h = handles.lock().unwrap();
-            h.last().unwrap().store(false, Ordering::SeqCst);
-        }
+        kill_latest(&handles);
 
         // First respawn fires after a ~100ms backoff. Allow generous
         // headroom; we're asserting "within the acceptance window", not
@@ -424,9 +420,7 @@ mod tests {
         // latest child. If the supervisor is still running, it would
         // observe this and spawn again. Wait a generous window covering
         // the longest possible initial backoff to confirm it doesn't.
-        if let Some(h) = handles.lock().unwrap().last() {
-            h.store(false, Ordering::SeqCst);
-        }
+        kill_latest(&handles);
         thread::sleep(Duration::from_millis(300));
         assert_eq!(launches.load(Ordering::SeqCst), after_shutdown);
     }
@@ -443,26 +437,8 @@ mod tests {
         let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
         let after_start = launches.load(Ordering::SeqCst);
         drop(daemon);
-        if let Some(h) = handles.lock().unwrap().last() {
-            h.store(false, Ordering::SeqCst);
-        }
+        kill_latest(&handles);
         thread::sleep(Duration::from_millis(200));
         assert_eq!(launches.load(Ordering::SeqCst), after_start);
-    }
-
-    /// `kill_latest` is a test helper, used to keep test code readable.
-    /// Belt-and-braces that the helper actually advances state.
-    #[test]
-    fn mock_kill_latest_marks_child_dead() {
-        let launcher = MockLauncher::new();
-        let _ = launcher.launch(0).unwrap();
-        launcher.kill_latest();
-        assert!(!launcher
-            .live_handles
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .load(Ordering::SeqCst));
     }
 }
