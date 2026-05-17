@@ -9,14 +9,14 @@
 
 import type { Worktree } from "./types";
 
-const HOME = "/home/agent";
+const HOME = "/Users/almeynman";
 
 export const DEMO_WORKTREES: readonly Worktree[] = [
   {
     id: "sanctel-main",
     projectId: "sanctel",
     branch: "main",
-    path: `${HOME}/workspace`,
+    path: `${HOME}/code/sanctel`,
     status: "active",
   },
   {
