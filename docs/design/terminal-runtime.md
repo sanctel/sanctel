@@ -38,9 +38,10 @@ tmux -L sanctel -f /dev/null <command...>
 - `-f /dev/null` ignores the user's `~/.tmux.conf`. Sanctel manages its
   own terminal environment; the user's customizations apply to their
   own tmux, not ours.
-- A user can attach to a sanctel window from their own shell with
-  `tmux -L sanctel attach -t sanctel_wt_<wt>` — supported, undocumented
-  power-user affordance.
+- A user can attach to a sanctel session from their own shell with
+  `tmux -L sanctel attach -t sanctel_wt_<wt>__term-1` — supported,
+  undocumented power-user affordance. `tmux -L sanctel ls | grep
+  sanctel_wt_<wt>__` lists every tab in that Worktree.
 - `tmux kill-server` in the user's terminal only kills their server;
   sanctel's is untouched. Symmetric.
 
@@ -71,63 +72,84 @@ ConPTY-based backend behind the same Rust interface.
 
 ## tmux session naming
 
-**One tmux session per Worktree, one tmux window per terminal Tab.**
+**One tmux session per terminal Tab, named with the Worktree as a
+prefix.** Per-tab sessions are the structural fix for the bug class
+issue #15 closes (two clients on one session share `curw`).
 
 ```
-tmux session "sanctel_wt_<worktreeId>"                       ← keyed by Worktree
-├── window "term-1"                              ← Tab A
-├── window "term-2"                              ← Tab B
-└── window "term-3"                              ← Tab C
+tmux session "sanctel_wt_<worktreeId>__term-1"          ← Tab A (one window: term-1)
+tmux session "sanctel_wt_<worktreeId>__term-2"          ← Tab B (one window: term-2)
+tmux session "sanctel_wt_<worktreeId>__term-3"          ← Tab C (one window: term-3)
 ```
 
-Worktree-less terminal tabs (a plain shell in `$HOME`) attach to a
-fallback session `sanctel_detached_<profileId>`.
+`tmux -L sanctel ls | grep sanctel_wt_<worktreeId>__` lists every tab
+in that Worktree — Worktree grouping is preserved at the name level
+even though no tmux entity groups them structurally.
 
-The separator is `_` (not `:`) because tmux parses `:` and `.` in
-target specs as session/window/pane delimiters — a session named
-`sanctel-wt:<id>` is unreachable for `list-windows`, `kill-window`, or
-`attach-session` lookups. Sanctel-built names are kept in
-`[A-Za-z0-9_-]`, and any `worktreeId` / `profileId` is passed through
-`tmux_safe` (replaces unsafe characters with `_`) before concatenation.
+Worktree-less terminal tabs (a plain shell in `$HOME`) attach to
+per-tab sessions named `sanctel_detached_<profileId>__<windowName>`.
+
+The suffix separator is `__` (double underscore). Every sanctel-built
+id flows through `tmux_safe`, which only ever produces single-`_`
+runs, so `__` unambiguously marks where the Worktree base ends and the
+windowName begins.
+
+The base-segment separator is `_` (not `:`) because tmux parses `:`
+and `.` in target specs as session/window/pane delimiters — a session
+named `sanctel-wt:<id>` is unreachable for `list-sessions`,
+`kill-session`, or `attach-session` lookups. Sanctel-built names are
+kept in `[A-Za-z0-9_-]`, and any `worktreeId` / `profileId` is passed
+through `tmux_safe` (replaces unsafe characters with `_`) before
+concatenation.
 
 ### Why
 
-- **`worktreeId` is durable by definition** (a Worktree is a filesystem
-  entity; ADR-0005). Using it as the session key means the session name
-  is reproducible on every launch with no per-tab UUIDs.
-- **Tab id stays fully ephemeral**, in line with ADR-0004. The Tab record
-  needs only a small immutable `windowName` string to find its tmux
-  window — not a session id.
+- **Each tab is its own session, so two clients never attach to the
+  same session.** The `curw` pointer in tmux's `struct session` cannot
+  be shared between tabs because they have no session in common. The
+  bug class issue #15 closes is structurally impossible.
+- **`worktreeId` is durable by definition** (a Worktree is a
+  filesystem entity; ADR-0005). Using it as the session-name prefix
+  means the session name is reproducible on every launch with no
+  per-tab UUIDs.
+- **Tab id stays fully ephemeral**, in line with ADR-0004. The Tab
+  record needs only a small immutable `windowName` string — which is
+  also the session-name suffix.
 - **Multiple terminal tabs per worktree get independent shells**,
-  matching VS Code / iTerm mental model. Sharing a shell across tabs
-  (mirrored view) is a future opt-in feature that adds another client to
-  the same window, not another session.
-- **Cleanup is automatic**: closing a tab runs `tmux kill-window`. tmux
-  destroys the session when its last window dies. No bookkeeping in Rust.
+  matching VS Code / iTerm mental model.
+- **Cleanup is one shot**: closing a tab runs
+  `tmux kill-session -t <session>`. The session's one window dies with
+  it. No bookkeeping in Rust, no two-level kill dance.
 
 ### `windowName` assignment
 
 Stable, monotonic per Worktree:
 
 ```
-windowName = "term-N"   where N = 1 + max(existing term-N in this session)
+windowName = "term-N"   where N = 1 + max(existing term-N in sibling sessions)
 ```
 
-**Allocation is server-side and atomic.** React passes `window_name: "auto"`
-(or omits the field) on `create_tab` for terminal/chat Tabs. Inside
-`create_tab`, Rust takes a per-session mutex, reads existing names via
-`tmux list-windows -t sanctel_wt_<wt> -F '#{window_name}'`, computes the
-next `term-N`, calls `tmux new-window -n <name>`, releases the mutex,
-and returns the resolved name in `CreateTabResp.window_name`. React
-reads the resolved name back and persists it in SQLite. The window name
-is **immutable for the Tab's lifetime** — the Tab's display title is a
-separate field (see Two-layer durability below).
+The `windowName` is the **session-name suffix** in the per-tab model;
+it remains the in-session window name as well so `tmux list-windows`
+of a tab's session returns exactly `["term-N"]`.
 
-The mutex matters: tmux allows duplicate window names by default, so a
-client-side "read names, compute next, call new-window" sequence races
-when two callers run it in parallel against the same session. The
-per-session mutex is the smallest critical section that closes that
-window.
+**Allocation is server-side and atomic.** React passes
+`window_name: "auto"` (or omits the field) on `create_tab` for
+terminal/chat Tabs. Inside `create_tab`, Rust takes a per-Worktree-base
+mutex, lists existing sessions via
+`tmux list-sessions -F '#{session_name}'`, filters by the
+`sanctel_wt_<wt>__` prefix, extracts each suffix as a `term-N`
+candidate, runs the monotonic allocator, calls
+`tmux new-session -d -s <base>__<term-N> -n <term-N>`, releases the
+mutex, and returns the resolved name in `CreateTabResp.window_name`.
+React reads the resolved name back and persists it in SQLite. The
+window name is **immutable for the Tab's lifetime** — the Tab's
+display title is a separate field (see Two-layer durability below).
+
+The mutex matters: without it two concurrent callers in the same
+Worktree both see "no existing sessions" and both compute `term-1`,
+racing on `new-session` for the same session name. The per-Worktree
+mutex is the smallest critical section that closes that window.
 
 ### Comparison to references
 
@@ -192,9 +214,12 @@ fn terminal_resize(webview: tauri::Webview, cols: u16, rows: u16) -> Result<(), 
 ```
 
 Lifecycle close is handled by extending the existing `close_tab` in
-`src-tauri/src/lib.rs:166` to kill the tmux window for `kind=terminal`
-tabs. No separate `terminal_close` command — one close path, one source
-of truth.
+`src-tauri/src/lib.rs` to call `tmux kill-session -t <session>` for
+`kind=terminal | chat` tabs. Each tab owns its own session per
+issue #15, so a single `kill-session` removes the tab's shell and the
+session in one shot — no two-level `kill-window` + base-survival
+coordination. No separate `terminal_close` command — one close path,
+one source of truth.
 
 ### Key properties
 
@@ -210,14 +235,16 @@ of truth.
   fan-out, gives backpressure semantics from the runtime.
 - **`terminal_attach` is the single mount entry point** for both fresh
   tabs and reattach-on-launch. The Rust side runs the single
-  `ensure_session_window` primitive — `tmux has-session` then either
-  `new-session -d -s <session> -n <window> -c <cwd>` (when the session
-  is missing) or `new-window -t <session> -n <window>` (when it
-  exists and the window is absent) — and either spawns or reattaches
-  a `portable-pty` client running `tmux attach-session -t <session>
-  \; select-window -t :<window>`. The `-n` on `new-session` matters:
-  without it tmux auto-creates a phantom shell window that keeps the
-  session alive after sanctel kills its `term-N` (issue #14).
+  `ensure_session_window` primitive against the tab's *own* per-tab
+  session — `tmux has-session` then `new-session -d -s
+  <base>__<window> -n <window> -c <cwd>` (when missing) — and either
+  spawns or reattaches a `portable-pty` client running
+  `tmux attach-session -t =<session>`. No `select-window` clause: the
+  session has exactly one window by construction (issue #15), so the
+  active-window pointer is uniquely the tab's. The `-n` on
+  `new-session` matters: without it tmux auto-creates a phantom shell
+  window that keeps the session alive after sanctel's `term-N` dies
+  (issue #14).
 
 ## Two-layer durability
 
@@ -301,30 +328,32 @@ architectural).
 ### Idempotent attach algorithm
 
 ```
-fn attach_tab_to_tmux(webview, worktreeId, initialCommand) -> Result:
+fn attach_tab_to_tmux(webview, worktreeId, windowName, initialCommand) -> Result:
   worktreePath = resolve(worktreeId)
   if not exists(worktreePath):
     return Err("worktree-missing")                            # case D
 
-  session = "sanctel_wt_" + worktreeId          # or sanctel_detached_<profileId>
-  windowName = window_name_for(webview.label)   # from Tab record via attach args
+  base    = "sanctel_wt_" + worktreeId    # or sanctel_detached_<profileId>
+  session = base + "__" + windowName      # one tmux session per Tab (issue #15)
 
-  # ensure (session, window) in one atomic primitive (race-safe: retry once on
-  # "session exists" from concurrent caller). initialCommand only fires on the
-  # new-session / new-window branches — reattach is a pure no-op.
-  if tmux has-session -t <session>:
-    tmux list-windows -t <session> | grep -qx <windowName>
-      || tmux new-window -t <session> -n <windowName> -c <worktreePath> [initialCommand]
-  else:
+  # ensure_session_window encapsulates the single primitive
+  # (race-safe: retry once on "session exists" from concurrent caller).
+  # initialCommand only fires on the new-session branch — reattach is a
+  # pure no-op.
+  if not tmux has-session -t =<session>:
     tmux new-session -d -s <session> -n <windowName> -c <worktreePath> [initialCommand]
-    # -n is critical: without it tmux creates a phantom shell window that
-    # outlives sanctel's term-N and leaks the session forever (issue #14).
+    # -n is critical: without it tmux creates a phantom shell window
+    # that outlives sanctel's term-N and leaks the session forever
+    # (issue #14). The session contains exactly its one term-N window.
 
   # spawn pty client; wire to channel
-  pty = portable_pty::spawn(["tmux", "attach-session", "-t", session,
-                             ";", "select-window", "-t", ":" + windowName])
+  pty = portable_pty::spawn(["tmux", "attach-session", "-t", "=" + session])
+  # No `select-window` clause: the session has exactly one window
+  # (issue #15), so its `curw` pointer cannot be moved by attaching to
+  # it. Two tabs in the same Worktree are two clients on TWO sessions
+  # — they cannot share an active-window pointer.
   spawn_thread { for chunk in pty.read(): channel.send(chunk) }
-  store(webview.label → {pty, session, windowName})
+  store(webview.label → {pty, session})
   return Ok
 ```
 
@@ -337,11 +366,20 @@ window never re-runs the command.
 
 ### Race handling
 
-If multiple tabs in the same Worktree call `terminal_attach`
-simultaneously, several may see `has-session` false and race on
-`new-session`. The losers see a "session already exists" error from
-tmux. They retry `has-session` once (which now succeeds) and proceed.
-Two lines of defensive code in the Rust path; no global lock.
+Two flavors:
+
+- **Same tab, multiple attaches** (e.g., a webview reload re-running
+  `terminal_attach`): both calls target the same session name. The
+  loser's `new-session` errors with "duplicate session"; the wrapper
+  re-checks `has-session` (now succeeds) and proceeds. Two lines of
+  defensive code in `ensure_session_window`; no global lock.
+- **Allocator race** (multiple new tabs in the same Worktree at the
+  same time): each call computes its own `term-N` under the
+  per-Worktree-base mutex in `allocate_session_for_tab`, so the
+  scan + new-session step is atomic per Worktree. Without the mutex,
+  two callers both see "no existing sessions" and both pick
+  `term-1`; with it, they see `[]` then `[term-1]` in sequence and
+  pick `term-1` and `term-2`.
 
 ### Broken-tab UX (worktree-missing case)
 
@@ -537,10 +575,13 @@ opens a browser tab.
 - React passes `windowName: "auto"`; Rust allocates `term-N` under a
   per-session mutex and returns the resolved name in `CreateTabResp`.
   React persists the resolved name in SQLite.
-- tmux session name = `sanctel_wt_<worktreeId>`, `-c <worktree.path>`.
+- tmux session name = `sanctel_wt_<worktreeId>__<windowName>`,
+  `-c <worktree.path>` (one session per Tab, Worktree as prefix —
+  see issue #15).
 
-**Demo:** two terminals in same worktree = same session, different
-windows. Different worktree = different session. `tmux ls` from outside
+**Demo:** two terminals in same worktree = two sibling sessions
+sharing a `sanctel_wt_<worktreeId>__` prefix, each with its own
+window. Different worktree = different prefix. `tmux ls` from outside
 confirms.
 
 ### Step 4 — Persistence (1–2 days)

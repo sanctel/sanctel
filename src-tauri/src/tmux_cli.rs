@@ -352,18 +352,60 @@ impl<R: CommandRunner> TmuxCli<R> {
         })
     }
 
-    /// `tmux kill-window -t <session>:<name>`. Used by close_tab for
-    /// terminal/chat tabs.
-    pub fn kill_window(&self, session: &str, name: &str) -> Result<(), TmuxError> {
-        let target = format!("={session}:{name}");
-        let out = self.run(&["kill-window", "-t", &target])?;
+    /// `tmux kill-session -t <session>`. Used by `close_tab` for
+    /// terminal/chat tabs: each tab owns its own session
+    /// (`sanctel_wt_<wt>__term-N`), so killing the session is the one-shot
+    /// cleanup. Idempotent on a session that doesn't exist — `tmux`'s
+    /// "can't find session" error is swallowed so reattach/cleanup paths
+    /// remain safe to call without first probing `has-session`. See
+    /// ADR-0012 / issue #15.
+    pub fn kill_session(&self, session: &str) -> Result<(), TmuxError> {
+        let target = format!("={session}");
+        let out = self.run(&["kill-session", "-t", &target])?;
         if out.status == 0 {
             return Ok(());
         }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("can't find session") || stderr.contains("session not found") {
+            return Ok(());
+        }
         Err(TmuxError::Command {
-            command: format!("kill-window -t {session}:{name}"),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            command: format!("kill-session -t {session}"),
+            stderr: stderr.into_owned(),
         })
+    }
+
+    /// Returns every existing session name on this socket, parsed from
+    /// `tmux list-sessions -F '#{session_name}'`. Used by the per-Worktree
+    /// windowName allocator (issue #15) to compute the next `term-N`: each
+    /// Tab is its own session, so the allocator scans sessions whose name
+    /// starts with the Worktree prefix.
+    ///
+    /// Returns an empty Vec (not an error) when the tmux server has no
+    /// sessions — list-sessions exits non-zero with "no server running on …"
+    /// or "no sessions" in that case.
+    pub fn list_sessions(&self) -> Result<Vec<String>, TmuxError> {
+        let out = self.run(&["list-sessions", "-F", "#{session_name}"])?;
+        if out.status != 0 {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("no server running")
+                || stderr.contains("no sessions")
+                || stderr.contains("error connecting")
+            {
+                return Ok(Vec::new());
+            }
+            return Err(TmuxError::Command {
+                command: "list-sessions".into(),
+                stderr: stderr.into_owned(),
+            });
+        }
+        let body = String::from_utf8_lossy(&out.stdout);
+        Ok(body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 }
 
@@ -764,14 +806,77 @@ mod tests {
         assert!(!seen.iter().any(|args| args.iter().any(|a| a == "new-window")));
     }
 
+    /// kill_session targets the session with the `=` exact-match prefix so
+    /// tmux doesn't fuzzy-match into a sibling session. The kill is
+    /// idempotent — a missing session is success, not error, so the
+    /// close_tab path is safe to call from cleanup contexts that might
+    /// race a previous attempt.
     #[test]
-    fn kill_window_targets_session_colon_name() {
+    fn kill_session_targets_session_exact_match() {
         let mock = MockRunner::new(vec![MockCall {
-            expect_args_contain: Some(vec!["kill-window", "=sess:term-1"]),
+            expect_args_contain: Some(vec!["kill-session", "=sanctel_wt_x__term-1"]),
             result: ok(""),
         }]);
         let cli = TmuxCli::new("s", mock);
-        cli.kill_window("sess", "term-1").unwrap();
+        cli.kill_session("sanctel_wt_x__term-1").unwrap();
+    }
+
+    #[test]
+    fn kill_session_is_idempotent_on_missing_session() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["kill-session"]),
+            result: err("can't find session: nope"),
+        }]);
+        let cli = TmuxCli::new("s", mock);
+        // Must succeed — close_tab cleanups call this without a
+        // has-session probe.
+        cli.kill_session("nope").unwrap();
+    }
+
+    #[test]
+    fn kill_session_surfaces_unexpected_errors() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["kill-session"]),
+            result: err("some other tmux failure"),
+        }]);
+        let cli = TmuxCli::new("s", mock);
+        assert!(matches!(
+            cli.kill_session("x"),
+            Err(TmuxError::Command { .. })
+        ));
+    }
+
+    #[test]
+    fn list_sessions_parses_one_name_per_line() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["list-sessions", "#{session_name}"]),
+            result: ok("sanctel_wt_a__term-1\nsanctel_wt_a__term-2\nsanctel_wt_b__term-1\n"),
+        }]);
+        let cli = TmuxCli::new("s", mock);
+        let names = cli.list_sessions().unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "sanctel_wt_a__term-1",
+                "sanctel_wt_a__term-2",
+                "sanctel_wt_b__term-1"
+            ]
+        );
+    }
+
+    /// `tmux list-sessions` on a freshly-started server with no sessions
+    /// exits non-zero with "no server running on …". The allocator calls
+    /// list_sessions before any session has been created, so this MUST
+    /// translate to Ok(empty vec) — otherwise the very first
+    /// create_tab on a fresh launch fails.
+    #[test]
+    fn list_sessions_returns_empty_when_no_server() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["list-sessions"]),
+            result: err("no server running on /tmp/tmux-1000/sanctel"),
+        }]);
+        let cli = TmuxCli::new("s", mock);
+        assert_eq!(cli.list_sessions().unwrap(), Vec::<String>::new());
     }
 
     /// A runner that models a tiny piece of "real tmux": a shared map from
@@ -818,7 +923,6 @@ mod tests {
                             | "new-session"
                             | "list-windows"
                             | "new-window"
-                            | "kill-window"
                     )
                 })
                 .copied()

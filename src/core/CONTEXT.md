@@ -46,17 +46,22 @@ cwd path (e.g., `~/.claude/projects/<encoded-cwd>/<id>.jsonl`), so an
 AgentSession is implicitly scoped to a Worktree, not to a Tab. A Tab is a
 *viewer* of the AgentSession that exists in its cwd.
 
-**TmuxSession**: a server-side tmux session, the persistence handle for a
-Worktree's shells. Named `sanctel_wt_<worktreeId>` — one session per
-Worktree. Contains one **tmux window** per terminal **Tab** in that
-Worktree; the window name lives in the Tab record (the Tab's only durable
-field beyond `worktreeId` and `kind`). Outlives the app. The reason tabs
-survive app restart without explicit save logic.
+**TmuxSession**: a server-side tmux session, the persistence handle for
+one terminal **Tab**'s shell. Named
+`sanctel_wt_<worktreeId>__<windowName>` — **one session per Tab**, with
+the Worktree as a name prefix so `tmux ls` still groups a Worktree's
+tabs visually. Contains exactly one **tmux window** (also named
+`<windowName>`). The window name lives in the Tab record (the Tab's
+only durable field beyond `worktreeId` and `kind`) and is also the
+session-name suffix. Outlives the app. The reason tabs survive app
+restart without explicit save logic.
 
 Worktree-less terminal tabs (plain shell, no `worktreeId`) attach to a
-fallback session `sanctel_detached_<profileId>`. The separator is `_`
-because tmux parses `:` and `.` in target specs as session/window/pane
-delimiters; see [ADR-0012](../../docs/adr/0012-tmux-session-per-worktree-window-per-tab.md).
+per-tab fallback session `sanctel_detached_<profileId>__<windowName>`.
+The base-segment separator is `_` because tmux parses `:` and `.` in
+target specs as session/window/pane delimiters; the suffix separator is
+`__` to mark where the Worktree base ends. See
+[ADR-0012](../../docs/adr/0012-tmux-session-per-worktree-window-per-tab.md).
 
 ## Relationships
 
@@ -70,11 +75,12 @@ delimiters; see [ADR-0012](../../docs/adr/0012-tmux-session-per-worktree-window-
 - One **Worktree** can be referenced from Tabs in many Spaces, and across
   many Profiles (though cross-Profile is unusual).
 - One **Profile** can hold Tabs referencing Worktrees in many Projects.
-- A **TmuxSession** is owned by the tmux server, named by Worktree
-  (`sanctel_wt_<worktreeId>`). A terminal **Tab** points at one
-  TmuxSession *and* one window within it. Many Tabs on the same Worktree
-  share one TmuxSession via separate windows; tmux destroys the session
-  when its last window dies.
+- A **TmuxSession** is owned by the tmux server, named
+  `sanctel_wt_<worktreeId>__<windowName>` — one TmuxSession per Tab,
+  Worktree as name prefix. A terminal **Tab** points at exactly one
+  TmuxSession, which contains exactly one window. Many Tabs on the
+  same Worktree have **separate TmuxSessions sharing a name prefix**;
+  `tmux kill-session` is the one-shot close path.
 - An **AgentSession** belongs to one Worktree (key = cwd path), not to a Tab.
   Multiple Tabs in the same Worktree see the same `claude --resume` history.
 

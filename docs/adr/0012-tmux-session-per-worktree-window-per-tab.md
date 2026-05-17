@@ -207,6 +207,15 @@ deferred until at least one of those use cases has a real PRD.
 - **Original:** ADR-0012 accepted with the Worktree-keyed-session +
   window-per-Tab model.
 
+## Migration / one-time cleanup
+
+The pre-issue-#15 session naming (`sanctel_wt_<wt>` with multiple
+windows) is unreachable by the post-fix attach paths. Dev machines
+that ran a pre-fix build should run
+`tmux -L sanctel kill-server` once after pulling. There is no
+auto-migration: pre-fix sessions can't be byte-stream-isolated by any
+amount of post-hoc renaming.
+
 See [docs/design/terminal-runtime.md](../design/terminal-runtime.md)
 for the full implementation design — IPC contract, reconnect algorithm,
 two-layer durability story, and implementation order. (The design doc
