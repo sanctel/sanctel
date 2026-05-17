@@ -16,9 +16,12 @@
 //     `profile_id`s are fully isolated.
 // ───────────────────────────────────────────────────────────────────────────
 
+mod backend;
 mod profile_isolation;
 mod terminal_runtime;
 mod tmux_cli;
+mod zellij_cli;
+mod zellij_daemon;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,9 +32,12 @@ use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
+use crate::backend::Backend;
 use crate::profile_isolation::apply_profile_isolation;
 use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
 use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
+use crate::zellij_cli::{ZellijCli, ZellijError};
+use crate::zellij_daemon::{RealLauncher, ZellijDaemon};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -64,6 +70,13 @@ struct AppState {
     // tab is its own session — the lock now serializes the allocator
     // across the *group* of sessions sharing a Worktree base.
     allocation_locks: AllocationLocks,
+    // Supervised `zellij web` daemon for the spike backend (issue #16 /
+    // issue #17). Populated only when `SANCTEL_BACKEND=zellij` is set and
+    // the zellij version probe succeeded; `None` otherwise. Drop on this
+    // field is what tears the daemon down at sanctel shutdown — the
+    // acceptance criterion that the spawned `zellij web` process must be
+    // terminated on clean exit rides on this Drop firing.
+    zellij_daemon: Mutex<Option<ZellijDaemon>>,
 }
 
 /// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
@@ -602,7 +615,7 @@ fn terminal_resize<R: Runtime>(
 }
 
 
-// ─── tmux probe (Slice 7) ─────────────────────────────────────────────────
+// ─── backend probe (Slice 7 + spike slice 1) ──────────────────────────────
 
 /// Run the one-time `tmux -V` probe and seed AppState.tmux_status. Pure
 /// over a TmuxCli so unit tests can inject a mock runner.
@@ -630,6 +643,37 @@ fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
     *status.lock() = resolved;
 }
 
+/// `zellij --version` probe, mirror of `probe_tmux_into`. Reuses the
+/// `tmux_status` AppState field by design: the field is structurally a
+/// "current backend ready / not ready" signal, and the spike's "no
+/// frontend changes" constraint forbids renaming it or adding a parallel
+/// command surface. The version string is whatever zellij reports (e.g.,
+/// `zellij 0.42.0`) so the frontend setup screen surfaces something
+/// recognisable rather than a confusing "tmux 0.42.0".
+fn probe_zellij_into<R: crate::tmux_cli::CommandRunner>(
+    status: &Mutex<TmuxStatus>,
+    zellij: &ZellijCli<R>,
+) {
+    let resolved = match zellij.version() {
+        Ok(v) => TmuxStatus {
+            available: true,
+            version: Some(v),
+            error: None,
+        },
+        Err(ZellijError::NotFound(msg)) => TmuxStatus {
+            available: false,
+            version: None,
+            error: Some(format!("zellij not installed: {msg}")),
+        },
+        Err(other) => TmuxStatus {
+            available: false,
+            version: None,
+            error: Some(other.to_string()),
+        },
+    };
+    *status.lock() = resolved;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -641,13 +685,44 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
         .setup(|app| {
-            // One-time tmux startup probe (issue #8 / Slice 7). React listens
-            // for `tmux-status` once and gates terminal/chat tab creation
-            // behind a setup screen if tmux is unavailable. The status is
-            // also exposed via the `tmux_status` command for synchronous
-            // first-paint reads.
+            // One-time backend startup probe. The current backend is
+            // resolved from `SANCTEL_BACKEND` exactly once here — switching
+            // mid-process is not a goal. The `tmux_status` field is the
+            // structural "current backend ready" signal that the frontend
+            // setup-screen gates on (Slice 7 wired this for tmux; the spike
+            // reuses it so no frontend changes are needed). When
+            // `SANCTEL_BACKEND=zellij`, we additionally spawn the
+            // `zellij web` daemon supervisor and stash it on AppState so
+            // its Drop tears the child down at sanctel shutdown.
             let state = app.state::<AppState>();
-            probe_tmux_into(&state.tmux_status, &TmuxCli::default());
+            match Backend::from_env() {
+                Backend::Tmux => {
+                    probe_tmux_into(&state.tmux_status, &TmuxCli::default());
+                }
+                Backend::Zellij => {
+                    probe_zellij_into(&state.tmux_status, &ZellijCli::default());
+                    if state.tmux_status.lock().available {
+                        match ZellijDaemon::start(RealLauncher) {
+                            Ok(daemon) => {
+                                *state.zellij_daemon.lock() = Some(daemon);
+                            }
+                            Err(e) => {
+                                // Surface the spawn failure through the same
+                                // available/error channel the version probe
+                                // uses; the frontend setup screen renders
+                                // identically.
+                                *state.tmux_status.lock() = TmuxStatus {
+                                    available: false,
+                                    version: None,
+                                    error: Some(format!(
+                                        "zellij daemon failed to start: {e}"
+                                    )),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             let snapshot = state.tmux_status.lock().clone();
             let _ = app.emit("tmux-status", snapshot);
             Ok(())
@@ -808,6 +883,91 @@ mod tests {
         assert!(result.available);
         assert_eq!(result.version.as_deref(), Some("tmux 3.4"));
         assert!(result.error.is_none());
+    }
+
+    // ─── zellij probe (spike slice 1 / issue #17) ────────────────────────
+
+    struct ZellijOkRunner;
+    impl CommandRunner for ZellijOkRunner {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: b"zellij 0.42.0\n".to_vec(),
+                stderr: vec![],
+            })
+        }
+    }
+
+    /// When zellij is on PATH, the probe writes `available: true` and the
+    /// version string into the same `tmux_status` field (reused by design
+    /// — the spike forbids frontend changes). The version string carries
+    /// the actual backend name so the setup screen can still tell users
+    /// which backend it's reporting about.
+    #[test]
+    fn zellij_probe_marks_available_with_version() {
+        let status = Mutex::new(TmuxStatus::default());
+        let zellij = ZellijCli::new(ZellijOkRunner);
+        probe_zellij_into(&status, &zellij);
+        let result = status.lock().clone();
+        assert!(result.available);
+        assert_eq!(result.version.as_deref(), Some("zellij 0.42.0"));
+        assert!(result.error.is_none());
+    }
+
+    /// Missing zellij surfaces as `available: false` + an error containing
+    /// `zellij not installed` so the setup screen can describe the actual
+    /// problem rather than the existing tmux-shaped message.
+    #[test]
+    fn zellij_probe_marks_unavailable_when_missing() {
+        let status = Mutex::new(TmuxStatus::default());
+        let zellij = ZellijCli::new(FailingRunner);
+        probe_zellij_into(&status, &zellij);
+        let result = status.lock().clone();
+        assert!(!result.available);
+        let err = result.error.expect("error must be populated");
+        assert!(
+            err.contains("zellij not installed"),
+            "error should name zellij, got: {err}"
+        );
+    }
+
+    /// The dispatcher acceptance criterion: `Backend::from_env_value(None)`
+    /// drives the tmux probe and only the tmux probe — wiring this end to
+    /// end here so a future contributor can't accidentally invert the
+    /// branches in `run()`'s setup hook.
+    #[test]
+    fn dispatcher_tmux_branch_runs_tmux_probe() {
+        let status = Mutex::new(TmuxStatus::default());
+        match Backend::from_env_value(None) {
+            Backend::Tmux => {
+                probe_tmux_into(&status, &TmuxCli::new("test", OkRunner));
+            }
+            Backend::Zellij => panic!("default branch must select Tmux"),
+        }
+        assert_eq!(
+            status.lock().version.as_deref(),
+            Some("tmux 3.4"),
+            "tmux branch must produce a tmux-shaped version string",
+        );
+    }
+
+    /// `SANCTEL_BACKEND=zellij` drives the zellij probe (and, in `run()`,
+    /// the daemon supervisor). The probe-only half is unit-testable here;
+    /// the supervisor half is exercised by zellij_daemon::tests.
+    #[test]
+    fn dispatcher_zellij_branch_runs_zellij_probe() {
+        let status = Mutex::new(TmuxStatus::default());
+        match Backend::from_env_value(Some("zellij")) {
+            Backend::Zellij => {
+                probe_zellij_into(&status, &ZellijCli::new(ZellijOkRunner));
+            }
+            Backend::Tmux => panic!("'zellij' env value must select Zellij"),
+        }
+        assert_eq!(
+            status.lock().version.as_deref(),
+            Some("zellij 0.42.0"),
+            "zellij branch must produce a zellij-shaped version string",
+        );
     }
 
     // ─── windowName allocation under the per-Worktree mutex (issue #10/#15) ───
