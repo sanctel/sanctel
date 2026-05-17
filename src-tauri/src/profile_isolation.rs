@@ -18,6 +18,7 @@
 
 use tauri::webview::WebviewBuilder;
 use tauri::{Manager, Runtime};
+#[cfg(any(target_os = "macos", test))]
 use uuid::Uuid;
 
 /// Sanctel's UUIDv5 namespace for Profile → data-store-identifier derivation.
@@ -27,6 +28,7 @@ use uuid::Uuid;
 /// WKWebsiteDataStore on macOS, so all users lose their cookies / logged-in
 /// sessions on the next launch. If a future migration ever needs this, it
 /// has to be paired with an explicit data-store migration step.
+#[cfg(any(target_os = "macos", test))]
 const SANCTEL_PROFILE_NAMESPACE: Uuid = Uuid::from_bytes([
     0xd4, 0x9c, 0xa7, 0xe2, 0x1a, 0x6f, 0x4f, 0x88,
     0x9c, 0x4a, 0x73, 0x2b, 0x16, 0x05, 0x4e, 0x11,
@@ -41,6 +43,7 @@ const SANCTEL_PROFILE_NAMESPACE: Uuid = Uuid::from_bytes([
 /// restart. Different profile_ids yield different UUIDs (UUIDv5's collision
 /// resistance is bounded by SHA-1's, which is more than enough for the
 /// handful of profiles a user actually creates).
+#[cfg(any(target_os = "macos", test))]
 pub fn profile_data_store_id(profile_id: &str) -> [u8; 16] {
     Uuid::new_v5(&SANCTEL_PROFILE_NAMESPACE, profile_id.as_bytes()).into_bytes()
 }

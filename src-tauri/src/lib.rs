@@ -110,6 +110,7 @@ struct TabRecord {
     initial_command: Option<String>,
     /// Forward-compat slot for chat tabs (Slice 6): the AgentSession id used
     /// by `claude --resume`. Stored on the record but not yet consumed.
+    #[allow(dead_code)]
     agent_session_id: Option<String>,
 }
 
@@ -545,6 +546,71 @@ fn terminal_resize<R: Runtime>(
     })
 }
 
+
+// ─── tmux probe (Slice 7) ─────────────────────────────────────────────────
+
+/// Run the one-time `tmux -V` probe and seed AppState.tmux_status. Pure
+/// over a TmuxCli so unit tests can inject a mock runner.
+fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
+    status: &Mutex<TmuxStatus>,
+    tmux: &TmuxCli<R>,
+) {
+    let resolved = match tmux.version() {
+        Ok(v) => TmuxStatus {
+            available: true,
+            version: Some(v),
+            error: None,
+        },
+        Err(TmuxError::NotFound(msg)) => TmuxStatus {
+            available: false,
+            version: None,
+            error: Some(format!("tmux not installed: {msg}")),
+        },
+        Err(other) => TmuxStatus {
+            available: false,
+            version: None,
+            error: Some(other.to_string()),
+        },
+    };
+    *status.lock() = resolved;
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
+        // Issue #6 / Slice 5: SQLite persistence lives entirely in the
+        // frontend (sql.js + this fs plugin reading/writing the .db file).
+        // Rust never imports a SQLite library or reads the .db directly —
+        // every per-Tab fact arrives via `create_tab` arguments.
+        .plugin(tauri_plugin_fs::init())
+        .manage(AppState::default())
+        .setup(|app| {
+            // One-time tmux startup probe (issue #8 / Slice 7). React listens
+            // for `tmux-status` once and gates terminal/chat tab creation
+            // behind a setup screen if tmux is unavailable. The status is
+            // also exposed via the `tmux_status` command for synchronous
+            // first-paint reads.
+            let state = app.state::<AppState>();
+            probe_tmux_into(&state.tmux_status, &TmuxCli::default());
+            let snapshot = state.tmux_status.lock().clone();
+            let _ = app.emit("tmux-status", snapshot);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            create_tab,
+            close_tab,
+            show_tab,
+            hide_all,
+            set_content_rect,
+            terminal_attach,
+            terminal_write,
+            terminal_resize,
+            tmux_status,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
 // ─── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -795,11 +861,19 @@ mod tests {
             })
             .collect();
 
+        let sort_by_term_index = |v: &mut Vec<String>| {
+            v.sort_by_key(|s| {
+                s.strip_prefix("term-")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .expect("allocated names match term-N")
+            });
+        };
+
         let mut got: Vec<String> = handles
             .into_iter()
             .map(|h| h.join().unwrap().expect("allocation must succeed"))
             .collect();
-        got.sort();
+        sort_by_term_index(&mut got);
 
         let expected: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
         assert_eq!(got, expected, "N concurrent callers must produce N distinct term-N names with no holes");
@@ -808,7 +882,7 @@ mod tests {
         // the new-window call atomic with the listing that drove the name
         // choice.
         let mut tmux_windows = runner.names_for(session);
-        tmux_windows.sort();
+        sort_by_term_index(&mut tmux_windows);
         assert_eq!(tmux_windows, expected);
     }
 
@@ -841,69 +915,4 @@ mod tests {
         assert_eq!(a, "term-1");
         assert_eq!(b, "term-1");
     }
-}
-
-// ─── tmux probe (Slice 7) ─────────────────────────────────────────────────
-
-/// Run the one-time `tmux -V` probe and seed AppState.tmux_status. Pure
-/// over a TmuxCli so unit tests can inject a mock runner.
-fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
-    status: &Mutex<TmuxStatus>,
-    tmux: &TmuxCli<R>,
-) {
-    let resolved = match tmux.version() {
-        Ok(v) => TmuxStatus {
-            available: true,
-            version: Some(v),
-            error: None,
-        },
-        Err(TmuxError::NotFound(msg)) => TmuxStatus {
-            available: false,
-            version: None,
-            error: Some(format!("tmux not installed: {msg}")),
-        },
-        Err(other) => TmuxStatus {
-            available: false,
-            version: None,
-            error: Some(other.to_string()),
-        },
-    };
-    *status.lock() = resolved;
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_clipboard_manager::init())
-        // Issue #6 / Slice 5: SQLite persistence lives entirely in the
-        // frontend (sql.js + this fs plugin reading/writing the .db file).
-        // Rust never imports a SQLite library or reads the .db directly —
-        // every per-Tab fact arrives via `create_tab` arguments.
-        .plugin(tauri_plugin_fs::init())
-        .manage(AppState::default())
-        .setup(|app| {
-            // One-time tmux startup probe (issue #8 / Slice 7). React listens
-            // for `tmux-status` once and gates terminal/chat tab creation
-            // behind a setup screen if tmux is unavailable. The status is
-            // also exposed via the `tmux_status` command for synchronous
-            // first-paint reads.
-            let state = app.state::<AppState>();
-            probe_tmux_into(&state.tmux_status, &TmuxCli::default());
-            let snapshot = state.tmux_status.lock().clone();
-            let _ = app.emit("tmux-status", snapshot);
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            create_tab,
-            close_tab,
-            show_tab,
-            hide_all,
-            set_content_rect,
-            terminal_attach,
-            terminal_write,
-            terminal_resize,
-            tmux_status,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
 }
