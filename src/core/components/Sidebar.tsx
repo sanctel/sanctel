@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useTabStore } from "../store/tabStore";
 import { useTmuxStatus } from "../store/tmuxStatusStore";
 import type { Tab, TabKind } from "../types";
@@ -13,13 +14,39 @@ const kindGlyph: Record<TabKind, string> = {
 };
 
 export default function Sidebar() {
+  // Select raw state slices (stable references). Derived values are computed
+  // with useMemo below — calling zustand methods like `s.visibleTabs()` from
+  // inside a selector returns a fresh array each read (`Array.filter` always
+  // allocates), which makes React's useSyncExternalStore think the snapshot
+  // changed every render and triggers an infinite update loop.
   const profiles = useTabStore((s) => s.profiles);
   const spaces = useTabStore((s) => s.spaces);
+  const tabs = useTabStore((s) => s.tabs);
   const activeSpaceId = useTabStore((s) => s.activeSpaceId);
-  const activeProfile = useTabStore((s) => s.activeProfile());
-  const visibleTabs = useTabStore((s) => s.visibleTabs());
-  const activeTab = useTabStore((s) => s.activeTab());
   const spacesForProfile = useTabStore((s) => s.spacesForProfile);
+
+  const activeSpace = useMemo(
+    () => spaces.find((s) => s.id === activeSpaceId),
+    [spaces, activeSpaceId],
+  );
+  const activeProfile = useMemo(
+    () =>
+      activeSpace
+        ? profiles.find((p) => p.id === activeSpace.profileId)
+        : undefined,
+    [activeSpace, profiles],
+  );
+  const visibleTabs = useMemo(
+    () => tabs.filter((t) => t.spaceId === activeSpaceId),
+    [tabs, activeSpaceId],
+  );
+  const activeTab = useMemo(
+    () =>
+      activeSpace?.activeTabId
+        ? tabs.find((t) => t.id === activeSpace.activeTabId)
+        : undefined,
+    [tabs, activeSpace],
+  );
 
   const newTab = useTabStore((s) => s.newTab);
   const newTerminalTab = useTabStore((s) => s.newTerminalTab);

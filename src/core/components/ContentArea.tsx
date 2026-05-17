@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useTabStore } from "../store/tabStore";
 
 /**
@@ -11,7 +11,19 @@ import { useTabStore } from "../store/tabStore";
 export default function ContentArea() {
   const ref = useRef<HTMLDivElement>(null);
   const setContentRect = useTabStore((s) => s.setContentRect);
-  const activeTab = useTabStore((s) => s.activeTab());
+  // Select stable slices; compute the derived activeTab here. Calling
+  // `s.activeTab()` from a zustand selector returns a fresh `find()` result
+  // on every snapshot read, which trips React's useSyncExternalStore
+  // caching check on some boot orderings.
+  const tabs = useTabStore((s) => s.tabs);
+  const spaces = useTabStore((s) => s.spaces);
+  const activeSpaceId = useTabStore((s) => s.activeSpaceId);
+  const activeTab = useMemo(() => {
+    const sp = spaces.find((s) => s.id === activeSpaceId);
+    return sp?.activeTabId
+      ? tabs.find((t) => t.id === sp.activeTabId)
+      : undefined;
+  }, [tabs, spaces, activeSpaceId]);
 
   useEffect(() => {
     const el = ref.current;
