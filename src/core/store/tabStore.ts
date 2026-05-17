@@ -326,7 +326,7 @@ export function createTabStore(): TabStoreHook {
 
       // For Worktree-keyed tabs we need both worktreeId (session key) and
       // worktreePath (`-c` cwd). For detached tabs both are null/undefined and
-      // Rust falls back to $HOME on `sanctel-detached:<profileId>`.
+      // Rust falls back to $HOME on `sanctel_detached_<profileId>`.
       const worktree = worktreeId ? findWorktree(worktreeId) : undefined;
       if (worktreeId && !worktree) {
         throw new Error(`unknown worktreeId: ${worktreeId}`);

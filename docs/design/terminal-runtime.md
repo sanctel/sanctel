@@ -39,7 +39,7 @@ tmux -L sanctel -f /dev/null <command...>
   own terminal environment; the user's customizations apply to their
   own tmux, not ours.
 - A user can attach to a sanctel window from their own shell with
-  `tmux -L sanctel attach -t sanctel-wt:<wt>` — supported, undocumented
+  `tmux -L sanctel attach -t sanctel_wt_<wt>` — supported, undocumented
   power-user affordance.
 - `tmux kill-server` in the user's terminal only kills their server;
   sanctel's is untouched. Symmetric.
@@ -74,14 +74,21 @@ ConPTY-based backend behind the same Rust interface.
 **One tmux session per Worktree, one tmux window per terminal Tab.**
 
 ```
-tmux session "sanctel-wt:<worktreeId>"                       ← keyed by Worktree
+tmux session "sanctel_wt_<worktreeId>"                       ← keyed by Worktree
 ├── window "term-1"                              ← Tab A
 ├── window "term-2"                              ← Tab B
 └── window "term-3"                              ← Tab C
 ```
 
 Worktree-less terminal tabs (a plain shell in `$HOME`) attach to a
-fallback session `sanctel-detached:<profileId>`.
+fallback session `sanctel_detached_<profileId>`.
+
+The separator is `_` (not `:`) because tmux parses `:` and `.` in
+target specs as session/window/pane delimiters — a session named
+`sanctel-wt:<id>` is unreachable for `list-windows`, `kill-window`, or
+`attach-session` lookups. Sanctel-built names are kept in
+`[A-Za-z0-9_-]`, and any `worktreeId` / `profileId` is passed through
+`tmux_safe` (replaces unsafe characters with `_`) before concatenation.
 
 ### Why
 
@@ -109,7 +116,7 @@ windowName = "term-N"   where N = 1 + max(existing term-N in this session)
 **Allocation is server-side and atomic.** React passes `window_name: "auto"`
 (or omits the field) on `create_tab` for terminal/chat Tabs. Inside
 `create_tab`, Rust takes a per-session mutex, reads existing names via
-`tmux list-windows -t sanctel-wt:<wt> -F '#{window_name}'`, computes the
+`tmux list-windows -t sanctel_wt_<wt> -F '#{window_name}'`, computes the
 next `term-N`, calls `tmux new-window -n <name>`, releases the mutex,
 and returns the resolved name in `CreateTabResp.window_name`. React
 reads the resolved name back and persists it in SQLite. The window name
@@ -294,7 +301,7 @@ fn attach_tab_to_tmux(webview, worktreeId, initialCommand) -> Result:
   if not exists(worktreePath):
     return Err("worktree-missing")                            # case D
 
-  session = "sanctel-wt:" + worktreeId          # or sanctel-detached:<profileId>
+  session = "sanctel_wt_" + worktreeId          # or sanctel_detached_<profileId>
   windowName = window_name_for(webview.label)   # from Tab record via attach args
 
   # ensure session (race-safe: retry once on "session exists" from concurrent caller)
@@ -522,7 +529,7 @@ opens a browser tab.
 - React passes `windowName: "auto"`; Rust allocates `term-N` under a
   per-session mutex and returns the resolved name in `CreateTabResp`.
   React persists the resolved name in SQLite.
-- tmux session name = `sanctel-wt:<worktreeId>`, `-c <worktree.path>`.
+- tmux session name = `sanctel_wt_<worktreeId>`, `-c <worktree.path>`.
 
 **Demo:** two terminals in same worktree = same session, different
 windows. Different worktree = different session. `tmux ls` from outside

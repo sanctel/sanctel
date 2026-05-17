@@ -144,7 +144,7 @@ ADRs; violations are blockers.
   operations require manifest-declared capabilities, enforced in Rust.
 - **tmux session/window mapping** —
   [ADR-0012](./docs/adr/0012-tmux-session-per-worktree-window-per-tab.md).
-  One tmux session per Worktree (`sanctel-wt:<worktreeId>`), one window
+  One tmux session per Worktree (`sanctel_wt_<worktreeId>`), one window
   per Tab. Sanctel runs on a dedicated tmux server (`-L sanctel`).
 
 ## When you add something new

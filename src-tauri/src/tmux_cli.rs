@@ -21,6 +21,29 @@ use std::process::Output;
 /// The default socket name used by the production sanctel app.
 pub const DEFAULT_SOCKET: &str = "sanctel";
 
+/// Sanitize a string for safe inclusion in a tmux session/window name.
+///
+/// tmux interprets `:` and `.` in target specs as the session/window/pane
+/// separators (e.g., `tmux list-windows -t foo:bar` parses as
+/// `session=foo, window=bar`). Sanctel must never pass `:` or `.` to tmux
+/// inside a name we own — and tmux itself silently rewrites `:` to `_` on
+/// `new-session`, so a session like `sanctel-wt:test` is created on disk as
+/// `sanctel-wt_test` but then unreachable by its construction-time name.
+///
+/// Replaces any character outside `[A-Za-z0-9_-]` with `_`. Idempotent:
+/// `tmux_safe(tmux_safe(x)) == tmux_safe(x)`.
+pub fn tmux_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Next `term-N` for the given existing window names. Gaps are tolerated
 /// (max + 1 rather than the lowest free integer) so that closing window N
 /// never re-uses N for a future tab in the same session — keeps `windowName`
@@ -372,6 +395,43 @@ mod tests {
     }
 
     #[test]
+    fn tmux_safe_passes_through_alphanumeric_underscore_hyphen() {
+        assert_eq!(tmux_safe("term-1"), "term-1");
+        assert_eq!(tmux_safe("sanctel_wt_main"), "sanctel_wt_main");
+        assert_eq!(tmux_safe("AZaz09_-"), "AZaz09_-");
+    }
+
+    #[test]
+    fn tmux_safe_replaces_colon_dot_and_space() {
+        // The three characters that matter most for tmux target-spec parsing
+        // (`:` and `.`) plus whitespace (a common worktreeId-from-branch issue).
+        assert_eq!(tmux_safe("a:b"), "a_b");
+        assert_eq!(tmux_safe("a.b"), "a_b");
+        assert_eq!(tmux_safe("a b"), "a_b");
+        assert_eq!(tmux_safe("sanctel-wt:test-wt"), "sanctel-wt_test-wt");
+    }
+
+    #[test]
+    fn tmux_safe_replaces_other_punctuation() {
+        assert_eq!(tmux_safe("a/b"), "a_b");
+        assert_eq!(tmux_safe("a\\b"), "a_b");
+        assert_eq!(tmux_safe("a@b"), "a_b");
+        assert_eq!(tmux_safe("\u{00E9}"), "_"); // non-ASCII collapses
+    }
+
+    #[test]
+    fn tmux_safe_is_idempotent() {
+        for s in ["", "term-1", "a:b", "feature/branch", "a..b::c"] {
+            assert_eq!(tmux_safe(s), tmux_safe(&tmux_safe(s)));
+        }
+    }
+
+    #[test]
+    fn tmux_safe_handles_empty_string() {
+        assert_eq!(tmux_safe(""), "");
+    }
+
+    #[test]
     fn allocate_window_name_empty_yields_term_1() {
         assert_eq!(allocate_window_name(&[]), "term-1");
     }
@@ -713,7 +773,7 @@ mod tests {
     #[test]
     fn ensure_session_is_concurrent_safe_under_real_race() {
         let shared = StateRunner::new();
-        let session = "sanctel-wt:race-test";
+        let session = "sanctel_wt_race-test";
         let cwd = "/tmp";
         const THREADS: usize = 16;
 

@@ -4,13 +4,21 @@
 
 **Decision:** Sanctel maps its persistence model onto tmux's native
 hierarchy as **one tmux session per Worktree, one tmux window per
-terminal Tab**. Sessions are named `sanctel-wt:<worktreeId>` and live on
+terminal Tab**. Sessions are named `sanctel_wt_<worktreeId>` and live on
 a dedicated tmux server (`tmux -L sanctel -f /dev/null`). Window names
 (`term-1`, `term-2`, …) are allocated monotonically per Worktree and
 stored as the Tab's only durable backend handle beyond `worktreeId`.
 
 Worktree-less terminal tabs attach to a fallback session named
-`sanctel-detached:<profileId>`.
+`sanctel_detached_<profileId>`.
+
+The separator is `_`, not `:`, because tmux interprets `:` and `.` as
+session/window/pane delimiters in target specs (`tmux list-windows -t
+foo:bar` parses as `session=foo, window=bar`). Sanctel-built names
+contain only characters in `[A-Za-z0-9_-]`; any `worktreeId` or
+`profileId` is passed through `tmux_safe` before concatenation, which
+collapses any other character to `_`. (Issue #13 documents the original
+`sanctel-wt:<id>` format and the silent breakage it caused.)
 
 ## Why this matters
 

@@ -31,7 +31,7 @@ use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, We
 
 use crate::profile_isolation::apply_profile_isolation;
 use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
-use crate::tmux_cli::{allocate_window_name, CommandRunner, TmuxCli, TmuxError};
+use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -174,7 +174,7 @@ struct CreateTabReq {
     /// and sends it directly.
     profile_id: String,
     /// Terminal/chat tabs carry server-held identity from create_tab time.
-    /// `worktreeId` keys the tmux session (`sanctel-wt:<id>` per ADR-0012);
+    /// `worktreeId` keys the tmux session (`sanctel_wt_<id>` per ADR-0012);
     /// `worktreePath` is the cwd passed to `tmux -c` so the shell starts in
     /// the right directory. Both are None for detached terminal tabs.
     worktree_id: Option<String>,
@@ -431,20 +431,27 @@ fn set_content_rect(app: tauri::AppHandle, rect: Rect) -> Result<(), String> {
 // time. The frontend never passes its own tabId — enforced by the IPC shape.
 
 /// The tmux session name for a (worktreeId, profileId) pair. Worktree-keyed
-/// tabs land on `sanctel-wt:<id>` per ADR-0012; detached tabs share one
-/// `sanctel-detached:<profileId>` session. Single source of truth for the
+/// tabs land on `sanctel_wt_<id>` per ADR-0012; detached tabs share one
+/// `sanctel_detached_<profileId>` session. Single source of truth for the
 /// naming convention — every command that maps to a tmux session goes
 /// through here.
+///
+/// `_` (not `:`) is the separator because tmux parses `:` and `.` as the
+/// session/window/pane delimiters in target specs — `tmux list-windows -t
+/// sanctel-wt:<id>` reads as "session=sanctel-wt, window=<id>" and fails
+/// to address the session sanctel created. Both `<id>` components are
+/// passed through `tmux_safe` so a branch name with `/`, `.`, or whitespace
+/// (e.g., a Worktree built from `feature/foo`) cannot reintroduce the bug.
 fn tmux_session_name(worktree_id: Option<&str>, profile_id: &str) -> String {
     match worktree_id {
-        Some(id) => format!("sanctel-wt:{id}"),
-        None => format!("sanctel-detached:{profile_id}"),
+        Some(id) => format!("sanctel_wt_{}", tmux_safe(id)),
+        None => format!("sanctel_detached_{}", tmux_safe(profile_id)),
     }
 }
 
 /// Resolve identity for a terminal/chat tab. Worktree-keyed tabs (ADR-0012)
-/// attach to `sanctel-wt:<worktreeId>` with the Worktree's path as cwd;
-/// worktree-less tabs attach to `sanctel-detached:<profileId>` and start in
+/// attach to `sanctel_wt_<worktreeId>` with the Worktree's path as cwd;
+/// worktree-less tabs attach to `sanctel_detached_<profileId>` and start in
 /// `$HOME`. Window name is allocated server-side at create_tab time (under
 /// a per-session mutex) and stored on the TabRecord — falling back to
 /// "term-1" only when the frontend omitted it (legacy demo path).
@@ -638,7 +645,7 @@ mod tests {
     fn worktree_keyed_record_yields_sanctel_wt_session_and_cwd() {
         let rec = record(Some("sanctel-main"), Some("/home/me/code/sanctel"), Some("term-2"));
         let p = resolve_attach_params(&rec, 80, 24).unwrap();
-        assert_eq!(p.session, "sanctel-wt:sanctel-main");
+        assert_eq!(p.session, "sanctel_wt_sanctel-main");
         assert_eq!(p.worktree_path, "/home/me/code/sanctel");
         assert_eq!(p.window_name, "term-2");
     }
@@ -650,8 +657,32 @@ mod tests {
         // documents the contract by erroring out — `resolve_attach_params`
         // would surface the same error to the user.
         let p = resolve_attach_params(&rec, 80, 24).unwrap();
-        assert_eq!(p.session, "sanctel-detached:profile-default");
+        assert_eq!(p.session, "sanctel_detached_profile-default");
         assert_eq!(p.worktree_path, std::env::var("HOME").unwrap());
+    }
+
+    /// A worktreeId containing `:` or `.` (e.g., a Worktree built from a
+    /// branch like `feature/foo` or `release.2025-05`) must NOT produce a
+    /// session name with those characters — tmux would parse them as
+    /// target separators and the session would be unreachable. This is the
+    /// regression test for issue #13.
+    #[test]
+    fn session_name_sanitizes_unsafe_characters_in_worktree_id() {
+        let session = tmux_session_name(Some("feature/foo:bar.baz"), "profile-default");
+        assert!(!session.contains(':'), "session must not contain ':'");
+        assert!(!session.contains('.'), "session must not contain '.'");
+        assert!(!session.contains('/'), "session must not contain '/'");
+        assert_eq!(session, "sanctel_wt_feature_foo_bar_baz");
+    }
+
+    /// Same regression test for the detached fallback: a profileId with
+    /// `:` or `.` cannot produce an unreachable session name.
+    #[test]
+    fn session_name_sanitizes_unsafe_characters_in_profile_id() {
+        let session = tmux_session_name(None, "work:profile.1");
+        assert!(!session.contains(':'));
+        assert!(!session.contains('.'));
+        assert_eq!(session, "sanctel_detached_work_profile_1");
     }
 
     #[test]
@@ -842,7 +873,7 @@ mod tests {
     #[test]
     fn allocate_window_under_lock_serializes_concurrent_callers() {
         const N: usize = 12;
-        let session = "sanctel-wt:race-test";
+        let session = "sanctel_wt_race-test";
         let cwd = "/tmp";
 
         let locks = Arc::new(SessionLocks::default());
@@ -899,7 +930,7 @@ mod tests {
         let a = allocate_window_under_lock(
             &locks,
             &tmux_a,
-            "sanctel-wt:a",
+            "sanctel_wt_a",
             "/tmp",
             None,
         )
@@ -907,7 +938,7 @@ mod tests {
         let b = allocate_window_under_lock(
             &locks,
             &tmux_b,
-            "sanctel-wt:b",
+            "sanctel_wt_b",
             "/tmp",
             None,
         )

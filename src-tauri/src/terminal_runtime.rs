@@ -419,7 +419,7 @@ mod tests {
             .output();
 
         // 1. Fresh create.
-        let session = "sanctel-wt:test-wt";
+        let session = "sanctel_wt_test-wt";
         let window = "term-1";
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
 
