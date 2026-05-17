@@ -37,21 +37,25 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 # Add Claude and cargo to PATH
 ENV PATH="/home/agent/.local/bin:/home/agent/.cargo/bin:$PATH"
 
-# Tauri's Linux build deps (only needed if you actually build/run the desktop
-# app in this container; the implement/review/merge agents mostly do
-# `cargo check`/`cargo clippy`/`cargo test`, which don't need these. Uncomment
-# the block below if you need full Tauri builds in the sandbox.
-#
-# USER root
-# RUN apt-get update && apt-get install -y \
-#   libwebkit2gtk-4.1-dev \
-#   build-essential \
-#   libssl-dev \
-#   libgtk-3-dev \
-#   libayatana-appindicator3-dev \
-#   librsvg2-dev \
-#   && rm -rf /var/lib/apt/lists/*
-# USER ${AGENT_UID}:${AGENT_GID}
+# Tauri's Linux build deps. Required even for `cargo check`: tauri pulls in
+# `-sys` crates (dbus-sys, webkit2gtk-sys, libsoup-sys, atk-sys, ...) whose
+# build.rs scripts call pkg-config at check time and abort if the .pc files
+# are missing.
+USER root
+RUN apt-get update && apt-get install -y \
+  build-essential \
+  pkg-config \
+  libssl-dev \
+  libdbus-1-dev \
+  libgtk-3-dev \
+  libwebkit2gtk-4.1-dev \
+  libsoup-3.0-dev \
+  libjavascriptcoregtk-4.1-dev \
+  libatk1.0-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  && rm -rf /var/lib/apt/lists/*
+USER ${AGENT_UID}:${AGENT_GID}
 
 WORKDIR /home/agent
 
