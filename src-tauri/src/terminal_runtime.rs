@@ -59,14 +59,49 @@ impl From<TmuxError> for AttachError {
 // ─── per-tab handle and store ─────────────────────────────────────────────
 
 /// Everything we need to drive one attached terminal tab.
+///
+/// The `writer` and `master` mutexes are private on purpose. Callers reach
+/// them through [`TerminalHandle::with_writer`] and
+/// [`TerminalHandle::with_master`], which hold the lock for the closure's
+/// lifetime and release it before the function returns. See those methods
+/// for why the closure pattern is mandatory.
 pub struct TerminalHandle {
     /// The PTY master end — writer side for keystrokes / resizes.
-    pub writer: Mutex<Box<dyn Write + Send>>,
+    writer: Mutex<Box<dyn Write + Send>>,
     /// Master so we can call `resize()` on it.
-    pub master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     /// Server-held identity used by terminal_attach lookups.
     pub session: String,
     pub window_name: String,
+}
+
+impl TerminalHandle {
+    /// Run `f` with the PTY writer locked. Lock is released the moment
+    /// the closure returns.
+    ///
+    /// Why a closure-scoped accessor rather than exposing the raw
+    /// `Mutex<Box<dyn Write + Send>>`: the obvious caller-side pattern
+    ///
+    /// ```ignore
+    /// let h = registry.get(label).unwrap();           // Arc<TerminalHandle>
+    /// h.writer.lock().write_all(&bytes)?;             // temporary MutexGuard
+    /// ```
+    ///
+    /// creates an unnamed `MutexGuard` that borrows from `h.writer`, which
+    /// borrows from the local `h`. In Rust 1.95+, locals drop in reverse
+    /// declaration order — `h` drops first, then the guard's `Drop` runs
+    /// and reaches into an already-dropped `Mutex`. The compiler rejects
+    /// this with E0597. Holding the lock inside this method means no
+    /// caller can construct a guard that outlives its `Arc`.
+    pub fn with_writer<R>(&self, f: impl FnOnce(&mut dyn Write) -> R) -> R {
+        f(&mut **self.writer.lock())
+    }
+
+    /// Run `f` with the PTY master locked. Same drop-order reasoning as
+    /// [`TerminalHandle::with_writer`].
+    pub fn with_master<R>(&self, f: impl FnOnce(&dyn MasterPty) -> R) -> R {
+        f(&**self.master.lock())
+    }
 }
 
 /// In-memory map from webview label → handle. Lives inside Tauri's managed
@@ -269,6 +304,98 @@ mod tests {
     fn check_worktree_exists_accepts_extant_path() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         check_worktree_exists(&home).expect("HOME exists");
+    }
+
+    /// Build a `TerminalHandle` backed by a real (but otherwise unused) PTY.
+    /// We don't spawn a child, so the slave side stays open and the master
+    /// can be locked / written to / resized in isolation.
+    fn handle_with_real_pty() -> TerminalHandle {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let writer = pair.master.take_writer().expect("take_writer");
+        TerminalHandle {
+            writer: Mutex::new(writer),
+            master: Mutex::new(pair.master),
+            session: "test-session".into(),
+            window_name: "term-1".into(),
+        }
+    }
+
+    /// `with_writer` must hold the writer mutex for the duration of the
+    /// closure (so concurrent callers serialize on PTY writes) and release
+    /// it the instant the closure returns.
+    #[test]
+    fn with_writer_holds_lock_for_closure_only() {
+        let handle = handle_with_real_pty();
+
+        let entered = handle.with_writer(|_w| {
+            assert!(
+                handle.writer.try_lock().is_none(),
+                "writer lock must be held inside the closure"
+            );
+            "ok"
+        });
+        assert_eq!(entered, "ok", "closure return value must propagate");
+
+        assert!(
+            handle.writer.try_lock().is_some(),
+            "writer lock must be released after the closure returns"
+        );
+    }
+
+    /// Same guarantee for the master side: lock held during the closure,
+    /// released afterwards.
+    #[test]
+    fn with_master_holds_lock_for_closure_only() {
+        let handle = handle_with_real_pty();
+
+        handle.with_master(|_m| {
+            assert!(
+                handle.master.try_lock().is_none(),
+                "master lock must be held inside the closure"
+            );
+        });
+
+        assert!(
+            handle.master.try_lock().is_some(),
+            "master lock must be released after the closure returns"
+        );
+    }
+
+    /// Smoke test that the closure receives a usable writer — bytes
+    /// written inside the closure reach the PTY's read side.
+    #[test]
+    fn with_writer_actually_writes_to_pty() {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut reader = pair.master.try_clone_reader().expect("clone_reader");
+        let writer = pair.master.take_writer().expect("take_writer");
+        let handle = TerminalHandle {
+            writer: Mutex::new(writer),
+            master: Mutex::new(pair.master),
+            session: "test-session".into(),
+            window_name: "term-1".into(),
+        };
+
+        handle
+            .with_writer(|w| w.write_all(b"hello"))
+            .expect("write_all");
+
+        let mut buf = [0u8; 5];
+        reader.read_exact(&mut buf).expect("read_exact");
+        assert_eq!(&buf, b"hello");
     }
 
     /// Real-tmux integration test for the idempotent attach algorithm.

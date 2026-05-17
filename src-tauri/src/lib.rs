@@ -19,7 +19,6 @@ mod terminal_runtime;
 mod tmux_cli;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -514,7 +513,7 @@ fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(),
         .terminals
         .get(webview.label())
         .ok_or_else(|| "terminal not attached".to_string())?;
-    handle.writer.lock().write_all(&bytes).map_err(|e| e.to_string())
+    handle.with_writer(|w| w.write_all(&bytes).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -529,16 +528,15 @@ fn terminal_resize<R: Runtime>(
         .terminals
         .get(webview.label())
         .ok_or_else(|| "terminal not attached".to_string())?;
-    handle
-        .master
-        .lock()
-        .resize(portable_pty::PtySize {
+    handle.with_master(|m| {
+        m.resize(portable_pty::PtySize {
             rows: rows.max(1),
             cols: cols.max(1),
             pixel_width: 0,
             pixel_height: 0,
         })
         .map_err(|e| e.to_string())
+    })
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────
