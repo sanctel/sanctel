@@ -208,8 +208,9 @@ impl<R: CommandRunner> TmuxCli<R> {
     /// See ADR-0012 and issue #14.
     ///
     /// Returns `Err(SessionAlreadyExists)` if tmux reports a name collision
-    /// (concurrent caller won the race). Callers should normally go through
-    /// `ensure_session_window`, which handles that retry internally.
+    /// (a concurrent caller won the race). The sole caller,
+    /// `ensure_session_window`, recovers by falling through to its
+    /// session-exists branch.
     fn new_session_with_window(
         &self,
         session: &str,
@@ -802,7 +803,7 @@ mod tests {
         }
     }
 
-    fn arg_after_<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
+    fn arg_after<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
         args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1)).copied()
     }
 
@@ -825,7 +826,7 @@ mod tests {
 
             match sub {
                 "has-session" => {
-                    let target = arg_after_(args, "-t")
+                    let target = arg_after(args, "-t")
                         .map(|s| s.trim_start_matches('=').to_string())
                         .unwrap_or_default();
                     let exists = self.windows.lock().unwrap().contains_key(&target);
@@ -836,11 +837,11 @@ mod tests {
                     })
                 }
                 "new-session" => {
-                    let name = arg_after_(args, "-s").unwrap_or_default().to_string();
+                    let name = arg_after(args, "-s").unwrap_or_default().to_string();
                     // The fix for issue #14: the new primitive ALWAYS passes
                     // `-n <window_name>`. Capture it so the simulated session
                     // starts with exactly that one window, never a phantom.
-                    let window_name = arg_after_(args, "-n").unwrap_or_default().to_string();
+                    let window_name = arg_after(args, "-n").unwrap_or_default().to_string();
                     let mut map = self.windows.lock().unwrap();
                     if let std::collections::hash_map::Entry::Vacant(e) = map.entry(name.clone()) {
                         let initial = if window_name.is_empty() {
@@ -861,7 +862,7 @@ mod tests {
                     }
                 }
                 "list-windows" => {
-                    let target = arg_after_(args, "-t")
+                    let target = arg_after(args, "-t")
                         .map(|s| s.trim_start_matches('=').to_string())
                         .unwrap_or_default();
                     let body = self
@@ -879,10 +880,10 @@ mod tests {
                     })
                 }
                 "new-window" => {
-                    let target = arg_after_(args, "-t")
+                    let target = arg_after(args, "-t")
                         .map(|s| s.trim_start_matches('=').to_string())
                         .unwrap_or_default();
-                    let name = arg_after_(args, "-n").unwrap_or_default().to_string();
+                    let name = arg_after(args, "-n").unwrap_or_default().to_string();
                     let mut map = self.windows.lock().unwrap();
                     let windows = map.entry(target).or_default();
                     windows.push(name);
