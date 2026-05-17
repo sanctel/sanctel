@@ -56,10 +56,11 @@ pub fn profile_data_store_id(profile_id: &str) -> [u8; 16] {
 ///   localStorage are fully isolated per Profile and survive restart. The
 ///   same API works on iOS ≥ 17; when sanctel ever ships a mobile bridge,
 ///   extend the cfg below to include `target_os = "ios"`.
-/// - **Windows / Linux:** `data_directory(<app-local>/profiles/<profile_id>)`.
-///   WebView2 and WebKitGTK both honor this for cookies / IndexedDB /
-///   localStorage. The path is computed via `app.path().app_local_data_dir()`
-///   so it lands in the OS-blessed per-app data directory.
+/// - **Non-macOS (Windows / Linux / BSD / …):** `data_directory(<app-local>/
+///   profiles/<profile_id>)`. WebView2 (Windows) and WebKitGTK (Linux/BSD)
+///   honor this for cookies / IndexedDB / localStorage. The path is computed
+///   via `app.path().app_local_data_dir()` so it lands in the OS-blessed
+///   per-app data directory.
 pub fn apply_profile_isolation<R: Runtime, M: Manager<R>>(
     builder: WebviewBuilder<R>,
     profile_id: &str,
