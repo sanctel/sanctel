@@ -141,6 +141,50 @@ impl ZellijWsHandle {
     }
 }
 
+/// Build the binary frame that bootstraps a freshly-created chat session.
+/// Appends a single newline so the receiving shell treats the bytes as a
+/// submitted command (mirroring the `\n` that lands in tmux's PTY when
+/// `new-session ... <cmd>` runs the command and the shell prints its
+/// trailing newline). Extracted so the wire shape is unit-testable without
+/// opening a real WebSocket — the connect+send sequence in
+/// [`write_initial_command`] is exercised by the manual acceptance
+/// criteria (sandcastle CI doesn't ship a zellij binary).
+pub fn initial_command_frame(command: &str) -> Message {
+    encode_binary_frame(format!("{command}\n").into_bytes())
+}
+
+/// One-shot: open a transient WebSocket to the given session's terminal
+/// endpoint, send `initial_command_frame(command)`, and close. Used by the
+/// `allocate_session_for_zellij_tab` caller to start `claude` (or
+/// `claude --resume <id>`) in a session that `zellij_cli::new_session` just
+/// created empty — zellij has no CLI flag for "start session with command
+/// running", so the byte-stream over WebSocket is the equivalent of tmux's
+/// `new-session ... <cmd>` argv splice.
+///
+/// The transient WS intentionally doesn't reuse `mount`: writing one shot
+/// of bytes doesn't need an `on_output` channel or the per-connection I/O
+/// thread machinery, and we want the connection closed before the user's
+/// webview opens its own persistent WS at attach time (zellij correctly
+/// handles multiple WS clients per session, but minimising overlap keeps
+/// the failure mode boring).
+pub fn write_initial_command(
+    session_name: &str,
+    port: u16,
+    command: &str,
+) -> Result<(), ZellijWsError> {
+    let url = format!("ws://127.0.0.1:{port}/ws/terminal/{session_name}");
+    let (mut ws, _resp) =
+        tungstenite::connect(&url).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
+    ws.send(initial_command_frame(command))
+        .map_err(|e| ZellijWsError::Send(e.to_string()))?;
+    ws.flush()
+        .map_err(|e| ZellijWsError::Send(e.to_string()))?;
+    // Best-effort close handshake; the daemon may have already buffered the
+    // bytes when we get here, so a closed-without-handshake socket is fine.
+    let _ = ws.close(None);
+    Ok(())
+}
+
 /// Open the two WebSocket connections for one attached tab and start the
 /// I/O threads. Binary frames from `/ws/terminal/<session>` are forwarded
 /// to `on_output`; bytes pushed through the returned handle's
@@ -302,6 +346,30 @@ mod tests {
             let decoded = decode_binary_frame(&frame).expect("binary frame decodes");
             assert_eq!(decoded.as_slice(), *bytes, "payload survived round-trip");
         }
+    }
+
+    /// The initial-command frame appends a trailing newline (so the
+    /// receiving shell submits the line) and rides as a binary frame
+    /// over `/ws/terminal/<session>` — same byte path as user keystrokes.
+    /// A chat tab's `claude --resume <id>` becomes `claude --resume <id>\n`
+    /// on the wire; the regression a contributor might land — dropping the
+    /// newline, or sending as text — would leave claude waiting for input
+    /// or the daemon refusing the frame, both manual-acceptance regressions
+    /// we'd rather catch in CI.
+    #[test]
+    fn initial_command_frame_appends_newline_as_binary() {
+        let frame = initial_command_frame("claude --resume abc-123");
+        let bytes = decode_binary_frame(&frame).expect("must be binary");
+        assert_eq!(bytes, b"claude --resume abc-123\n");
+    }
+
+    /// And the plain `claude` (no `--resume`) shape — the first-chat
+    /// acceptance criterion path (no prior .jsonl for the Worktree).
+    #[test]
+    fn initial_command_frame_handles_plain_claude() {
+        let frame = initial_command_frame("claude");
+        let bytes = decode_binary_frame(&frame).expect("must be binary");
+        assert_eq!(bytes, b"claude\n");
     }
 
     /// Non-binary frames decode to `None` so the production reader can

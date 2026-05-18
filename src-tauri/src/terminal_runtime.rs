@@ -285,6 +285,16 @@ pub fn attach_tab_to_tmux(
 /// handle whose `write_bytes` / `resize` route through the WS pair. Caller
 /// signature matches the tmux side so the dispatcher in lib.rs is one
 /// match arm.
+///
+/// Slice 5 (issue #21) layered the chat-tab durability story on top:
+/// `has_session` is probed BEFORE `new_session`, so a session that's
+/// missing at attach time (the user ran `zellij kill-all-sessions` between
+/// sanctel runs — the PRD's simulated-laptop-reboot scenario) is freshly
+/// recreated and the chat tab's persisted `initial_command` (typically
+/// `claude --resume <agentSessionId>`) is written into the new pane via
+/// the persistent WS. The create_tab "auto"-allocation path handles the
+/// fresh-create case at allocator time; this branch covers the
+/// SQLite-restored-but-session-wiped case.
 pub fn attach_tab_to_zellij(
     zellij: &ZellijCli,
     daemon_port: u16,
@@ -295,6 +305,15 @@ pub fn attach_tab_to_zellij(
     // UI is the same wire contract regardless of which backend would have
     // failed downstream.
     check_worktree_exists(&params.worktree_path)?;
+
+    // Probe BEFORE the (idempotent) `new_session` call so we can tell a
+    // fresh recreation from a true reattach. has_session=true → the user's
+    // prior process (e.g., a still-running claude) is alive across the
+    // sanctel restart and we must NOT re-fire `initial_command` or claude
+    // would receive the literal command string as input on its stdin.
+    // has_session=false → the session was wiped externally and we need to
+    // re-bootstrap with the chat tab's persisted command.
+    let session_existed = zellij.has_session(&params.session)?;
 
     // `attach --create-background` is idempotent on existing sessions (see
     // zellij_cli module docs) — calling it on the reattach path is cheap
@@ -315,6 +334,22 @@ pub fn attach_tab_to_zellij(
     // see zellij's default pane dimensions until the first user-driven
     // resize, which is jarring.
     let _ = ws.resize(params.cols, params.rows);
+
+    // Simulated-reboot path: the session was missing when we probed, so
+    // `new_session` just created an empty shell pane. Fire the chat tab's
+    // persisted initial_command (e.g., `claude --resume <agentSessionId>`)
+    // through the persistent WS so claude can rehydrate the conversation
+    // from the on-disk transcript at `~/.claude/projects/<encoded-cwd>/
+    // <id>.jsonl`. On a fresh-create from `create_tab`, the allocator
+    // already wrote the command; here `session_existed` is true and we
+    // skip.
+    if !session_existed {
+        if let Some(cmd) = &params.initial_command {
+            let bytes = format!("{cmd}\n").into_bytes();
+            ws.write_bytes(bytes)
+                .map_err(|e| AttachError::Other(e.to_string()))?;
+        }
+    }
 
     Ok(TerminalHandle {
         inner: TerminalHandleInner::Zellij { ws },
