@@ -20,6 +20,7 @@ mod backend;
 mod profile_isolation;
 mod terminal_runtime;
 mod tmux_cli;
+mod zellij_auth;
 mod zellij_cli;
 mod zellij_daemon;
 mod zellij_ws;
@@ -40,7 +41,7 @@ use crate::terminal_runtime::{
 };
 use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
 use crate::zellij_cli::{ZellijCli, ZellijError};
-use crate::zellij_daemon::{RealLauncher, ZellijDaemon};
+use crate::zellij_daemon::{RealAuthenticator, RealLauncher, ZellijDaemon};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -272,18 +273,16 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
                 // command, so the chat tab's initial_command rides over a
                 // transient WebSocket (see `write_initial_command`).
                 if let Some(cmd) = req.initial_command.as_deref() {
-                    let port = app
-                        .state::<AppState>()
-                        .zellij_daemon
-                        .lock()
-                        .as_ref()
-                        .map(|d| d.port())
-                        .ok_or_else(|| {
-                            "zellij daemon not running — startup probe failed"
-                                .to_string()
+                    let state = app.state::<AppState>();
+                    let (port, session_token) = {
+                        let daemon = state.zellij_daemon.lock();
+                        let d = daemon.as_ref().ok_or_else(|| {
+                            "zellij daemon not running — startup probe failed".to_string()
                         })?;
+                        (d.port(), d.session_token())
+                    };
                     let session = format!("{base}__{window_name}");
-                    zellij_ws::write_initial_command(&session, port, cmd)
+                    zellij_ws::write_initial_command(&session, port, &session_token, cmd)
                         .map_err(|e| e.to_string())?;
                 }
                 window_name
@@ -645,17 +644,22 @@ fn terminal_attach<R: Runtime>(
         Backend::Tmux => attach_tab_to_tmux(&TmuxCli::default(), params, on_output)
             .map_err(|e| e.to_string())?,
         Backend::Zellij => {
-            let port = app
-                .state::<AppState>()
-                .zellij_daemon
-                .lock()
-                .as_ref()
-                .map(|d| d.port())
-                .ok_or_else(|| {
+            let state = app.state::<AppState>();
+            let (port, session_token) = {
+                let daemon = state.zellij_daemon.lock();
+                let d = daemon.as_ref().ok_or_else(|| {
                     "zellij daemon not running — startup probe failed".to_string()
                 })?;
-            attach_tab_to_zellij(&ZellijCli::default(), port, params, on_output)
-                .map_err(|e| e.to_string())?
+                (d.port(), d.session_token())
+            };
+            attach_tab_to_zellij(
+                &ZellijCli::default(),
+                port,
+                &session_token,
+                params,
+                on_output,
+            )
+            .map_err(|e| e.to_string())?
         }
     };
     app.state::<AppState>().terminals.insert(label, Arc::new(handle));
@@ -781,15 +785,19 @@ pub fn run() {
                 Backend::Zellij => {
                     probe_zellij_into(&state.tmux_status, &ZellijCli::default());
                     if state.tmux_status.lock().available {
-                        match ZellijDaemon::start(RealLauncher) {
+                        match ZellijDaemon::start(RealLauncher, RealAuthenticator::default()) {
                             Ok(daemon) => {
                                 *state.zellij_daemon.lock() = Some(daemon);
                             }
                             Err(e) => {
-                                // Surface the spawn failure through the same
-                                // available/error channel the version probe
-                                // uses; the frontend setup screen renders
-                                // identically.
+                                // Surface the spawn (or auth) failure through
+                                // the same available/error channel the
+                                // version probe uses; the frontend setup
+                                // screen renders identically. Routing auth
+                                // failures here is what keeps the failure
+                                // mode named (diagnostic detail in the
+                                // setup screen) rather than an opaque
+                                // HTTP 401 per terminal tab.
                                 *state.tmux_status.lock() = TmuxStatus {
                                     available: false,
                                     version: None,
