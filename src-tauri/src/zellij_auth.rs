@@ -23,10 +23,24 @@
 //      The session_token is per-daemon-process — restart the daemon and
 //      the old session_token is invalidated.
 //
-//   3. Carry the cookie on every WebSocket open
-//      (`/ws/control`, `/ws/terminal/<session>`).
+//   3. Register a web client:
+//      POST http://127.0.0.1:<port>/session
+//        Cookie: session_token=<UUID>
+//        Content-Type: application/json
+//        body: {}
+//      Server replies 200 OK with
+//        {"web_client_id":"<UUID>","is_read_only":false}.
+//      The id is per-attached-client and must accompany every WebSocket
+//      open as a `?web_client_id=<UUID>` query parameter; zellij's
+//      `ws_handler_terminal` / `ws_handler_control` look the client up
+//      in an in-process connection table by that id and reject the
+//      handshake with HTTP 400 if it's missing or unknown.
 //
-//   4. On clean shutdown: `zellij web --revoke-token <name>` so the
+//   4. Carry the cookie AND the web_client_id on every WebSocket open
+//      (`/ws/control?web_client_id=<id>`,
+//      `/ws/terminal/<session>?web_client_id=<id>`).
+//
+//   5. On clean shutdown: `zellij web --revoke-token <name>` so the
 //      user's `zellij web --list-tokens` doesn't accumulate sanctel
 //      tokens across runs. The name passed here is the auto-generated
 //      `token_<N>` from step 1, NOT a caller-supplied string.
@@ -77,6 +91,17 @@ pub enum ZellijAuthError {
     /// header was present — likely a zellij version that changed the
     /// cookie name or removed the cookie auth path.
     MissingSessionTokenCookie,
+    /// `POST /session` (the web_client_id registration step) failed —
+    /// either non-2xx status, malformed JSON, or missing the
+    /// `web_client_id` field. The status + body excerpt are included
+    /// so the user can see what zellij returned.
+    ClientRegistrationFailed { status: u16, body: String },
+    /// `POST /session` answered 2xx but the body didn't parse as the
+    /// expected `{"web_client_id":"<UUID>",...}` shape. Distinct from
+    /// `ClientRegistrationFailed` so the diagnostic message names the
+    /// version-drift failure mode (zellij renamed/removed the field)
+    /// rather than implying an HTTP failure.
+    ClientRegistrationInvalid { body: String },
 }
 
 impl fmt::Display for ZellijAuthError {
@@ -100,6 +125,19 @@ impl fmt::Display for ZellijAuthError {
             }
             ZellijAuthError::MissingSessionTokenCookie => {
                 write!(f, "zellij auth: login response missing session_token cookie")
+            }
+            ZellijAuthError::ClientRegistrationFailed { status, body } => {
+                write!(
+                    f,
+                    "zellij auth: POST /session failed (HTTP {status}): {body}",
+                )
+            }
+            ZellijAuthError::ClientRegistrationInvalid { body } => {
+                write!(
+                    f,
+                    "zellij auth: POST /session body did not match expected \
+                     `{{\"web_client_id\":\"...\"}}` shape: {body}",
+                )
             }
         }
     }
@@ -276,6 +314,112 @@ pub fn parse_login_response(bytes: &[u8]) -> Result<String, ZellijAuthError> {
         }
     }
     Err(ZellijAuthError::MissingSessionTokenCookie)
+}
+
+/// Build the bytes of the POST /session request. Mirrors
+/// [`build_login_request_bytes`] — same hand-rolled HTTP/1.1 shape with
+/// the `session_token` cookie carried on the wire so the auth middleware
+/// authorises the request. Body is an empty JSON object (the endpoint
+/// accepts `{}`).
+pub fn build_register_client_request_bytes(port: u16, session_token: &str) -> Vec<u8> {
+    let body = "{}";
+    let request = format!(
+        "POST /session HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Cookie: session_token={session_token}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        len = body.len(),
+    );
+    request.into_bytes()
+}
+
+/// Parse the response bytes from POST /session. On 2xx, extracts the
+/// `web_client_id` field from the JSON body. Errors are routed into
+/// `ClientRegistrationFailed` (non-2xx / malformed HTTP) vs
+/// `ClientRegistrationInvalid` (2xx but missing field) so the user sees
+/// the right diagnostic for the failure mode.
+pub fn parse_create_client_response(bytes: &[u8]) -> Result<String, ZellijAuthError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| ZellijAuthError::ClientRegistrationInvalid {
+        body: format!("non-UTF-8 response: {e}"),
+    })?;
+    let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+    let status_line = headers.split_once("\r\n").map(|(s, _)| s).unwrap_or(headers);
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| ZellijAuthError::ClientRegistrationInvalid {
+            body: format!("bad status line: {status_line}"),
+        })?;
+    if !(200..300).contains(&status_code) {
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(ZellijAuthError::ClientRegistrationFailed {
+            status: status_code,
+            body: excerpt,
+        });
+    }
+    extract_web_client_id(body).ok_or_else(|| ZellijAuthError::ClientRegistrationInvalid {
+        body: body.chars().take(200).collect(),
+    })
+}
+
+/// Pure JSON field extractor for `{"web_client_id":"<UUID>", ...}`.
+/// Tolerates surrounding fields (e.g., `is_read_only`) and whitespace.
+/// Returns None on malformed input — the caller surfaces it as
+/// `ClientRegistrationInvalid` with the original body for diagnostics.
+fn extract_web_client_id(body: &str) -> Option<String> {
+    // Find the `"web_client_id"` key, then the quoted value that follows
+    // its colon. A small ad-hoc parser is fine here — the response shape
+    // is fixed and a serde_json dependency for one field would be
+    // overkill alongside the rest of this module's hand-rolled HTTP.
+    let key = "\"web_client_id\"";
+    let key_pos = body.find(key)?;
+    let after_key = &body[key_pos + key.len()..];
+    let colon_pos = after_key.find(':')?;
+    let after_colon = &after_key[colon_pos + 1..];
+    let quote_open = after_colon.find('"')?;
+    let value_start = quote_open + 1;
+    let after_open = &after_colon[value_start..];
+    let quote_close = after_open.find('"')?;
+    let value = &after_open[..quote_close];
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// Open a TCP connection to the daemon, POST /session with the cookie,
+/// read the response, parse the `web_client_id`. The id must accompany
+/// every WebSocket open as `?web_client_id=<id>` — zellij's WS handlers
+/// reject the handshake with HTTP 400 if it's missing.
+pub fn register_client(port: u16, session_token: &str) -> Result<String, ZellijAuthError> {
+    let request = build_register_client_request_bytes(port, session_token);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| {
+        ZellijAuthError::ClientRegistrationFailed {
+            status: 0,
+            body: format!("connect to 127.0.0.1:{port}: {e}"),
+        }
+    })?;
+    let _ = stream.set_read_timeout(Some(LOGIN_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(LOGIN_TIMEOUT));
+    stream
+        .write_all(&request)
+        .map_err(|e| ZellijAuthError::ClientRegistrationFailed {
+            status: 0,
+            body: format!("write: {e}"),
+        })?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| ZellijAuthError::ClientRegistrationFailed {
+            status: 0,
+            body: format!("read: {e}"),
+        })?;
+    parse_create_client_response(&buf)
 }
 
 /// Open a TCP connection to the daemon, write the login request, read the
@@ -596,6 +740,233 @@ Content-Length: 0\r\n\
             looks_like_uuid(&uuid),
             "parsed UUID must be UUID-shaped, got: {uuid:?}",
         );
+    }
+
+    /// Standard zellij response shape from the empirical curl trace in
+    /// issue #28: `{"web_client_id":"<UUID>","is_read_only":false}`.
+    /// The parser extracts the id and ignores the trailing field.
+    #[test]
+    fn parse_create_client_response_extracts_web_client_id() {
+        let raw = "\
+HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 60\r\n\
+\r\n\
+{\"web_client_id\":\"0b37aed9-4d1d-442a-a500-b34221c1c653\",\"is_read_only\":false}";
+        let id = parse_create_client_response(raw.as_bytes()).expect("parse");
+        assert_eq!(id, "0b37aed9-4d1d-442a-a500-b34221c1c653");
+    }
+
+    /// Field-order tolerance: zellij could change the JSON encoder and
+    /// emit `is_read_only` first; the extractor must still find the
+    /// `web_client_id` value.
+    #[test]
+    fn parse_create_client_response_tolerates_field_reordering() {
+        let raw = "\
+HTTP/1.1 200 OK\r\n\
+\r\n\
+{\"is_read_only\":false,\"web_client_id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"}";
+        let id = parse_create_client_response(raw.as_bytes()).expect("parse");
+        assert_eq!(id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    }
+
+    /// 2xx but missing the `web_client_id` field → `ClientRegistrationInvalid`.
+    /// This is the version-drift failure mode (zellij renamed the field).
+    #[test]
+    fn parse_create_client_response_fails_when_field_is_absent() {
+        let raw = "\
+HTTP/1.1 200 OK\r\n\
+\r\n\
+{\"is_read_only\":false}";
+        match parse_create_client_response(raw.as_bytes()) {
+            Err(ZellijAuthError::ClientRegistrationInvalid { body }) => {
+                assert!(body.contains("is_read_only"), "body in error: {body}");
+            }
+            other => panic!("expected ClientRegistrationInvalid, got {other:?}"),
+        }
+    }
+
+    /// Empty `web_client_id` value → invalid (otherwise we'd build a
+    /// `?web_client_id=` URL that zellij would still reject).
+    #[test]
+    fn parse_create_client_response_fails_on_empty_id() {
+        let raw = "\
+HTTP/1.1 200 OK\r\n\
+\r\n\
+{\"web_client_id\":\"\",\"is_read_only\":false}";
+        match parse_create_client_response(raw.as_bytes()) {
+            Err(ZellijAuthError::ClientRegistrationInvalid { .. }) => {}
+            other => panic!("expected ClientRegistrationInvalid, got {other:?}"),
+        }
+    }
+
+    /// 4xx response → `ClientRegistrationFailed` with the status code.
+    /// Most likely cause is a stale `session_token` cookie (daemon
+    /// restarted between login and register), surfaced verbatim so the
+    /// user can re-trigger an attach.
+    #[test]
+    fn parse_create_client_response_surfaces_401_with_status() {
+        let raw = "\
+HTTP/1.1 401 Unauthorized\r\n\
+Content-Length: 0\r\n\
+\r\n";
+        match parse_create_client_response(raw.as_bytes()) {
+            Err(ZellijAuthError::ClientRegistrationFailed { status, .. }) => {
+                assert_eq!(status, 401);
+            }
+            other => panic!("expected ClientRegistrationFailed, got {other:?}"),
+        }
+    }
+
+    /// Wire-shape pin on the POST body and headers. A regression that
+    /// dropped the `session_token` cookie or renamed the path would land
+    /// here as a failing assertion before any real-zellij run.
+    #[test]
+    fn build_register_client_request_bytes_carries_cookie_and_path() {
+        let bytes = build_register_client_request_bytes(54321, "the-session-token");
+        let text = std::str::from_utf8(&bytes).expect("ascii request");
+        assert!(text.starts_with("POST /session HTTP/1.1\r\n"), "got: {text}");
+        assert!(text.contains("Host: 127.0.0.1:54321\r\n"), "got: {text}");
+        assert!(
+            text.contains("Cookie: session_token=the-session-token\r\n"),
+            "got: {text}",
+        );
+        assert!(text.contains("Content-Type: application/json\r\n"), "got: {text}");
+        // Empty JSON body — `{}` is two bytes, must be reflected in
+        // Content-Length so zellij doesn't hang reading more.
+        assert!(text.contains("Content-Length: 2\r\n"), "got: {text}");
+        assert!(text.ends_with("{}"), "got: {text}");
+    }
+
+    /// End-to-end: spin a tiny TCP server that mimics zellij's /session
+    /// endpoint, drive `register_client` against it, assert the parsed
+    /// id. Mirrors the `exchange_login_round_trips_through_loopback`
+    /// pattern.
+    #[test]
+    fn register_client_round_trips_through_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            // Drain headers; assert the session_token cookie is present
+            // on the wire so a regression dropping it lands here.
+            let mut saw_cookie = false;
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line.to_ascii_lowercase().contains("cookie:")
+                    && line.contains("session_token=the-cookie")
+                {
+                    saw_cookie = true;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            assert!(saw_cookie, "register_client must carry session_token cookie");
+            let response = "\
+HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+\r\n\
+{\"web_client_id\":\"fixture-client-id-7777\",\"is_read_only\":false}";
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let id = register_client(port, "the-cookie").expect("register succeeds");
+        assert_eq!(id, "fixture-client-id-7777");
+    }
+
+    /// End-to-end against a real `zellij web` daemon: spawn it on a free
+    /// port, run mint+login+register_client, assert the returned
+    /// `web_client_id` is UUID-shaped. This pins the issue #28 bug fix —
+    /// pre-fix, sanctel skipped this step entirely and every subsequent
+    /// WebSocket handshake answered HTTP 400 because zellij's WS handlers
+    /// require `?web_client_id=<id>` from a registered client.
+    ///
+    /// Gated on `zellij --version` like the other `_against_real_zellij`
+    /// tests; skips cleanly in environments without zellij installed.
+    /// Cleans up by revoking the minted token and killing the daemon
+    /// regardless of test outcome — leaving a stranded daemon would
+    /// hold the port and break subsequent runs.
+    #[test]
+    fn register_client_against_real_zellij_returns_uuid() {
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        if !zellij_installed() {
+            eprintln!("skipping: zellij not installed");
+            return;
+        }
+
+        // Short ZELLIJ_SOCKET_DIR for the same macOS sun_path reason
+        // covered in issue #25. The path is set via the production
+        // helper so this test's environment matches what sanctel sets
+        // at startup.
+        let socket_dir = PathBuf::from(format!(
+            "/tmp/sanctel-zellij-auth-test-{}",
+            std::process::id(),
+        ));
+        crate::zellij_cli::set_zellij_socket_dir(&socket_dir);
+
+        // Pick a free loopback port — bind+drop, same shape as the
+        // helper in zellij_daemon.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut daemon = Command::new("zellij")
+            .args(["web", "--start", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn zellij web");
+
+        // Wait for the daemon to bind the port (cold-spawn budget: 5s).
+        // The login retry loop also has a budget, but a hung daemon
+        // here means the test panic message names the right failure
+        // mode rather than blaming the auth flow.
+        let bound = (|| {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        })();
+
+        let run = || -> Result<(String, String), String> {
+            if !bound {
+                return Err(format!("zellij web did not bind port {port} within 5s"));
+            }
+            let pair = authenticate(port).map_err(|e| e.to_string())?;
+            let id = register_client(port, &pair.session_token).map_err(|e| e.to_string())?;
+            Ok((pair.auth_token_name, id))
+        };
+        let result = run();
+
+        // Cleanup, regardless of result. Revoke before kill so the
+        // running daemon is still around to honor the request; the
+        // best-effort revoke would otherwise hit a dead port.
+        if let Ok((ref token_name, _)) = result {
+            revoke_token(token_name);
+        }
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+
+        match result {
+            Ok((_, id)) => {
+                assert!(
+                    looks_like_uuid(&id),
+                    "web_client_id must be UUID-shaped, got: {id:?}",
+                );
+            }
+            Err(msg) => panic!("{msg}"),
+        }
     }
 
     fn zellij_installed() -> bool {

@@ -24,6 +24,7 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use tauri::ipc::Channel;
 
 use crate::tmux_cli::{TmuxCli, TmuxError};
+use crate::zellij_auth::{self, ZellijAuthError};
 use crate::zellij_cli::{ZellijCli, ZellijError};
 use crate::zellij_ws::{self, ZellijWsError, ZellijWsHandle};
 
@@ -66,6 +67,12 @@ impl From<ZellijError> for AttachError {
 
 impl From<ZellijWsError> for AttachError {
     fn from(e: ZellijWsError) -> Self {
+        AttachError::Other(e.to_string())
+    }
+}
+
+impl From<ZellijAuthError> for AttachError {
+    fn from(e: ZellijAuthError) -> Self {
         AttachError::Other(e.to_string())
     }
 }
@@ -329,7 +336,21 @@ pub fn attach_tab_to_zellij(
         Err(e) => return Err(e.into()),
     }
 
-    let ws = zellij_ws::mount(&params.session, daemon_port, session_token, on_output)?;
+    // Register a per-tab `web_client_id` with the daemon. zellij's WS
+    // handlers (`/ws/terminal/<s>`, `/ws/control`) require this id as a
+    // query parameter at handshake time — without it the upgrade is
+    // rejected with HTTP 400. One id per tab: zellij's connection_table
+    // is per-attached-client and reusing an id across tabs has unclear
+    // semantics there.
+    let web_client_id = zellij_auth::register_client(daemon_port, session_token)?;
+
+    let ws = zellij_ws::mount(
+        &params.session,
+        daemon_port,
+        session_token,
+        &web_client_id,
+        on_output,
+    )?;
     // Tell zellij what size to render at. The frontend would otherwise
     // see zellij's default pane dimensions until the first user-driven
     // resize, which is jarring.

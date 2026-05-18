@@ -173,6 +173,13 @@ pub fn initial_command_frame(command: &str) -> Message {
 /// supervised daemon; without it `zellij web`'s auth middleware would
 /// reject the WebSocket handshake with HTTP 401.
 ///
+/// `web_client_id` is the id minted by `zellij_auth::register_client` —
+/// zellij's WS handlers look the client up in an in-process connection
+/// table by this id at handshake time and reject the upgrade with HTTP
+/// 400 if it's missing or unknown. One id per transient WS is the right
+/// shape: zellij's connection_table garbage-collects clients when the
+/// WS closes, so a fresh id per one-shot is cheaper than caching.
+///
 /// The transient WS intentionally doesn't reuse `mount`: writing one shot
 /// of bytes doesn't need an `on_output` channel or the per-connection I/O
 /// thread machinery, and we want the connection closed before the user's
@@ -181,9 +188,10 @@ pub fn write_initial_command(
     session_name: &str,
     port: u16,
     session_token: &str,
+    web_client_id: &str,
     command: &str,
 ) -> Result<(), ZellijWsError> {
-    let url = format!("ws://127.0.0.1:{port}/ws/terminal/{session_name}");
+    let url = terminal_ws_url(port, session_name, web_client_id);
     let req = build_ws_request(&url, session_token)?;
     let (mut ws, _resp) =
         tungstenite::connect(req).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
@@ -195,6 +203,50 @@ pub fn write_initial_command(
     // bytes when we get here, so a closed-without-handshake socket is fine.
     let _ = ws.close(None);
     Ok(())
+}
+
+/// `ws://127.0.0.1:<port>/ws/terminal/<session>?web_client_id=<id>`. Pure
+/// so the URL shape is unit-testable without opening a real socket.
+/// The id is URL-encoded so a future zellij version that swaps the UUID
+/// for an opaque token containing reserved characters doesn't silently
+/// corrupt the handshake.
+pub fn terminal_ws_url(port: u16, session_name: &str, web_client_id: &str) -> String {
+    format!(
+        "ws://127.0.0.1:{port}/ws/terminal/{session_name}?web_client_id={}",
+        url_encode(web_client_id),
+    )
+}
+
+/// `ws://127.0.0.1:<port>/ws/control?web_client_id=<id>`. Same query-
+/// parameter rule as the terminal endpoint — zellij's `ws_handler_control`
+/// also requires the id.
+pub fn control_ws_url(port: u16, web_client_id: &str) -> String {
+    format!(
+        "ws://127.0.0.1:{port}/ws/control?web_client_id={}",
+        url_encode(web_client_id),
+    )
+}
+
+/// Minimal percent-encoder covering the characters that would otherwise
+/// be interpreted as URL syntax in a query value. Everything outside
+/// `[A-Za-z0-9-._~]` is encoded as `%HH`. Adequate for the UUIDs zellij
+/// currently emits (which need no encoding) and forward-compat with a
+/// less constrained id format.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let is_unreserved = b.is_ascii_alphanumeric()
+            || b == b'-'
+            || b == b'.'
+            || b == b'_'
+            || b == b'~';
+        if is_unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Build a tungstenite client request for `url` carrying a
@@ -222,15 +274,19 @@ pub fn build_ws_request(url: &str, session_token: &str) -> Result<Request, Zelli
 /// resize / set-config messages.
 ///
 /// `session_token` is the cookie minted by `zellij_auth` — see
-/// `build_ws_request` for the auth-middleware contract.
+/// `build_ws_request` for the auth-middleware contract. `web_client_id`
+/// is minted by `zellij_auth::register_client` and rides on both URLs as
+/// a `?web_client_id=<id>` query parameter; zellij's WS handlers reject
+/// the handshake with HTTP 400 if it's missing.
 pub fn mount(
     session_name: &str,
     port: u16,
     session_token: &str,
+    web_client_id: &str,
     on_output: Channel<Vec<u8>>,
 ) -> Result<ZellijWsHandle, ZellijWsError> {
-    let terminal_url = format!("ws://127.0.0.1:{port}/ws/terminal/{session_name}");
-    let control_url = format!("ws://127.0.0.1:{port}/ws/control");
+    let terminal_url = terminal_ws_url(port, session_name, web_client_id);
+    let control_url = control_ws_url(port, web_client_id);
 
     let terminal_ws = connect_with_session(&terminal_url, session_token)?;
     let control_ws = connect_with_session(&control_url, session_token)?;
@@ -465,5 +521,49 @@ mod tests {
             .expect("request builds");
         let cookie = req.headers().get("Cookie").expect("Cookie present");
         assert_eq!(cookie.to_str().unwrap(), "session_token=abc-123");
+    }
+
+    /// `terminal_ws_url` must append `?web_client_id=<id>` to the path.
+    /// zellij's `ws_handler_terminal` deserialises a `TerminalParams` from
+    /// the query string at handshake time — a missing parameter rejects
+    /// the upgrade with HTTP 400. This is the load-bearing piece of the
+    /// fix for issue #28.
+    #[test]
+    fn terminal_ws_url_carries_web_client_id_query() {
+        let url = terminal_ws_url(9123, "sanctel_wt_x__term-1", "client-abc");
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:9123/ws/terminal/sanctel_wt_x__term-1?web_client_id=client-abc",
+        );
+    }
+
+    /// `control_ws_url` must also carry the query parameter — the same
+    /// middleware gates both endpoints.
+    #[test]
+    fn control_ws_url_carries_web_client_id_query() {
+        let url = control_ws_url(9123, "client-abc");
+        assert_eq!(url, "ws://127.0.0.1:9123/ws/control?web_client_id=client-abc");
+    }
+
+    /// Reserved characters in the id are percent-encoded so a future
+    /// zellij version that swaps the UUID for an opaque token containing
+    /// `&`, `=`, `/`, etc. doesn't silently corrupt the URL parse. UUIDs
+    /// today need no encoding — the test pins forward-compat.
+    #[test]
+    fn terminal_ws_url_percent_encodes_reserved_chars() {
+        let url = terminal_ws_url(9123, "sess", "a&b=c/d");
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:9123/ws/terminal/sess?web_client_id=a%26b%3Dc%2Fd",
+        );
+    }
+
+    /// Sanity: a canonical UUID id round-trips unchanged through the
+    /// encoder. Guards against an over-eager encoder mangling the common
+    /// case.
+    #[test]
+    fn url_encode_leaves_uuids_unchanged() {
+        let id = "0b37aed9-4d1d-442a-a500-b34221c1c653";
+        assert_eq!(url_encode(id), id);
     }
 }

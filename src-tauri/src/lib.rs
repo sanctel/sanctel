@@ -288,7 +288,10 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
                         .map_err(|e| e.to_string())?;
                 // Zellij has no CLI flag to start a session with a running
                 // command, so the chat tab's initial_command rides over a
-                // transient WebSocket (see `write_initial_command`).
+                // transient WebSocket (see `write_initial_command`). The
+                // transient WS needs its own `web_client_id` minted via
+                // `register_client` — zellij's WS handlers reject the
+                // handshake with HTTP 400 if it's missing.
                 if let Some(cmd) = req.initial_command.as_deref() {
                     let state = app.state::<AppState>();
                     let (port, session_token) = {
@@ -298,9 +301,18 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
                         })?;
                         (d.port(), d.session_token())
                     };
+                    let web_client_id =
+                        crate::zellij_auth::register_client(port, &session_token)
+                            .map_err(|e| e.to_string())?;
                     let session = format!("{base}__{window_name}");
-                    zellij_ws::write_initial_command(&session, port, &session_token, cmd)
-                        .map_err(|e| e.to_string())?;
+                    zellij_ws::write_initial_command(
+                        &session,
+                        port,
+                        &session_token,
+                        &web_client_id,
+                        cmd,
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
                 window_name
             }
