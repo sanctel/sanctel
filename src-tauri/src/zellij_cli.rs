@@ -708,6 +708,134 @@ mod tests {
         cli.kill_session(&session).expect("kill_session is idempotent");
     }
 
+    /// Regression guard for the bug class issue #15 closes — restated for
+    /// the zellij backend (PRD #16, spike acceptance criterion 2). Two
+    /// sibling per-tab zellij sessions sharing a Worktree base must NOT
+    /// share output: writes routed to one session land only in that
+    /// session's pane. The mirror of
+    /// `two_tabs_in_same_worktree_have_independent_output_against_real_tmux`
+    /// in shape and gating; if isolation fails here, the spike has hit
+    /// the same structural bug class on the new backend.
+    ///
+    /// Skips when zellij isn't installed (sandcastle CI doesn't ship it).
+    /// On a zellij-bearing dev box this exercises the full session-per-tab
+    /// model end-to-end: spawn two sessions, write distinct bytes through
+    /// each (via `zellij action write-chars` — the CLI primitive that
+    /// targets a session by name), capture each session's screen (via
+    /// `zellij action dump-screen`), assert each capture contains only its
+    /// own marker.
+    ///
+    /// The PRD calls for polling-with-timeout rather than a fixed sleep,
+    /// because shell-boot timing made the tmux equivalent flaky: the
+    /// `dump-screen` may run before the shell has booted enough to echo
+    /// the marker. The loop budgets 5s total at 50ms intervals.
+    #[test]
+    fn two_tabs_in_same_worktree_have_independent_output_against_real_zellij() {
+        if !zellij_available() {
+            eprintln!("skipping: zellij not installed");
+            return;
+        }
+
+        let cli = ZellijCli::default();
+        let pid = std::process::id();
+        // Per-tab session naming convention (ADR-0012, restated for zellij):
+        // `sanctel_wt_<wt>__<window>`. PID-suffixed Worktree base so
+        // parallel test runs don't collide on the same daemon.
+        let session_a = format!("sanctel_wt_test-wt-{pid}__term-1");
+        let session_b = format!("sanctel_wt_test-wt-{pid}__term-2");
+
+        // Belt-and-braces cleanup if a prior run leaked.
+        let _ = cli.kill_session(&session_a);
+        let _ = cli.kill_session(&session_b);
+
+        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        cli.new_session(&session_a, &cwd, None).expect("create A");
+        cli.new_session(&session_b, &cwd, None).expect("create B");
+
+        // Both sessions exist as distinct entries — the structural
+        // invariant the fix relies on. A pre-fix shared-session model
+        // would surface here as one session containing both windows.
+        assert!(cli.has_session(&session_a).unwrap());
+        assert!(cli.has_session(&session_b).unwrap());
+
+        let marker_a = "SANCTEL_ZELLIJ_TAB_A_MARKER";
+        let marker_b = "SANCTEL_ZELLIJ_TAB_B_MARKER";
+
+        // `zellij --session <name> action write-chars <chars>` writes
+        // chars into the session's focused pane as if typed. The trailing
+        // '\n' in the chars string is interpreted as Enter, which the
+        // shell uses to execute the echoed command. Each session has its
+        // own focused pane; pre-fix, sharing a session would have meant
+        // both writes targeting the same pane.
+        let send = |session: &str, marker: &str| {
+            let chars = format!("echo {marker}\n");
+            let _ = std::process::Command::new("zellij")
+                .args(["--session", session, "action", "write-chars", &chars])
+                .output()
+                .expect("zellij action write-chars");
+        };
+        send(&session_a, marker_a);
+        send(&session_b, marker_b);
+
+        // `zellij --session <name> action dump-screen <path>` writes the
+        // pane's current screen content to a file. We poll this rather
+        // than sleep-then-capture: the bytes may arrive at the pane
+        // before the shell has booted enough to echo them, in which case
+        // the first dump is empty and a later poll catches the echo.
+        let dump = |session: &str| -> String {
+            let path = std::env::temp_dir().join(format!("{session}-{pid}.dump"));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::process::Command::new("zellij")
+                .args([
+                    "--session",
+                    session,
+                    "action",
+                    "dump-screen",
+                    path.to_str().unwrap(),
+                ])
+                .output()
+                .expect("zellij action dump-screen");
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
+
+        // 100 iterations * 50ms = 5s budget. Exit early once both markers
+        // are visible so the happy path is fast.
+        let mut cap_a = String::new();
+        let mut cap_b = String::new();
+        for _ in 0..100 {
+            cap_a = dump(&session_a);
+            cap_b = dump(&session_b);
+            if cap_a.contains(marker_a) && cap_b.contains(marker_b) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Each session sees its own marker, neither sees the other's. A
+        // failing assertion here means zellij's session model has the
+        // same shared-`curw` shape that bit tmux in issue #15.
+        assert!(
+            cap_a.contains(marker_a),
+            "tab A must see A's marker. cap_a: {cap_a}",
+        );
+        assert!(
+            !cap_a.contains(marker_b),
+            "tab A must NOT see B's marker. cap_a: {cap_a}",
+        );
+        assert!(
+            cap_b.contains(marker_b),
+            "tab B must see B's marker. cap_b: {cap_b}",
+        );
+        assert!(
+            !cap_b.contains(marker_a),
+            "tab B must NOT see A's marker. cap_b: {cap_b}",
+        );
+
+        // Cleanup.
+        let _ = cli.kill_session(&session_a);
+        let _ = cli.kill_session(&session_b);
+    }
+
     fn zellij_available() -> bool {
         std::process::Command::new("zellij")
             .arg("--version")
