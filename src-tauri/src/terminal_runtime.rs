@@ -278,23 +278,22 @@ pub fn attach_tab_to_tmux(
     })
 }
 
-/// Spike slice 3 (issue #19) — zellij analog of [`attach_tab_to_tmux`].
-/// Ensures the named session exists via `zellij attach --create-background`,
-/// opens the two WebSocket connections (terminal + control) to the
-/// supervised `zellij web` daemon, sends an initial resize, and returns a
-/// handle whose `write_bytes` / `resize` route through the WS pair. Caller
+/// Zellij analog of [`attach_tab_to_tmux`]. Ensures the named session
+/// exists via `zellij attach --create-background`, opens the two
+/// WebSocket connections (terminal + control) to the supervised
+/// `zellij web` daemon, sends an initial resize, and returns a handle
+/// whose `write_bytes` / `resize` route through the WS pair. Caller
 /// signature matches the tmux side so the dispatcher in lib.rs is one
 /// match arm.
 ///
-/// Slice 5 (issue #21) layered the chat-tab durability story on top:
-/// `has_session` is probed BEFORE `new_session`, so a session that's
-/// missing at attach time (the user ran `zellij kill-all-sessions` between
-/// sanctel runs — the PRD's simulated-laptop-reboot scenario) is freshly
-/// recreated and the chat tab's persisted `initial_command` (typically
+/// If the session was missing at probe time (e.g., the user ran
+/// `zellij kill-all-sessions` externally between sanctel runs), the chat
+/// tab's persisted `initial_command` (typically
 /// `claude --resume <agentSessionId>`) is written into the new pane via
-/// the persistent WS. The create_tab "auto"-allocation path handles the
-/// fresh-create case at allocator time; this branch covers the
-/// SQLite-restored-but-session-wiped case.
+/// the persistent WS so claude can rehydrate from its on-disk transcript.
+/// On a true reattach (session still alive across sanctel restart) the
+/// initial_command is suppressed — re-firing it would feed the literal
+/// command string into the running process's stdin.
 pub fn attach_tab_to_zellij(
     zellij: &ZellijCli,
     daemon_port: u16,
@@ -335,18 +334,14 @@ pub fn attach_tab_to_zellij(
     // resize, which is jarring.
     let _ = ws.resize(params.cols, params.rows);
 
-    // Simulated-reboot path: the session was missing when we probed, so
-    // `new_session` just created an empty shell pane. Fire the chat tab's
-    // persisted initial_command (e.g., `claude --resume <agentSessionId>`)
-    // through the persistent WS so claude can rehydrate the conversation
-    // from the on-disk transcript at `~/.claude/projects/<encoded-cwd>/
-    // <id>.jsonl`. On a fresh-create from `create_tab`, the allocator
-    // already wrote the command; here `session_existed` is true and we
-    // skip.
+    // The session was missing when we probed, so `new_session` just
+    // created an empty shell. Fire the chat tab's persisted command so
+    // claude can rehydrate from its on-disk transcript. When the session
+    // pre-existed (true reattach), skip — the prior process is still
+    // running and re-firing would feed the command into its stdin.
     if !session_existed {
-        if let Some(cmd) = &params.initial_command {
-            let bytes = format!("{cmd}\n").into_bytes();
-            ws.write_bytes(bytes)
+        if let Some(cmd) = params.initial_command.as_deref() {
+            ws.write_bytes(zellij_ws::initial_command_bytes(cmd))
                 .map_err(|e| AttachError::Other(e.to_string()))?;
         }
     }

@@ -141,16 +141,21 @@ impl ZellijWsHandle {
     }
 }
 
-/// Build the binary frame that bootstraps a freshly-created chat session.
-/// Appends a single newline so the receiving shell treats the bytes as a
-/// submitted command (mirroring the `\n` that lands in tmux's PTY when
-/// `new-session ... <cmd>` runs the command and the shell prints its
-/// trailing newline). Extracted so the wire shape is unit-testable without
-/// opening a real WebSocket — the connect+send sequence in
-/// [`write_initial_command`] is exercised by the manual acceptance
-/// criteria (sandcastle CI doesn't ship a zellij binary).
+/// Bytes that bootstrap a freshly-created chat session: command + `\n`.
+/// The trailing newline is what makes the receiving shell treat the bytes
+/// as a submitted command — without it the shell sees the keystrokes but
+/// never runs them, mirroring the `\n` that lands in tmux's PTY when
+/// `new-session ... <cmd>` runs the command. Shared between the transient
+/// WS path ([`write_initial_command`]) and the persistent WS path
+/// (terminal_runtime's attach) so the wire shape can't drift between them.
+pub fn initial_command_bytes(command: &str) -> Vec<u8> {
+    format!("{command}\n").into_bytes()
+}
+
+/// Binary-frame wrapper around [`initial_command_bytes`]. Pure so the wire
+/// shape is unit-testable without opening a real WebSocket.
 pub fn initial_command_frame(command: &str) -> Message {
-    encode_binary_frame(format!("{command}\n").into_bytes())
+    encode_binary_frame(initial_command_bytes(command))
 }
 
 /// One-shot: open a transient WebSocket to the given session's terminal

@@ -268,14 +268,9 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
                 let window_name =
                     allocate_session_for_zellij_tab(locks, &zellij, &base, &cwd)
                         .map_err(|e| e.to_string())?;
-                // Bootstrap the chat tab's initial_command into the freshly
-                // created (empty) zellij pane. Zellij has no CLI flag for
-                // `new-session ... <cmd>`, so the byte-stream over WebSocket
-                // is the spike's equivalent of tmux's argv splice. This is
-                // what makes acceptance criterion #1 ("creating a chat tab
-                // spawns a zellij session whose initial command runs
-                // claude") fire — without this, the session exists but the
-                // shell is bare.
+                // Zellij has no CLI flag to start a session with a running
+                // command, so the chat tab's initial_command rides over a
+                // transient WebSocket (see `write_initial_command`).
                 if let Some(cmd) = req.initial_command.as_deref() {
                     let port = app
                         .state::<AppState>()
@@ -427,15 +422,15 @@ fn allocate_session_for_tab<R: CommandRunner>(
     Ok(window_name)
 }
 
-/// Zellij analog of [`allocate_session_for_tab`] (spike slice 5 / issue
-/// #21). Under the same per-base mutex, scans existing zellij sessions
-/// matching `<base>__`, picks the next `term-N`, and creates the session
-/// via `zellij attach --create-background` (empty — no shell-command
-/// argument; zellij has no CLI flag for it). The caller is responsible for
-/// writing the chat-tab's `initial_command` into the new pane via the
-/// transient WebSocket helper (`zellij_ws::write_initial_command`) — kept
-/// separate so this function stays a pure CLI shell, unit-testable with the
-/// mock `CommandRunner` without faking a WebSocket server.
+/// Zellij analog of [`allocate_session_for_tab`]. Under the same per-base
+/// mutex, scans existing zellij sessions matching `<base>__`, picks the
+/// next `term-N`, and creates the session via
+/// `zellij attach --create-background` (empty — zellij has no CLI flag
+/// to splice a shell-command argument). The caller is responsible for
+/// writing the chat-tab's `initial_command` into the new pane via
+/// [`zellij_ws::write_initial_command`] — kept separate so this function
+/// stays a pure CLI shell, unit-testable with the mock `CommandRunner`
+/// without faking a WebSocket server.
 ///
 /// Race protection mirrors the tmux allocator: the per-base mutex spans
 /// list → pick → create, so two concurrent callers can never compute the
@@ -1315,7 +1310,7 @@ mod tests {
         assert!(sessions.contains(&"sanctel_wt_other__term-1".to_string()));
     }
 
-    // ─── zellij allocator (spike slice 5 / issue #21) ────────────────────
+    // ─── zellij allocator ────────────────────────────────────────────────
 
     /// A zellij-shaped runner that maintains a session set in memory.
     /// `list-sessions` returns the sorted set; `attach --create-background
@@ -1419,13 +1414,13 @@ mod tests {
         }
     }
 
-    /// The structural invariant from issue #15 carried over to the zellij
-    /// backend: N concurrent callers against the same Worktree base each
-    /// land on their OWN session, not on a shared one. Without the per-
-    /// base mutex (which the allocator inherits from the tmux version via
+    /// N concurrent callers against the same Worktree base each land on
+    /// their OWN session, not on a shared one. Without the per-base mutex
+    /// (which the allocator inherits from the tmux version via
     /// `AllocationLocks`), the cold-start path would see `list-sessions`
     /// return empty for all callers and they would all pick `term-1`,
-    /// colliding on `new_session`.
+    /// colliding on `new_session`. Per-tab session isolation is the
+    /// load-bearing invariant captured in ADR-0012.
     #[test]
     fn allocate_session_for_zellij_tab_serializes_concurrent_callers() {
         const N: usize = 12;
@@ -1548,11 +1543,12 @@ mod tests {
     }
 
     /// The allocator never splices `initial_command` into zellij's argv —
-    /// zellij's `attach --create-background` has no CLI flag for it. The
-    /// `new_session` slice-2 layer already pins this; the allocator here
-    /// must not silently sneak it in via some other path. The chat tab's
-    /// initial_command reaches the pane via the WS write that the
-    /// allocator's caller (`create_tab` in lib.rs) does separately.
+    /// `attach --create-background` has no CLI flag for it, and the
+    /// chat-tab command instead reaches the pane via the WS write that
+    /// `create_tab` does separately. `zellij_cli::new_session` already
+    /// pins the no-splice contract at its layer; this test pins it at the
+    /// allocator layer so a future contributor can't sneak it in here
+    /// either.
     #[test]
     fn allocate_session_for_zellij_tab_does_not_pass_initial_command_to_new_session() {
         // Recording runner: pushes argv into an external Arc<Mutex<Vec>>
@@ -1602,11 +1598,10 @@ mod tests {
         let locks = AllocationLocks::default();
         allocate_session_for_zellij_tab(&locks, &zellij, "sanctel_wt_x", "/tmp").unwrap();
         let calls = seen.lock().clone();
-        // Calls were: list-sessions, attach --create-background. Neither
-        // should carry a `claude` token (or any token resembling a chat
-        // command) from initial_command. The allocator signature doesn't
-        // even accept initial_command, but a future contributor adding it
-        // must NOT splice without redesign — pin the contract.
+        // No call should carry a `claude` token (or any token resembling
+        // a chat command) — the allocator's signature doesn't accept
+        // initial_command, but a future contributor adding it must not
+        // silently splice without redesign.
         for argv in &calls {
             assert!(
                 !argv.iter().any(|a| a.contains("claude")),
@@ -1614,8 +1609,7 @@ mod tests {
             );
         }
         // The `attach --create-background` argv must be exactly three
-        // positional tokens — `attach`, `--create-background`,
-        // `<session>` — same shape `zellij_cli::tests` pins.
+        // positional tokens — same shape `zellij_cli::tests` pins.
         let attach_call = calls
             .iter()
             .find(|a| a.iter().any(|t| t == "--create-background"))
