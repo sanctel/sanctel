@@ -19,6 +19,19 @@ outlives the app.
   cross-platform thesis.
 - **alacritty_terminal + canvas** — viable but requires writing more
   rendering glue than xterm.js already provides.
+- **zellij** — evaluated via a 3-day spike (issue #16). 7/7 functional
+  acceptance criteria pass; performance parity with tmux (~6% faster on
+  the printf microbenchmark). Rejected because: (a) zellij introduces a
+  supervised daemon process (`zellij web`) and WebSocket protocol that
+  tmux does not require, (b) the structural-quirks-profile is comparable
+  to tmux's rather than cleaner (zellij`#2074` list-sessions hang, an
+  undocumented pre-create-vs-WS-attach close quirk), and (c) zellij's
+  one decisive advantage — native Windows support via ConPTY — does not
+  apply because Windows is not on sanctel's roadmap. See
+  [`.out-of-scope/zellij-backend.md`](../../.out-of-scope/zellij-backend.md)
+  for the full reasoning, the WebSocket-overengineering lesson, and the
+  conditions under which to reconsider (which include evaluating
+  **psmux** before re-spiking zellij itself).
 
 ## Consequences
 

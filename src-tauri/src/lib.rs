@@ -16,14 +16,9 @@
 //     `profile_id`s are fully isolated.
 // ───────────────────────────────────────────────────────────────────────────
 
-mod backend;
 mod profile_isolation;
 mod terminal_runtime;
 mod tmux_cli;
-mod zellij_auth;
-mod zellij_cli;
-mod zellij_daemon;
-mod zellij_ws;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,16 +29,9 @@ use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
-use crate::backend::Backend;
 use crate::profile_isolation::apply_profile_isolation;
-use crate::terminal_runtime::{
-    attach_tab_to_tmux, attach_tab_to_zellij, AttachParams, TerminalRegistry,
-};
+use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
 use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
-use crate::zellij_cli::{
-    cleanup_stale_zellij_sockets, list_zellij_sessions_via_socket_dir, ZellijCli, ZellijError,
-};
-use crate::zellij_daemon::{RealAuthenticator, RealLauncher, ZellijDaemon};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -76,20 +64,6 @@ struct AppState {
     // tab is its own session — the lock now serializes the allocator
     // across the *group* of sessions sharing a Worktree base.
     allocation_locks: AllocationLocks,
-    // Session names sanctel has allocated for the zellij backend but
-    // whose unix socket hasn't appeared on disk yet (the WS terminal
-    // handler creates the socket lazily on first attach). Combined with
-    // the on-disk dir scan in `allocate_session_for_zellij_tab` so a
-    // second allocation between create_tab and terminal_attach doesn't
-    // pick the same `term-N`. Drained by `close_tab`.
-    zellij_reserved_sessions: Mutex<std::collections::HashSet<String>>,
-    // Supervised `zellij web` daemon for the spike backend (issue #16 /
-    // issue #17). Populated only when `SANCTEL_BACKEND=zellij` is set and
-    // the zellij version probe succeeded; `None` otherwise. Drop on this
-    // field is what tears the daemon down at sanctel shutdown — the
-    // acceptance criterion that the spawned `zellij web` process must be
-    // terminated on clean exit rides on this Drop firing.
-    zellij_daemon: Mutex<Option<ZellijDaemon>>,
 }
 
 /// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
@@ -115,14 +89,9 @@ impl AllocationLocks {
     }
 }
 
-/// Result of the one-time backend startup probe. Emitted as a Tauri event
+/// Result of the one-time tmux startup probe. Emitted as a Tauri event
 /// and also readable via the `tmux_status` command so React can render
 /// synchronously on first paint without waiting for the event.
-///
-/// The struct name is historical (tmux was the only backend when the
-/// field was added). `backend` identifies which backend was probed so
-/// the frontend setup screen can render the appropriate copy and install
-/// instructions — a zellij failure must not render "needs tmux".
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TmuxStatus {
@@ -135,7 +104,7 @@ struct TmuxStatus {
 impl Default for TmuxStatus {
     fn default() -> Self {
         Self {
-            backend: Backend::Tmux.name().to_string(),
+            backend: "tmux".to_string(),
             available: false,
             version: None,
             error: None,
@@ -278,39 +247,15 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
             resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
         let base = tmux_session_base(req.worktree_id.as_deref(), &req.profile_id);
         let locks = &app.state::<AppState>().allocation_locks;
-        let allocated = match Backend::from_env() {
-            Backend::Tmux => {
-                let tmux = TmuxCli::default();
-                allocate_session_for_tab(
-                    locks,
-                    &tmux,
-                    &base,
-                    &cwd,
-                    req.initial_command.as_deref(),
-                )
-                .map_err(|e| e.to_string())?
-            }
-            Backend::Zellij => {
-                let socket_dir = std::env::var("ZELLIJ_SOCKET_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/sanctel-zellij"));
-                let reserved = &app.state::<AppState>().zellij_reserved_sessions;
-                let window_name = allocate_session_for_zellij_tab(
-                    locks, reserved, &socket_dir, &base,
-                )
-                .map_err(|e| e.to_string())?;
-                // Chat tab's initial_command is written on the persistent
-                // WS in attach_tab_to_zellij, not via a transient WS here.
-                // A transient WS would pre-attach the session, and zellij
-                // closes the subsequent re-attach from the persistent WS
-                // prematurely (verified empirically — Normal close right
-                // after handshake). Holding the command until first attach
-                // keeps the session creation and command write on the
-                // same connection.
-                let _ = req.initial_command.as_deref();
-                window_name
-            }
-        };
+        let tmux = TmuxCli::default();
+        let allocated = allocate_session_for_tab(
+            locks,
+            &tmux,
+            &base,
+            &cwd,
+            req.initial_command.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         Some(allocated)
     } else {
         None
@@ -444,66 +389,6 @@ fn allocate_session_for_tab<R: CommandRunner>(
     Ok(window_name)
 }
 
-/// Zellij analog of [`allocate_session_for_tab`]. Under the same per-base
-/// mutex, scans existing zellij sessions matching `<base>__`, picks the
-/// next `term-N`, and creates the session via
-/// `zellij attach --create-background` (empty — zellij has no CLI flag
-/// to splice a shell-command argument). The caller is responsible for
-/// writing the chat-tab's `initial_command` into the new pane via
-/// [`zellij_ws::write_initial_command`] — kept separate so this function
-/// stays a pure CLI shell, unit-testable with the mock `CommandRunner`
-/// without faking a WebSocket server.
-///
-/// Race protection mirrors the tmux allocator: the per-base mutex spans
-/// list → pick → create, so two concurrent callers can never compute the
-/// same `term-N` against the same Worktree. The WebSocket write done by
-/// the caller post-allocator is per-session (uniquely named at this point)
-/// and doesn't need additional serialisation.
-fn allocate_session_for_zellij_tab(
-    locks: &AllocationLocks,
-    reserved: &Mutex<std::collections::HashSet<String>>,
-    socket_dir: &std::path::Path,
-    base: &str,
-) -> Result<String, ZellijError> {
-    let lock = locks.lock_for(base);
-    let _guard = lock.lock();
-    // Sweep dead sockets first. `zellij list-sessions` and zellij's web
-    // server both hang indefinitely when stale session sockets are in
-    // the dir (they try to handshake with each one); see
-    // `cleanup_stale_zellij_sockets` docs.
-    cleanup_stale_zellij_sockets(socket_dir);
-    let prefix = format!("{base}__");
-    // Two-source discovery:
-    //   (a) on-disk sockets — sessions that have been created (either by
-    //       a previous sanctel run's zellij-server processes that
-    //       outlived sanctel, or by the WS handler creating the session
-    //       on first attach).
-    //   (b) in-memory reservations — sessions sanctel allocated but
-    //       hasn't WS-attached yet, so no socket exists.
-    // Both reads happen INSIDE the per-base mutex so the union snapshot
-    // is atomic with the pick + insert below.
-    let on_disk = list_zellij_sessions_via_socket_dir(socket_dir);
-    let reserved_now = reserved.lock();
-    let existing_suffixes: Vec<String> = on_disk
-        .iter()
-        .chain(reserved_now.iter())
-        .filter_map(|s| s.strip_prefix(&prefix).map(str::to_string))
-        .collect();
-    drop(reserved_now);
-    let window_name = allocate_window_name(&existing_suffixes);
-    let session = format!("{base}__{window_name}");
-    // Note: we deliberately do NOT call `zellij attach --create-background`
-    // here. zellij closes the WS prematurely when a name is pre-created
-    // and then attached via WS; the WS handler's `spawn_session_if_needed`
-    // path is what zellij's own browser client uses, and what works.
-    // Verified empirically: pre-create → io_loop exits on Normal close;
-    // no pre-create → terminal renders. The reservation guards collision
-    // avoidance in place of the on-disk socket the pre-create used to
-    // leave behind.
-    reserved.lock().insert(session);
-    Ok(window_name)
-}
-
 #[tauri::command]
 fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // Tauri 2 doesn't expose a stable webview.close() at the time of this
@@ -513,32 +398,16 @@ fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // proper destroy API.
     let _ = hide_webview(&app, &id);
 
-    // For terminal/chat tabs, kill the per-tab session on whichever backend
-    // owns it so the shell dies. Each tab owns its own session
-    // (`sanctel_wt_<wt>__term-N`) per ADR-0012 revised by issue #15, so a
-    // single `kill_session` is the complete cleanup.
+    // For terminal/chat tabs, kill the per-tab session so the shell dies.
+    // Each tab owns its own session (`sanctel_wt_<wt>__term-N`) per
+    // ADR-0012 revised by issue #15, so a single `kill_session` is the
+    // complete cleanup.
     let state = app.state::<AppState>();
     let record = state.tabs.lock().get(&id).cloned();
     if let Some(rec) = record {
         if rec.kind == "terminal" || rec.kind == "chat" {
             if let Some(handle) = state.terminals.remove(&id) {
-                match Backend::from_env() {
-                    Backend::Tmux => {
-                        let _ = TmuxCli::default().kill_session(&handle.session);
-                    }
-                    Backend::Zellij => {
-                        let _ = ZellijCli::default().kill_session(&handle.session);
-                        // Drop the in-memory reservation in case this
-                        // tab was closed before its WS ever attached
-                        // (so the on-disk socket never appeared and
-                        // a later allocator would otherwise see the
-                        // name as taken forever).
-                        state
-                            .zellij_reserved_sessions
-                            .lock()
-                            .remove(&handle.session);
-                    }
-                }
+                let _ = TmuxCli::default().kill_session(&handle.session);
             }
         }
     }
@@ -697,28 +566,8 @@ fn terminal_attach<R: Runtime>(
     // AttachError::Display emits `worktree-missing: <path>` for the broken-tab
     // case, which the frontend pattern-matches in terminal-runtime.ts. Don't
     // wrap or rephrase — the prefix is the wire contract.
-    let handle = match Backend::from_env() {
-        Backend::Tmux => attach_tab_to_tmux(&TmuxCli::default(), params, on_output)
-            .map_err(|e| e.to_string())?,
-        Backend::Zellij => {
-            let state = app.state::<AppState>();
-            let (port, session_token) = {
-                let daemon = state.zellij_daemon.lock();
-                let d = daemon.as_ref().ok_or_else(|| {
-                    "zellij daemon not running — startup probe failed".to_string()
-                })?;
-                (d.port(), d.session_token())
-            };
-            attach_tab_to_zellij(
-                &ZellijCli::default(),
-                port,
-                &session_token,
-                params,
-                on_output,
-            )
-            .map_err(|e| e.to_string())?
-        }
-    };
+    let handle = attach_tab_to_tmux(&TmuxCli::default(), params, on_output)
+        .map_err(|e| e.to_string())?;
     app.state::<AppState>().terminals.insert(label, Arc::new(handle));
     Ok(())
 }
@@ -763,7 +612,7 @@ fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
     status: &Mutex<TmuxStatus>,
     tmux: &TmuxCli<R>,
 ) {
-    let backend = Backend::Tmux.name().to_string();
+    let backend = "tmux".to_string();
     let resolved = match tmux.version() {
         Ok(v) => TmuxStatus {
             backend,
@@ -787,41 +636,6 @@ fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
     *status.lock() = resolved;
 }
 
-/// `zellij --version` probe, mirror of `probe_tmux_into`. Reuses the
-/// `tmux_status` AppState field by design: the field is structurally a
-/// "current backend ready / not ready" signal, and the spike's "no
-/// frontend changes" constraint forbids renaming it or adding a parallel
-/// command surface. The version string is whatever zellij reports (e.g.,
-/// `zellij 0.42.0`) so the frontend setup screen surfaces something
-/// recognisable rather than a confusing "tmux 0.42.0".
-fn probe_zellij_into<R: crate::tmux_cli::CommandRunner>(
-    status: &Mutex<TmuxStatus>,
-    zellij: &ZellijCli<R>,
-) {
-    let backend = Backend::Zellij.name().to_string();
-    let resolved = match zellij.version() {
-        Ok(v) => TmuxStatus {
-            backend,
-            available: true,
-            version: Some(v),
-            error: None,
-        },
-        Err(ZellijError::NotFound(msg)) => TmuxStatus {
-            backend,
-            available: false,
-            version: None,
-            error: Some(format!("zellij not installed: {msg}")),
-        },
-        Err(other) => TmuxStatus {
-            backend,
-            available: false,
-            version: None,
-            error: Some(other.to_string()),
-        },
-    };
-    *status.lock() = resolved;
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -833,56 +647,11 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
         .setup(|app| {
-            // One-time backend startup probe. The current backend is
-            // resolved from `SANCTEL_BACKEND` exactly once here — switching
-            // mid-process is not a goal. The `tmux_status` field is the
-            // structural "current backend ready" signal that the frontend
-            // setup-screen gates on (Slice 7 wired this for tmux; the spike
-            // reuses it so no frontend changes are needed). When
-            // `SANCTEL_BACKEND=zellij`, we additionally spawn the
-            // `zellij web` daemon supervisor and stash it on AppState so
-            // its Drop tears the child down at sanctel shutdown.
+            // One-time tmux startup probe. The `tmux_status` field is the
+            // structural "backend ready" signal that the frontend setup-
+            // screen gates on (Slice 7).
             let state = app.state::<AppState>();
-            match Backend::from_env() {
-                Backend::Tmux => {
-                    probe_tmux_into(&state.tmux_status, &TmuxCli::default());
-                }
-                Backend::Zellij => {
-                    // Must run BEFORE the version probe and daemon launch so
-                    // every child zellij subprocess inherits the short socket
-                    // path. See `zellij_cli::set_zellij_socket_dir` for the
-                    // macOS sun_path arithmetic.
-                    crate::zellij_cli::set_zellij_socket_dir(
-                        std::path::Path::new("/tmp/sanctel-zellij"),
-                    );
-                    probe_zellij_into(&state.tmux_status, &ZellijCli::default());
-                    if state.tmux_status.lock().available {
-                        match ZellijDaemon::start(RealLauncher, RealAuthenticator) {
-                            Ok(daemon) => {
-                                *state.zellij_daemon.lock() = Some(daemon);
-                            }
-                            Err(e) => {
-                                // Surface the spawn (or auth) failure through
-                                // the same available/error channel the
-                                // version probe uses; the frontend setup
-                                // screen renders identically. Routing auth
-                                // failures here is what keeps the failure
-                                // mode named (diagnostic detail in the
-                                // setup screen) rather than an opaque
-                                // HTTP 401 per terminal tab.
-                                *state.tmux_status.lock() = TmuxStatus {
-                                    backend: Backend::Zellij.name().to_string(),
-                                    available: false,
-                                    version: None,
-                                    error: Some(format!(
-                                        "zellij daemon failed to start: {e}"
-                                    )),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
+            probe_tmux_into(&state.tmux_status, &TmuxCli::default());
             let snapshot = state.tmux_status.lock().clone();
             let _ = app.emit("tmux-status", snapshot);
             Ok(())
@@ -1061,115 +830,13 @@ mod tests {
         assert_eq!(status.lock().backend, "tmux");
     }
 
-    // ─── zellij probe (spike slice 1 / issue #17) ────────────────────────
-
-    struct ZellijOkRunner;
-    impl CommandRunner for ZellijOkRunner {
-        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CommandOutput> {
-            Ok(CommandOutput {
-                status: 0,
-                stdout: b"zellij 0.42.0\n".to_vec(),
-                stderr: vec![],
-            })
-        }
-    }
-
-    /// When zellij is on PATH, the probe writes `available: true` and the
-    /// version string into the same `tmux_status` field (reused by design
-    /// — the spike forbids frontend changes). The version string carries
-    /// the actual backend name so the setup screen can still tell users
-    /// which backend it's reporting about.
-    #[test]
-    fn zellij_probe_marks_available_with_version() {
-        let status = Mutex::new(TmuxStatus::default());
-        let zellij = ZellijCli::new(ZellijOkRunner);
-        probe_zellij_into(&status, &zellij);
-        let result = status.lock().clone();
-        assert!(result.available);
-        assert_eq!(result.version.as_deref(), Some("zellij 0.42.0"));
-        assert!(result.error.is_none());
-    }
-
-    /// Missing zellij surfaces as `available: false` + an error containing
-    /// `zellij not installed` so the setup screen can describe the actual
-    /// problem rather than the existing tmux-shaped message.
-    #[test]
-    fn zellij_probe_marks_unavailable_when_missing() {
-        let status = Mutex::new(TmuxStatus::default());
-        let zellij = ZellijCli::new(FailingRunner);
-        probe_zellij_into(&status, &zellij);
-        let result = status.lock().clone();
-        assert!(!result.available);
-        let err = result.error.expect("error must be populated");
-        assert!(
-            err.contains("zellij not installed"),
-            "error should name zellij, got: {err}"
-        );
-    }
-
-    /// The zellij probe writes `backend: "zellij"` so the frontend setup-
-    /// screen renders zellij-flavoured copy and install instructions when
-    /// the spike backend is the one that failed. Pinned on both branches
-    /// so the failure path (where the setup screen is actually rendered)
-    /// is covered.
-    #[test]
-    fn zellij_probe_names_backend_in_status() {
-        let status = Mutex::new(TmuxStatus::default());
-        probe_zellij_into(&status, &ZellijCli::new(ZellijOkRunner));
-        assert_eq!(status.lock().backend, "zellij");
-
-        let status = Mutex::new(TmuxStatus::default());
-        probe_zellij_into(&status, &ZellijCli::new(FailingRunner));
-        assert_eq!(status.lock().backend, "zellij");
-    }
-
     /// The default value of the field — what `TmuxStatus::default()` yields
-    /// before any probe has run — must be `"tmux"`. This matches the
-    /// frontend's defensive fallback (a missing or malformed value renders
-    /// the existing tmux copy) so the two sides agree on which backend is
-    /// implied by a bare status.
+    /// before any probe has run — must be `"tmux"`. Matches the frontend's
+    /// defensive fallback so both sides agree on which backend is implied
+    /// by a bare status.
     #[test]
     fn default_status_names_tmux_backend() {
         assert_eq!(TmuxStatus::default().backend, "tmux");
-    }
-
-    /// The dispatcher acceptance criterion: `Backend::from_env_value(None)`
-    /// drives the tmux probe and only the tmux probe — wiring this end to
-    /// end here so a future contributor can't accidentally invert the
-    /// branches in `run()`'s setup hook.
-    #[test]
-    fn dispatcher_tmux_branch_runs_tmux_probe() {
-        let status = Mutex::new(TmuxStatus::default());
-        match Backend::from_env_value(None) {
-            Backend::Tmux => {
-                probe_tmux_into(&status, &TmuxCli::new("test", OkRunner));
-            }
-            Backend::Zellij => panic!("default branch must select Tmux"),
-        }
-        assert_eq!(
-            status.lock().version.as_deref(),
-            Some("tmux 3.4"),
-            "tmux branch must produce a tmux-shaped version string",
-        );
-    }
-
-    /// `SANCTEL_BACKEND=zellij` drives the zellij probe (and, in `run()`,
-    /// the daemon supervisor). The probe-only half is unit-testable here;
-    /// the supervisor half is exercised by zellij_daemon::tests.
-    #[test]
-    fn dispatcher_zellij_branch_runs_zellij_probe() {
-        let status = Mutex::new(TmuxStatus::default());
-        match Backend::from_env_value(Some("zellij")) {
-            Backend::Zellij => {
-                probe_zellij_into(&status, &ZellijCli::new(ZellijOkRunner));
-            }
-            Backend::Tmux => panic!("'zellij' env value must select Zellij"),
-        }
-        assert_eq!(
-            status.lock().version.as_deref(),
-            Some("zellij 0.42.0"),
-            "zellij branch must produce a zellij-shaped version string",
-        );
     }
 
     // ─── windowName allocation under the per-Worktree mutex (issue #10/#15) ───
@@ -1431,201 +1098,6 @@ mod tests {
         let sessions = runner.session_names();
         assert!(sessions.contains(&"sanctel_wt_target__term-4".to_string()));
         assert!(sessions.contains(&"sanctel_wt_other__term-1".to_string()));
-    }
-
-    // ─── zellij allocator ────────────────────────────────────────────────
-
-    /// Build a fresh per-test socket dir under $TMPDIR with a unique name.
-    /// The allocator scans this path the same way it would scan
-    /// $ZELLIJ_SOCKET_DIR in production. Returns the dir's path.
-    fn fresh_test_socket_dir(tag: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        // Use `/tmp` directly rather than `env::temp_dir()` (which on
-        // macOS resolves to a long `/var/folders/...` path that overflows
-        // the 104-byte SUN_LEN limit once combined with our session
-        // names). Same reason production sanctel sets ZELLIJ_SOCKET_DIR
-        // to `/tmp/sanctel-zellij`.
-        let dir = std::path::PathBuf::from(format!(
-            "/tmp/sanctel-test-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("contract_version_1")).unwrap();
-        dir
-    }
-
-    /// Bind real Unix listening sockets in the test socket dir so they
-    /// (a) appear in `list_zellij_sessions_via_socket_dir` and (b) accept
-    /// `connect()` from `cleanup_stale_zellij_sockets` so the sweep
-    /// doesn't delete them. Returns the listeners so the caller keeps
-    /// them alive for the test duration; dropping them closes the
-    /// sockets (file remains on disk but connect would then refuse).
-    #[must_use = "caller must keep the listeners alive for the test"]
-    fn seed_socket_dir(
-        socket_dir: &std::path::Path,
-        names: &[&str],
-    ) -> Vec<std::os::unix::net::UnixListener> {
-        names
-            .iter()
-            .map(|name| {
-                let path = socket_dir.join("contract_version_1").join(name);
-                let _ = std::fs::remove_file(&path);
-                std::os::unix::net::UnixListener::bind(&path)
-                    .expect("bind test session socket")
-            })
-            .collect()
-    }
-
-    /// N concurrent callers against the same base must produce N
-    /// distinct `term-N` names with no holes. Without the per-base mutex
-    /// + in-memory reservation set, two callers would scan the empty
-    /// dir, both pick `term-1`, and collide downstream. Reservation is
-    /// the source of truth because the allocator no longer pre-creates
-    /// the on-disk socket (pre-create caused zellij to close the WS on
-    /// re-attach — verified empirically).
-    #[test]
-    fn allocate_session_for_zellij_tab_serializes_concurrent_callers() {
-        const N: usize = 12;
-        let base = "sanctel_wt_race-test";
-
-        let locks = Arc::new(AllocationLocks::default());
-        let reserved = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        let socket_dir = Arc::new(fresh_test_socket_dir("race"));
-
-        let handles: Vec<_> = (0..N)
-            .map(|_| {
-                let locks = Arc::clone(&locks);
-                let reserved = Arc::clone(&reserved);
-                let socket_dir = Arc::clone(&socket_dir);
-                let base = base.to_string();
-                std::thread::spawn(move || {
-                    allocate_session_for_zellij_tab(&locks, &reserved, &socket_dir, &base)
-                })
-            })
-            .collect();
-
-        let mut got: Vec<String> = handles
-            .into_iter()
-            .map(|h| h.join().unwrap().expect("allocation must succeed"))
-            .collect();
-        got.sort_by_key(|s| {
-            s.rsplit("term-")
-                .next()
-                .and_then(|n| n.parse::<usize>().ok())
-                .expect("name ends in term-N")
-        });
-
-        let expected: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
-        assert_eq!(
-            got, expected,
-            "N concurrent callers must produce N distinct term-N names with no holes"
-        );
-    }
-
-    /// Cold start: empty socket dir, empty reservation set → first
-    /// allocation picks `term-1`. Regression here would break every new
-    /// terminal/chat tab on a fresh install.
-    #[test]
-    fn allocate_session_for_zellij_tab_picks_term_1_on_cold_start() {
-        let locks = AllocationLocks::default();
-        let reserved = Mutex::new(std::collections::HashSet::new());
-        let socket_dir = fresh_test_socket_dir("cold");
-        let next = allocate_session_for_zellij_tab(
-            &locks,
-            &reserved,
-            &socket_dir,
-            "sanctel_wt_a",
-        )
-        .unwrap();
-        assert_eq!(next, "term-1");
-        assert!(reserved.lock().contains("sanctel_wt_a__term-1"));
-    }
-
-    /// Allocator scan correctness on the disk source: when sockets from
-    /// previous sanctel runs (or surviving zellij-server processes) are
-    /// present in the dir, the allocator picks the next free `term-N`,
-    /// ignoring siblings on other Worktrees and any external sessions
-    /// that don't match our naming pattern.
-    #[test]
-    fn allocate_session_for_zellij_tab_scans_existing_zellij_sessions() {
-        let locks = AllocationLocks::default();
-        let reserved = Mutex::new(std::collections::HashSet::new());
-        let socket_dir = fresh_test_socket_dir("scan");
-        let _seeded = seed_socket_dir(
-            &socket_dir,
-            &[
-                "sanctel_wt_target__term-1",
-                "sanctel_wt_target__term-3",
-                "sanctel_wt_other__term-1",
-                // An external `zellij`-created session that doesn't match
-                // our naming pattern — must not perturb the counter.
-                "my-debug-session",
-            ],
-        );
-
-        let next = allocate_session_for_zellij_tab(
-            &locks,
-            &reserved,
-            &socket_dir,
-            "sanctel_wt_target",
-        )
-        .unwrap();
-        // Max term-N on target is 3 → next is term-4.
-        assert_eq!(next, "term-4");
-        assert!(reserved.lock().contains("sanctel_wt_target__term-4"));
-    }
-
-    /// Reservation-set source: when a sibling allocation has already
-    /// claimed `term-1` but hasn't been WS-attached yet (so no socket
-    /// exists on disk), the next allocator must still pick `term-2`.
-    /// This is the case the pre-create-via-CLI flow used to cover via
-    /// the on-disk socket; the in-memory reservation replaces it.
-    #[test]
-    fn allocate_session_for_zellij_tab_skips_in_flight_reservations() {
-        let locks = AllocationLocks::default();
-        let reserved = Mutex::new(std::collections::HashSet::new());
-        reserved
-            .lock()
-            .insert("sanctel_wt_a__term-1".to_string());
-        let socket_dir = fresh_test_socket_dir("reservation");
-
-        let next = allocate_session_for_zellij_tab(
-            &locks,
-            &reserved,
-            &socket_dir,
-            "sanctel_wt_a",
-        )
-        .unwrap();
-        assert_eq!(next, "term-2");
-    }
-
-    /// Different Worktree bases don't serialize against each other: two
-    /// callers against distinct bases both get `term-1`. The per-base
-    /// mutex keys on the base, so parallel allocations across Worktrees
-    /// run concurrently.
-    #[test]
-    fn allocate_session_for_zellij_tab_does_not_serialize_distinct_worktrees() {
-        let locks = AllocationLocks::default();
-        let reserved = Mutex::new(std::collections::HashSet::new());
-        let socket_dir = fresh_test_socket_dir("distinct");
-        let a = allocate_session_for_zellij_tab(
-            &locks,
-            &reserved,
-            &socket_dir,
-            "sanctel_wt_a",
-        )
-        .unwrap();
-        let b = allocate_session_for_zellij_tab(
-            &locks,
-            &reserved,
-            &socket_dir,
-            "sanctel_wt_b",
-        )
-        .unwrap();
-        assert_eq!(a, "term-1");
-        assert_eq!(b, "term-1");
     }
 
 }

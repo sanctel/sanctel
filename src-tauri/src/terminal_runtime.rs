@@ -24,9 +24,6 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use tauri::ipc::Channel;
 
 use crate::tmux_cli::{TmuxCli, TmuxError};
-use crate::zellij_auth::{self, ZellijAuthError};
-use crate::zellij_cli::{ZellijCli, ZellijError};
-use crate::zellij_ws::{self, ZellijWsError, ZellijWsHandle};
 
 // ─── attach errors ────────────────────────────────────────────────────────
 
@@ -59,90 +56,43 @@ impl From<TmuxError> for AttachError {
     }
 }
 
-impl From<ZellijError> for AttachError {
-    fn from(e: ZellijError) -> Self {
-        AttachError::Other(e.to_string())
-    }
-}
-
-impl From<ZellijWsError> for AttachError {
-    fn from(e: ZellijWsError) -> Self {
-        AttachError::Other(e.to_string())
-    }
-}
-
-impl From<ZellijAuthError> for AttachError {
-    fn from(e: ZellijAuthError) -> Self {
-        AttachError::Other(e.to_string())
-    }
-}
-
 // ─── per-tab handle and store ─────────────────────────────────────────────
 
-/// Everything we need to drive one attached terminal tab. Backend-agnostic
-/// surface (`write_bytes`, `resize`) on top of an internal enum that holds
-/// the backend-specific state — a PTY master for tmux, a WebSocket pair
-/// for zellij. Callers (`terminal_write`, `terminal_resize` in lib.rs) are
-/// indifferent to which backend produced the handle; `close_tab` dispatches
-/// the kill_session call by reading the current backend.
+/// Everything we need to drive one attached terminal tab. Holds a PTY pair
+/// attached to `tmux attach-session`. The writer mutex is locked inside
+/// `write_bytes`; the master mutex is locked inside `resize`. Locks held
+/// only for the duration of the I/O call — no caller-side `MutexGuard` is
+/// ever constructed (which would trip Rust 1.95+'s drop-order check E0597
+/// against an `Arc<Self>`).
 pub struct TerminalHandle {
-    inner: TerminalHandleInner,
+    writer: Mutex<Box<dyn Write + Send>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     /// Per-tab session name (`sanctel_wt_<wt>__term-N` per ADR-0012
-    /// revised by issue #15) — same convention on both backends. The
-    /// frontend never sees this; `close_tab` passes it to the appropriate
-    /// backend's `kill_session` to tear down the server-side state.
+    /// revised by issue #15). The frontend never sees this; `close_tab`
+    /// passes it to `tmux kill-session` to tear down the server-side state.
     pub session: String,
 }
 
-enum TerminalHandleInner {
-    /// tmux path: PTY pair attached to `tmux attach-session`. The writer
-    /// mutex is locked inside `write_bytes`; the master mutex is locked
-    /// inside `resize`. Locks held only for the duration of the I/O call
-    /// — no caller-side `MutexGuard` is ever constructed (which would
-    /// trip Rust 1.95+'s drop-order check E0597 against an `Arc<Self>`).
-    Tmux {
-        writer: Mutex<Box<dyn Write + Send>>,
-        master: Mutex<Box<dyn MasterPty + Send>>,
-    },
-    /// zellij path: a pair of WebSocket connections to the supervised
-    /// `zellij web` daemon. The handle owns the send-side mpsc channels;
-    /// drop closes them and the I/O threads exit cleanly.
-    Zellij { ws: ZellijWsHandle },
-}
-
 impl TerminalHandle {
-    /// Write raw bytes to the terminal. On the tmux path: PTY master write.
-    /// On the zellij path: binary frame on `/ws/terminal/<session>`.
+    /// Write raw bytes to the tmux PTY master.
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), String> {
-        match &self.inner {
-            TerminalHandleInner::Tmux { writer, .. } => writer
-                .lock()
-                .write_all(bytes)
-                .map_err(|e| e.to_string()),
-            TerminalHandleInner::Zellij { ws } => {
-                ws.write_bytes(bytes.to_vec()).map_err(|e| e.to_string())
-            }
-        }
+        self.writer
+            .lock()
+            .write_all(bytes)
+            .map_err(|e| e.to_string())
     }
 
-    /// Resize the terminal pane. On the tmux path: `master.resize(...)`.
-    /// On the zellij path: a `TerminalResize` control message on
-    /// `/ws/control`.
+    /// Resize the PTY pane.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        match &self.inner {
-            TerminalHandleInner::Tmux { master, .. } => master
-                .lock()
-                .resize(PtySize {
-                    rows: rows.max(1),
-                    cols: cols.max(1),
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|e| e.to_string()),
-            TerminalHandleInner::Zellij { ws } => {
-                ws.resize(cols, rows).map_err(|e| e.to_string())
-            }
-        }
+        self.master
+            .lock()
+            .resize(PtySize {
+                rows: rows.max(1),
+                cols: cols.max(1),
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -277,96 +227,8 @@ pub fn attach_tab_to_tmux(
     spawn_pty_reader(reader, on_output);
 
     Ok(TerminalHandle {
-        inner: TerminalHandleInner::Tmux {
-            writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
-        },
-        session: params.session,
-    })
-}
-
-/// Zellij analog of [`attach_tab_to_tmux`]. Ensures the named session
-/// exists via `zellij attach --create-background`, opens the two
-/// WebSocket connections (terminal + control) to the supervised
-/// `zellij web` daemon, sends an initial resize, and returns a handle
-/// whose `write_bytes` / `resize` route through the WS pair. Caller
-/// signature matches the tmux side so the dispatcher in lib.rs is one
-/// match arm.
-///
-/// If the session was missing at probe time (e.g., the user ran
-/// `zellij kill-all-sessions` externally between sanctel runs), the chat
-/// tab's persisted `initial_command` (typically
-/// `claude --resume <agentSessionId>`) is written into the new pane via
-/// the persistent WS so claude can rehydrate from its on-disk transcript.
-/// On a true reattach (session still alive across sanctel restart) the
-/// initial_command is suppressed — re-firing it would feed the literal
-/// command string into the running process's stdin.
-pub fn attach_tab_to_zellij(
-    zellij: &ZellijCli,
-    daemon_port: u16,
-    session_token: &str,
-    params: AttachParams,
-    on_output: Channel<Vec<u8>>,
-) -> Result<TerminalHandle, AttachError> {
-    // Same worktree-existence preflight as the tmux path — the broken-tab
-    // UI is the same wire contract regardless of which backend would have
-    // failed downstream.
-    check_worktree_exists(&params.worktree_path)?;
-
-    // Distinguish "fresh allocation" from "reattach to a session that
-    // already existed at sanctel startup". For fresh sessions we fire the
-    // chat tab's `initial_command`; for reattach we MUST NOT, or claude
-    // would receive the literal command string on its stdin.
-    //
-    // Source of truth: the on-disk socket file. The allocator skips
-    // pre-create (zellij closes the WS prematurely on re-attach to a
-    // pre-created session — verified empirically), so on first attach
-    // the socket doesn't exist yet → fresh. On a re-attach in the same
-    // sanctel run, the WS handler created the socket on the prior
-    // attach → exists → reattach. On a new sanctel run with a surviving
-    // zellij-server process from a previous run, the socket also
-    // exists → reattach (correctly skipping initial_command).
-    let session_existed = std::env::var("ZELLIJ_SOCKET_DIR")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .map(|d| d.join("contract_version_1").join(&params.session).exists())
-        .unwrap_or(false);
-    let _ = &zellij;
-
-    // Register a per-tab `web_client_id` with the daemon. zellij's WS
-    // handlers (`/ws/terminal/<s>`, `/ws/control`) require this id as a
-    // query parameter at handshake time — without it the upgrade is
-    // rejected with HTTP 400. One id per tab: zellij's connection_table
-    // is per-attached-client and reusing an id across tabs has unclear
-    // semantics there.
-    let web_client_id = zellij_auth::register_client(daemon_port, session_token)?;
-
-    let ws = zellij_ws::mount(
-        &params.session,
-        daemon_port,
-        session_token,
-        &web_client_id,
-        on_output,
-    )?;
-    // Tell zellij what size to render at. The frontend would otherwise
-    // see zellij's default pane dimensions until the first user-driven
-    // resize, which is jarring.
-    let _ = ws.resize(params.cols, params.rows);
-
-    // The session was missing when we probed, so `new_session` just
-    // created an empty shell. Fire the chat tab's persisted command so
-    // claude can rehydrate from its on-disk transcript. When the session
-    // pre-existed (true reattach), skip — the prior process is still
-    // running and re-firing would feed the command into its stdin.
-    if !session_existed {
-        if let Some(cmd) = params.initial_command.as_deref() {
-            ws.write_bytes(zellij_ws::initial_command_bytes(cmd))
-                .map_err(|e| AttachError::Other(e.to_string()))?;
-        }
-    }
-
-    Ok(TerminalHandle {
-        inner: TerminalHandleInner::Zellij { ws },
+        writer: Mutex::new(writer),
+        master: Mutex::new(pair.master),
         session: params.session,
     })
 }
@@ -457,10 +319,8 @@ mod tests {
         let mut reader = pair.master.try_clone_reader().expect("clone_reader");
         let writer = pair.master.take_writer().expect("take_writer");
         let handle = TerminalHandle {
-            inner: TerminalHandleInner::Tmux {
-                writer: Mutex::new(writer),
-                master: Mutex::new(pair.master),
-            },
+            writer: Mutex::new(writer),
+            master: Mutex::new(pair.master),
             session: "test-session".into(),
         };
 
@@ -651,8 +511,7 @@ mod tests {
         // Poll-with-timeout rather than a fixed sleep. Shell boot on a
         // cold container can exceed any short fixed sleep; the
         // assertion is structural (which session saw which marker), so
-        // it's safe to wait until both markers actually appear. Mirrors
-        // the zellij analog's polling shape. 5s budget.
+        // it's safe to wait until both markers actually appear. 5s budget.
         let mut cap_a = String::new();
         let mut cap_b = String::new();
         for _ in 0..100 {

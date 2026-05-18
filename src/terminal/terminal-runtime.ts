@@ -81,7 +81,7 @@ export function mount(
   // it correctly (including partial multi-byte chunks).
   //
   // The channel is installed BEFORE terminal_attach is invoked so the
-  // initial screen dump (for chat tabs reattaching to a surviving zellij
+  // initial screen dump (for chat tabs reattaching to a surviving tmux
   // session) is never missed.
   const onOutput = new Channel<number[] | Uint8Array>();
   onOutput.onmessage = (data) => {
@@ -125,11 +125,8 @@ export function mount(
   // size. During hydrate, sanctel creates webviews while content_rect is
   // still (0,0,0,0) (React hasn't reported its layout yet), so the
   // container is clamped to 1×1 and `fit.fit()` would yield 0/1 cols.
-  // Attaching at that size tells zellij the grid is degenerate, so on a
-  // surviving-session reattach the existing screen content gets emitted
-  // for that broken grid and the user sees blank until they tab away and
-  // back. Wait for the show_webview pass to apply real dimensions
-  // before talking to Rust.
+  // Attaching at that size tells tmux the grid is degenerate; wait for
+  // the show_webview pass to apply real dimensions before talking to Rust.
   waitForRealContainerSize(container, fit, term).then(() => {
     invoke("terminal_attach", {
       cols: term.cols,

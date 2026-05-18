@@ -123,12 +123,11 @@ impl From<Output> for CommandOutput {
 pub trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CommandOutput>;
 
-    /// Like `run`, but sets the spawned process's working directory. Used by
-    /// `zellij_cli::new_session` because zellij has no `-c <cwd>` CLI flag
-    /// (tmux does). Default impl delegates to `run` and ignores cwd — fine
-    /// for mock runners that don't actually spawn processes; the production
+    /// Like `run`, but sets the spawned process's working directory.
+    /// Default impl delegates to `run` and ignores cwd — fine for mock
+    /// runners that don't actually spawn processes; the production
     /// `RealCommandRunner` overrides to call `Command::current_dir`.
-    #[allow(dead_code)] // Production caller (`new_session`) lands in slice 3.
+    #[allow(dead_code)]
     fn run_in_dir(
         &self,
         program: &str,

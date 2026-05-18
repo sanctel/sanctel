@@ -1,12 +1,6 @@
-// Status of the one-time backend startup probe Rust runs at app launch.
+// Status of the one-time tmux startup probe Rust runs at app launch.
 // Mirrors src-tauri/src/lib.rs `TmuxStatus`. React consumes this to gate
-// terminal/chat tab creation behind a setup screen when the active
-// backend isn't usable.
-//
-// `backend` names which one was probed ("tmux" or "zellij") so the setup
-// screen can render backend-appropriate copy and install instructions.
-// The field name is historical (the struct was added when only tmux
-// existed); both tmux probe and zellij probe write to it now.
+// terminal/chat tab creation behind a setup screen when tmux isn't usable.
 //
 // Lifecycle:
 //   - On mount, App reads the current status synchronously via the
@@ -19,7 +13,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-export type BackendName = "tmux" | "zellij";
+export type BackendName = "tmux";
 
 export interface TmuxStatus {
   backend: BackendName;
@@ -76,9 +70,7 @@ export const useTmuxStatus = create<TmuxStatusState>((set, get) => ({
 function normalize(s: TmuxStatus | undefined | null): TmuxStatus {
   if (!s) return INITIAL;
   return {
-    // Defensive fallback: an unrecognised or missing backend value
-    // renders the existing tmux copy rather than a blank setup screen.
-    backend: s.backend === "zellij" ? "zellij" : "tmux",
+    backend: "tmux",
     available: !!s.available,
     version: s.version ?? null,
     error: s.error ?? null,
