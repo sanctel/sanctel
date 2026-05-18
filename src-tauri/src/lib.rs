@@ -792,7 +792,7 @@ pub fn run() {
                     );
                     probe_zellij_into(&state.tmux_status, &ZellijCli::default());
                     if state.tmux_status.lock().available {
-                        match ZellijDaemon::start(RealLauncher, RealAuthenticator::default()) {
+                        match ZellijDaemon::start(RealLauncher, RealAuthenticator) {
                             Ok(daemon) => {
                                 *state.zellij_daemon.lock() = Some(daemon);
                             }

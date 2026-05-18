@@ -45,13 +45,6 @@ pub const BACKOFF_CAP: Duration = Duration::from_millis(2000);
 /// large enough to keep idle CPU negligible.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Fixed sanctel auth token name. Deterministic per machine so re-runs
-/// replace rather than accumulate entries in `zellij web --list-tokens`.
-/// One sanctel instance per user is assumed; two concurrent instances
-/// would still share the same token (auth tokens are per-machine, not
-/// per-process — the session_token is what's per-process).
-pub const DEFAULT_TOKEN_NAME: &str = "sanctel";
-
 /// Errors the daemon's start path can surface. `Io` wraps the existing
 /// spawn failures; the new variants surface auth-flow failures so the
 /// setup-screen message can name the specific failure mode rather than
@@ -127,11 +120,14 @@ pub trait ChildProc: Send {
 /// drive the supervisor — production uses `RealAuthenticator` which
 /// shells out to `zellij web --create-token` + POSTs the login exchange.
 pub trait Authenticator: Send + 'static {
-    /// Mint + login against the daemon listening on `port`. Returns a
-    /// freshly-issued (token_name, session_token) pair.
+    /// Mint + login against the daemon listening on `port`. Returns the
+    /// freshly-issued (auth_token_name, session_token) pair. zellij
+    /// auto-generates the name; the supervisor records it for revocation
+    /// at shutdown.
     fn authenticate(&self, port: u16) -> Result<TokenPair, ZellijAuthError>;
-    /// Best-effort revoke at shutdown. Failures are swallowed by the caller
-    /// (Drop path doesn't have a place to surface errors).
+    /// Best-effort revoke at shutdown for a single previously-minted
+    /// token name. Failures are swallowed by the caller (Drop path
+    /// doesn't have a place to surface errors).
     fn revoke(&self, token_name: &str);
 }
 
@@ -149,21 +145,13 @@ impl Launcher for RealLauncher {
 
 /// Production authenticator: shells out to `zellij web --create-token` and
 /// POSTs the login exchange. See `zellij_auth` for the wire-shape details.
-pub struct RealAuthenticator {
-    pub token_name: String,
-}
-
-impl Default for RealAuthenticator {
-    fn default() -> Self {
-        RealAuthenticator {
-            token_name: DEFAULT_TOKEN_NAME.into(),
-        }
-    }
-}
+/// Carries no per-instance state — zellij is responsible for naming the
+/// minted tokens.
+pub struct RealAuthenticator;
 
 impl Authenticator for RealAuthenticator {
     fn authenticate(&self, port: u16) -> Result<TokenPair, ZellijAuthError> {
-        zellij_auth::authenticate(port, &self.token_name)
+        zellij_auth::authenticate(port)
     }
     fn revoke(&self, token_name: &str) {
         zellij_auth::revoke_token(token_name);
@@ -224,7 +212,6 @@ impl ZellijDaemon {
         let initial = launcher.launch(port)?;
         let pair = authenticator.authenticate(port)?;
         let session_token = Arc::new(Mutex::new(pair.session_token));
-        let token_name = pair.token_name;
         let session_token_for_supervisor = Arc::clone(&session_token);
         let (tx, rx) = mpsc::channel();
         let supervisor = thread::spawn(move || {
@@ -234,7 +221,7 @@ impl ZellijDaemon {
                 port,
                 initial,
                 session_token_for_supervisor,
-                token_name,
+                pair.auth_token_name,
                 rx,
             );
         });
@@ -288,17 +275,24 @@ impl Drop for ZellijDaemon {
 /// The supervisor's body. Owns the launcher (so respawns are possible),
 /// the port (stable across respawns), the currently-live child, and the
 /// shutdown channel. Returns only when shutdown is signaled.
+///
+/// Tracks every auth token name minted across the daemon's lifetime in
+/// `minted_token_names` so the shutdown path can revoke them all — each
+/// respawn mints a new `token_<N>` (zellij auto-increments N), and
+/// without revoking the lot the user's `zellij web --list-tokens` would
+/// show one entry per respawn for the just-closed sanctel session.
 fn supervisor_loop<L: Launcher, A: Authenticator>(
     launcher: L,
     authenticator: A,
     port: u16,
     initial_child: Box<dyn ChildProc>,
     session_token: Arc<Mutex<String>>,
-    token_name: String,
+    initial_token_name: String,
     shutdown_rx: Receiver<()>,
 ) {
     let mut child = initial_child;
     let mut attempt: u32 = 0;
+    let mut minted_token_names: Vec<String> = vec![initial_token_name];
 
     loop {
         // Watch the current child. Returns either because the child
@@ -310,9 +304,7 @@ fn supervisor_loop<L: Launcher, A: Authenticator>(
             }
             WatchOutcome::Shutdown => {
                 let _ = child.kill();
-                // Best-effort revoke before returning. Failure is silent
-                // because Drop has no place to surface it.
-                authenticator.revoke(&token_name);
+                revoke_all(&authenticator, &minted_token_names);
                 return;
             }
         }
@@ -322,7 +314,7 @@ fn supervisor_loop<L: Launcher, A: Authenticator>(
         // immediately rather than running an unwanted respawn.
         let delay = next_backoff(attempt);
         if shutdown_rx.recv_timeout(delay).is_ok() {
-            authenticator.revoke(&token_name);
+            revoke_all(&authenticator, &minted_token_names);
             return;
         }
         attempt = attempt.saturating_add(1);
@@ -343,6 +335,7 @@ fn supervisor_loop<L: Launcher, A: Authenticator>(
                 match authenticator.authenticate(port) {
                     Ok(pair) => {
                         *session_token.lock().unwrap() = pair.session_token;
+                        minted_token_names.push(pair.auth_token_name);
                     }
                     Err(_) => {
                         // Treat as a degenerate exit: kill the child and
@@ -359,6 +352,16 @@ fn supervisor_loop<L: Launcher, A: Authenticator>(
                 child = Box::new(ZombieChild);
             }
         }
+    }
+}
+
+/// Best-effort revoke for every token name minted by this supervisor.
+/// Failures are swallowed — the user only notices a residue if they
+/// inspect `zellij web --list-tokens`, and any blocked subprocess on
+/// this path would block sanctel's exit.
+fn revoke_all<A: Authenticator>(authenticator: &A, names: &[String]) {
+    for name in names {
+        authenticator.revoke(name);
     }
 }
 
@@ -516,12 +519,49 @@ mod tests {
         fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
             let n = self.auth_calls.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(TokenPair {
-                token_name: "test-token".into(),
+                auth_token_name: format!("token_{n}"),
                 session_token: format!("session-{n}"),
             })
         }
         fn revoke(&self, _token_name: &str) {
             self.revoke_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Authenticator that records the exact token names it was asked to
+    /// revoke. Tests use this to assert the shutdown path revokes every
+    /// token minted across the daemon's lifetime — not just the last one,
+    /// and not the wrong one.
+    struct RecordingAuth {
+        auth_calls: Arc<AtomicUsize>,
+        revoked_names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingAuth {
+        fn new() -> (Self, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+            let auth_calls = Arc::new(AtomicUsize::new(0));
+            let revoked_names = Arc::new(Mutex::new(Vec::new()));
+            (
+                RecordingAuth {
+                    auth_calls: Arc::clone(&auth_calls),
+                    revoked_names: Arc::clone(&revoked_names),
+                },
+                auth_calls,
+                revoked_names,
+            )
+        }
+    }
+
+    impl Authenticator for RecordingAuth {
+        fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
+            let n = self.auth_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(TokenPair {
+                auth_token_name: format!("token_{n}"),
+                session_token: format!("session-{n}"),
+            })
+        }
+        fn revoke(&self, token_name: &str) {
+            self.revoked_names.lock().unwrap().push(token_name.into());
         }
     }
 
@@ -531,7 +571,7 @@ mod tests {
     impl Authenticator for NoopAuth {
         fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
             Ok(TokenPair {
-                token_name: "test-token".into(),
+                auth_token_name: "token_noop".into(),
                 session_token: "session-noop".into(),
             })
         }
@@ -670,6 +710,47 @@ mod tests {
         kill_latest(&handles);
         thread::sleep(Duration::from_millis(300));
         assert_eq!(launches.load(Ordering::SeqCst), after_shutdown);
+    }
+
+    /// Each daemon respawn mints a fresh `token_<N>` (zellij auto-
+    /// increments N across the daemon's lifetime). Without revoking the
+    /// lot at shutdown, the user's `zellij web --list-tokens` would show
+    /// one entry per respawn for the just-closed sanctel session. The
+    /// supervisor must remember every minted name and revoke each by
+    /// the exact name it was minted under.
+    #[test]
+    fn shutdown_revokes_every_token_minted_across_respawns() {
+        let launcher = MockLauncher::new();
+        let handles = Arc::clone(&launcher.live_handles);
+        let (auth, auth_calls, revoked_names) = RecordingAuth::new();
+        let mut daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+
+        // Two external kills → two respawns → two more authenticate calls.
+        // After each kill we wait for the auth count to advance so the
+        // supervisor has actually pushed the new name onto its list
+        // before we move on.
+        for expected_auth_count in [2usize, 3] {
+            kill_latest(&handles);
+            let start = Instant::now();
+            while auth_calls.load(Ordering::SeqCst) < expected_auth_count {
+                if start.elapsed() > Duration::from_millis(1500) {
+                    panic!(
+                        "respawn/reauth did not reach {expected_auth_count}: auth_calls={}",
+                        auth_calls.load(Ordering::SeqCst),
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        daemon.shutdown();
+        let revoked = revoked_names.lock().unwrap().clone();
+        assert_eq!(
+            revoked,
+            vec!["token_1".to_string(), "token_2".to_string(), "token_3".to_string()],
+            "shutdown must revoke every minted token, in mint order",
+        );
     }
 
     /// Repeated-kill stress: five back-to-back external kills, each timed
