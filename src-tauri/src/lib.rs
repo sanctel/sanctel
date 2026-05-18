@@ -22,6 +22,7 @@ mod terminal_runtime;
 mod tmux_cli;
 mod zellij_cli;
 mod zellij_daemon;
+mod zellij_ws;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,7 +35,9 @@ use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, We
 
 use crate::backend::Backend;
 use crate::profile_isolation::apply_profile_isolation;
-use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
+use crate::terminal_runtime::{
+    attach_tab_to_tmux, attach_tab_to_zellij, AttachParams, TerminalRegistry,
+};
 use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
 use crate::zellij_cli::{ZellijCli, ZellijError};
 use crate::zellij_daemon::{RealLauncher, ZellijDaemon};
@@ -400,17 +403,23 @@ fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // proper destroy API.
     let _ = hide_webview(&app, &id);
 
-    // For terminal/chat tabs, kill the per-tab tmux session so the shell
-    // dies. Each tab owns its own session (`sanctel_wt_<wt>__term-N`) per
-    // ADR-0012 revised by issue #15, so a single `kill-session` is the
-    // complete cleanup — no two-level `kill-window` + base-survival dance.
+    // For terminal/chat tabs, kill the per-tab session on whichever backend
+    // owns it so the shell dies. Each tab owns its own session
+    // (`sanctel_wt_<wt>__term-N`) per ADR-0012 revised by issue #15, so a
+    // single `kill_session` is the complete cleanup.
     let state = app.state::<AppState>();
     let record = state.tabs.lock().get(&id).cloned();
     if let Some(rec) = record {
         if rec.kind == "terminal" || rec.kind == "chat" {
             if let Some(handle) = state.terminals.remove(&id) {
-                let tmux = TmuxCli::default();
-                let _ = tmux.kill_session(&handle.session);
+                match Backend::from_env() {
+                    Backend::Tmux => {
+                        let _ = TmuxCli::default().kill_session(&handle.session);
+                    }
+                    Backend::Zellij => {
+                        let _ = ZellijCli::default().kill_session(&handle.session);
+                    }
+                }
             }
         }
     }
@@ -566,11 +575,26 @@ fn terminal_attach<R: Runtime>(
     }
 
     let params = resolve_attach_params(&record, cols, rows)?;
-    let tmux = TmuxCli::default();
     // AttachError::Display emits `worktree-missing: <path>` for the broken-tab
     // case, which the frontend pattern-matches in terminal-runtime.ts. Don't
     // wrap or rephrase — the prefix is the wire contract.
-    let handle = attach_tab_to_tmux(&tmux, params, on_output).map_err(|e| e.to_string())?;
+    let handle = match Backend::from_env() {
+        Backend::Tmux => attach_tab_to_tmux(&TmuxCli::default(), params, on_output)
+            .map_err(|e| e.to_string())?,
+        Backend::Zellij => {
+            let port = app
+                .state::<AppState>()
+                .zellij_daemon
+                .lock()
+                .as_ref()
+                .map(|d| d.port())
+                .ok_or_else(|| {
+                    "zellij daemon not running — startup probe failed".to_string()
+                })?;
+            attach_tab_to_zellij(&ZellijCli::default(), port, params, on_output)
+                .map_err(|e| e.to_string())?
+        }
+    };
     app.state::<AppState>().terminals.insert(label, Arc::new(handle));
     Ok(())
 }
@@ -588,7 +612,7 @@ fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(),
         .terminals
         .get(webview.label())
         .ok_or_else(|| "terminal not attached".to_string())?;
-    handle.with_writer(|w| w.write_all(&bytes).map_err(|e| e.to_string()))
+    handle.write_bytes(&bytes)
 }
 
 #[tauri::command]
@@ -603,15 +627,7 @@ fn terminal_resize<R: Runtime>(
         .terminals
         .get(webview.label())
         .ok_or_else(|| "terminal not attached".to_string())?;
-    handle.with_master(|m| {
-        m.resize(portable_pty::PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())
-    })
+    handle.resize(cols, rows)
 }
 
 

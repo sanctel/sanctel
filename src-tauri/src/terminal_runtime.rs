@@ -24,6 +24,8 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use tauri::ipc::Channel;
 
 use crate::tmux_cli::{TmuxCli, TmuxError};
+use crate::zellij_cli::{ZellijCli, ZellijError};
+use crate::zellij_ws::{self, ZellijWsError, ZellijWsHandle};
 
 // ─── attach errors ────────────────────────────────────────────────────────
 
@@ -56,54 +58,84 @@ impl From<TmuxError> for AttachError {
     }
 }
 
+impl From<ZellijError> for AttachError {
+    fn from(e: ZellijError) -> Self {
+        AttachError::Other(e.to_string())
+    }
+}
+
+impl From<ZellijWsError> for AttachError {
+    fn from(e: ZellijWsError) -> Self {
+        AttachError::Other(e.to_string())
+    }
+}
+
 // ─── per-tab handle and store ─────────────────────────────────────────────
 
-/// Everything we need to drive one attached terminal tab.
-///
-/// The `writer` and `master` mutexes are private on purpose. Callers reach
-/// them through [`TerminalHandle::with_writer`] and
-/// [`TerminalHandle::with_master`], which hold the lock for the closure's
-/// lifetime and release it before the function returns. See those methods
-/// for why the closure pattern is mandatory.
+/// Everything we need to drive one attached terminal tab. Backend-agnostic
+/// surface (`write_bytes`, `resize`) on top of an internal enum that holds
+/// the backend-specific state — a PTY master for tmux, a WebSocket pair
+/// for zellij. Callers (`terminal_write`, `terminal_resize` in lib.rs) are
+/// indifferent to which backend produced the handle; `close_tab` dispatches
+/// the kill_session call by reading the current backend.
 pub struct TerminalHandle {
-    /// The PTY master end — writer side for keystrokes / resizes.
-    writer: Mutex<Box<dyn Write + Send>>,
-    /// Master so we can call `resize()` on it.
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    /// Per-tab tmux session name (`sanctel_wt_<wt>__term-N` per ADR-0012
-    /// revised by issue #15). `close_tab` passes it to
-    /// `TmuxCli::kill_session` to tear down the tab's tmux server-side
-    /// state in one shot. The window name is encoded in the session name
-    /// suffix so it is not stored separately.
+    inner: TerminalHandleInner,
+    /// Per-tab session name (`sanctel_wt_<wt>__term-N` per ADR-0012
+    /// revised by issue #15) — same convention on both backends. The
+    /// frontend never sees this; `close_tab` passes it to the appropriate
+    /// backend's `kill_session` to tear down the server-side state.
     pub session: String,
 }
 
+enum TerminalHandleInner {
+    /// tmux path: PTY pair attached to `tmux attach-session`. The writer
+    /// mutex is locked inside `write_bytes`; the master mutex is locked
+    /// inside `resize`. Locks held only for the duration of the I/O call
+    /// — no caller-side `MutexGuard` is ever constructed (which would
+    /// trip Rust 1.95+'s drop-order check E0597 against an `Arc<Self>`).
+    Tmux {
+        writer: Mutex<Box<dyn Write + Send>>,
+        master: Mutex<Box<dyn MasterPty + Send>>,
+    },
+    /// zellij path: a pair of WebSocket connections to the supervised
+    /// `zellij web` daemon. The handle owns the send-side mpsc channels;
+    /// drop closes them and the I/O threads exit cleanly.
+    Zellij { ws: ZellijWsHandle },
+}
+
 impl TerminalHandle {
-    /// Run `f` with the PTY writer locked. Lock is released the moment
-    /// the closure returns.
-    ///
-    /// Why a closure-scoped accessor rather than exposing the raw
-    /// `Mutex<Box<dyn Write + Send>>`: the obvious caller-side pattern
-    ///
-    /// ```ignore
-    /// let h = registry.get(label).unwrap();           // Arc<TerminalHandle>
-    /// h.writer.lock().write_all(&bytes)?;             // temporary MutexGuard
-    /// ```
-    ///
-    /// creates an unnamed `MutexGuard` that borrows from `h.writer`, which
-    /// borrows from the local `h`. In Rust 1.95+, locals drop in reverse
-    /// declaration order — `h` drops first, then the guard's `Drop` runs
-    /// and reaches into an already-dropped `Mutex`. The compiler rejects
-    /// this with E0597. Holding the lock inside this method means no
-    /// caller can construct a guard that outlives its `Arc`.
-    pub fn with_writer<R>(&self, f: impl FnOnce(&mut dyn Write) -> R) -> R {
-        f(&mut **self.writer.lock())
+    /// Write raw bytes to the terminal. On the tmux path: PTY master write.
+    /// On the zellij path: binary frame on `/ws/terminal/<session>`.
+    pub fn write_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        match &self.inner {
+            TerminalHandleInner::Tmux { writer, .. } => writer
+                .lock()
+                .write_all(bytes)
+                .map_err(|e| e.to_string()),
+            TerminalHandleInner::Zellij { ws } => {
+                ws.write_bytes(bytes.to_vec()).map_err(|e| e.to_string())
+            }
+        }
     }
 
-    /// Run `f` with the PTY master locked. Same drop-order reasoning as
-    /// [`TerminalHandle::with_writer`].
-    pub fn with_master<R>(&self, f: impl FnOnce(&dyn MasterPty) -> R) -> R {
-        f(&**self.master.lock())
+    /// Resize the terminal pane. On the tmux path: `master.resize(...)`.
+    /// On the zellij path: a `TerminalResize` control message on
+    /// `/ws/control`.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        match &self.inner {
+            TerminalHandleInner::Tmux { master, .. } => master
+                .lock()
+                .resize(PtySize {
+                    rows: rows.max(1),
+                    cols: cols.max(1),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| e.to_string()),
+            TerminalHandleInner::Zellij { ws } => {
+                ws.resize(cols, rows).map_err(|e| e.to_string())
+            }
+        }
     }
 }
 
@@ -238,8 +270,54 @@ pub fn attach_tab_to_tmux(
     spawn_pty_reader(reader, on_output);
 
     Ok(TerminalHandle {
-        writer: Mutex::new(writer),
-        master: Mutex::new(pair.master),
+        inner: TerminalHandleInner::Tmux {
+            writer: Mutex::new(writer),
+            master: Mutex::new(pair.master),
+        },
+        session: params.session,
+    })
+}
+
+/// Spike slice 3 (issue #19) — zellij analog of [`attach_tab_to_tmux`].
+/// Ensures the named session exists via `zellij attach --create-background`,
+/// opens the two WebSocket connections (terminal + control) to the
+/// supervised `zellij web` daemon, sends an initial resize, and returns a
+/// handle whose `write_bytes` / `resize` route through the WS pair. Caller
+/// signature matches the tmux side so the dispatcher in lib.rs is one
+/// match arm.
+pub fn attach_tab_to_zellij(
+    zellij: &ZellijCli,
+    daemon_port: u16,
+    params: AttachParams,
+    on_output: Channel<Vec<u8>>,
+) -> Result<TerminalHandle, AttachError> {
+    // Same worktree-existence preflight as the tmux path — the broken-tab
+    // UI is the same wire contract regardless of which backend would have
+    // failed downstream.
+    check_worktree_exists(&params.worktree_path)?;
+
+    // `attach --create-background` is idempotent on existing sessions (see
+    // zellij_cli module docs) — calling it on the reattach path is cheap
+    // and avoids a list-sessions probe before every attach. The defensive
+    // `SessionAlreadyExists` recovery covers the rare zellij resurrectable-
+    // session edge case.
+    match zellij.new_session(
+        &params.session,
+        &params.worktree_path,
+        params.initial_command.as_deref(),
+    ) {
+        Ok(()) | Err(ZellijError::SessionAlreadyExists(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let ws = zellij_ws::mount(&params.session, daemon_port, on_output)?;
+    // Tell zellij what size to render at. The frontend would otherwise
+    // see zellij's default pane dimensions until the first user-driven
+    // resize, which is jarring.
+    let _ = ws.resize(params.cols, params.rows);
+
+    Ok(TerminalHandle {
+        inner: TerminalHandleInner::Zellij { ws },
         session: params.session,
     })
 }
@@ -313,71 +391,12 @@ mod tests {
         check_worktree_exists(&home).expect("HOME exists");
     }
 
-    /// Build a `TerminalHandle` backed by a real (but otherwise unused) PTY.
-    /// We don't spawn a child, so the slave side stays open and the master
-    /// can be locked / written to / resized in isolation.
-    fn handle_with_real_pty() -> TerminalHandle {
-        let pair = NativePtySystem::default()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-        let writer = pair.master.take_writer().expect("take_writer");
-        TerminalHandle {
-            writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
-            session: "test-session".into(),
-        }
-    }
-
-    /// `with_writer` must hold the writer mutex for the duration of the
-    /// closure (so concurrent callers serialize on PTY writes) and release
-    /// it the instant the closure returns.
+    /// `TerminalHandle::write_bytes` on a tmux-variant handle reaches the
+    /// PTY's read side. The handle's write path is the same code
+    /// `terminal_write` calls in production; this proves the dispatch +
+    /// lock-scope wiring is byte-clean for the tmux backend.
     #[test]
-    fn with_writer_holds_lock_for_closure_only() {
-        let handle = handle_with_real_pty();
-
-        let entered = handle.with_writer(|_w| {
-            assert!(
-                handle.writer.try_lock().is_none(),
-                "writer lock must be held inside the closure"
-            );
-            "ok"
-        });
-        assert_eq!(entered, "ok", "closure return value must propagate");
-
-        assert!(
-            handle.writer.try_lock().is_some(),
-            "writer lock must be released after the closure returns"
-        );
-    }
-
-    /// Same guarantee for the master side: lock held during the closure,
-    /// released afterwards.
-    #[test]
-    fn with_master_holds_lock_for_closure_only() {
-        let handle = handle_with_real_pty();
-
-        handle.with_master(|_m| {
-            assert!(
-                handle.master.try_lock().is_none(),
-                "master lock must be held inside the closure"
-            );
-        });
-
-        assert!(
-            handle.master.try_lock().is_some(),
-            "master lock must be released after the closure returns"
-        );
-    }
-
-    /// Smoke test that the closure receives a usable writer — bytes
-    /// written inside the closure reach the PTY's read side.
-    #[test]
-    fn with_writer_actually_writes_to_pty() {
+    fn write_bytes_reaches_pty_for_tmux_variant() {
         let pair = NativePtySystem::default()
             .openpty(PtySize {
                 rows: 24,
@@ -389,14 +408,14 @@ mod tests {
         let mut reader = pair.master.try_clone_reader().expect("clone_reader");
         let writer = pair.master.take_writer().expect("take_writer");
         let handle = TerminalHandle {
-            writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
+            inner: TerminalHandleInner::Tmux {
+                writer: Mutex::new(writer),
+                master: Mutex::new(pair.master),
+            },
             session: "test-session".into(),
         };
 
-        handle
-            .with_writer(|w| w.write_all(b"hello"))
-            .expect("write_all");
+        handle.write_bytes(b"hello").expect("write_bytes");
 
         let mut buf = [0u8; 5];
         reader.read_exact(&mut buf).expect("read_exact");
