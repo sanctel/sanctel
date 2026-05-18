@@ -16,6 +16,10 @@ import type {
   PersistedTab,
   Persistence,
 } from "../persistence/persistence";
+import {
+  startAgentSessionCapture as startTauriAgentSessionCapture,
+  type AgentSessionCaptureStarter,
+} from "../../terminal/agent-session-capture-tauri";
 
 // Response shape from Rust's `create_tab`. For terminal/chat tabs created
 // with `windowName: "auto"`, Rust returns the resolved name here so the
@@ -173,10 +177,19 @@ function tabToRow(t: Tab, sortOrder: number): PersistedTab {
 
 export type TabStoreHook = UseBoundStore<StoreApi<TabState>>;
 
-export function createTabStore(): TabStoreHook {
+interface CreateTabStoreOptions {
+  startAgentSessionCapture?: AgentSessionCaptureStarter;
+}
+
+export function createTabStore(
+  options: CreateTabStoreOptions = {},
+): TabStoreHook {
   // Persistence ref held outside the Zustand state so it doesn't trigger
   // re-renders and so mutations can dispatch through it synchronously.
   let persistence: Persistence | null = null;
+  const startAgentSessionCapture =
+    options.startAgentSessionCapture ?? startTauriAgentSessionCapture;
+  const agentSessionCaptures = new Map<string, { stop(): void }>();
 
   return create<TabState>((set, get) => ({
     profiles: [DEFAULT_PROFILE],
@@ -406,6 +419,7 @@ export function createTabStore(): TabStoreHook {
       const initialCommand = "claude";
 
       const id = crypto.randomUUID();
+      const captureStartedAt = Date.now();
       const resp = await invoke<CreateTabResp>("create_tab", {
         req: {
           id,
@@ -454,10 +468,23 @@ export function createTabStore(): TabStoreHook {
         ),
       }));
 
+      startCaptureForTab({
+        captures: agentSessionCaptures,
+        startAgentSessionCapture,
+        get,
+        set,
+        persistence: () => persistence,
+        tabId: id,
+        worktreePath: worktree.path,
+        startedAt: captureStartedAt,
+      });
+
       return tab;
     },
 
     closeTab: async (id) => {
+      agentSessionCaptures.get(id)?.stop();
+      agentSessionCaptures.delete(id);
       await invoke("close_tab", { id }).catch(console.error);
       // Persist row removal after the IPC succeeds so a failure mid-close
       // leaves a row whose next-launch create_tab is benign (re-attaches to
@@ -551,13 +578,74 @@ export function createTabStore(): TabStoreHook {
       for (const t of tabs) {
         const space = spacesWithActive.find((sp) => sp.id === t.spaceId);
         if (!space) continue;
+        const captureStartedAt = Date.now();
         try {
           await invoke("create_tab", { req: buildCreateTabReq(t, space) });
+          if (t.kind === "chat" && !t.agentSessionId && t.worktreeId) {
+            const wt = findWorktree(t.worktreeId);
+            if (wt) {
+              startCaptureForTab({
+                captures: agentSessionCaptures,
+                startAgentSessionCapture,
+                get,
+                set,
+                persistence: () => persistence,
+                tabId: t.id,
+                worktreePath: wt.path,
+                startedAt: captureStartedAt,
+              });
+            }
+          }
         } catch (e) {
           console.error("hydrate: create_tab failed for", t.id, e);
         }
       }
     },
+  }));
+}
+
+interface StartCaptureForTabArgs {
+  captures: Map<string, { stop(): void }>;
+  startAgentSessionCapture: AgentSessionCaptureStarter;
+  get: () => TabState;
+  set: StoreApi<TabState>["setState"];
+  persistence: () => Persistence | null;
+  tabId: string;
+  worktreePath: string;
+  startedAt: number;
+}
+
+function startCaptureForTab(args: StartCaptureForTabArgs): void {
+  args.captures.get(args.tabId)?.stop();
+  const capture = args.startAgentSessionCapture({
+    tabId: args.tabId,
+    worktreePath: args.worktreePath,
+    startedAt: args.startedAt,
+    onSession: async (agentSessionId) => {
+      await recordCapturedAgentSession(args, agentSessionId);
+      args.captures.delete(args.tabId);
+    },
+  });
+  args.captures.set(args.tabId, capture);
+}
+
+async function recordCapturedAgentSession(
+  args: Pick<StartCaptureForTabArgs, "get" | "set" | "persistence" | "tabId">,
+  agentSessionId: string,
+): Promise<void> {
+  const tab = args.get().tabs.find((t) => t.id === args.tabId);
+  if (!tab || tab.kind !== "chat" || tab.agentSessionId) return;
+
+  const initialCommand = `claude --resume ${agentSessionId}`;
+  await args.persistence()?.updateTabAgentSession(
+    args.tabId,
+    agentSessionId,
+    initialCommand,
+  );
+  args.set((s) => ({
+    tabs: s.tabs.map((t) =>
+      t.id === args.tabId ? { ...t, agentSessionId, initialCommand } : t,
+    ),
   }));
 }
 

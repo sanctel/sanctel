@@ -321,6 +321,47 @@ describe("tabStore mutations persist", () => {
     });
   });
 
+  it("persists a chat tab's captured AgentSession for the next launch", async () => {
+    const persistence = new InMemoryPersistence();
+    const captures: {
+      tabId: string;
+      onSession: (sessionId: string) => Promise<void> | void;
+    }[] = [];
+    const useStore = createTabStore({
+      startAgentSessionCapture: (opts) => {
+        captures.push({ tabId: opts.tabId, onSession: opts.onSession });
+        return { stop: vi.fn() };
+      },
+    });
+    await useStore.getState().hydrate(persistence);
+
+    const tab = await useStore.getState().newChatTab("sanctel-main");
+    expect(captures.map((c) => c.tabId)).toEqual([tab.id]);
+
+    await captures[0].onSession("captured-session-id");
+
+    const snap = await persistence.loadAll();
+    expect(snap.tabs[0]).toMatchObject({
+      id: tab.id,
+      kind: "chat",
+      initialCommand: "claude --resume captured-session-id",
+      agentSessionId: "captured-session-id",
+    });
+
+    invokeMock.mockClear();
+    const useStoreB = createTabStore();
+    await useStoreB.getState().hydrate(persistence);
+    const createTabCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "create_tab",
+    );
+    expect(createTabCall?.[1].req).toMatchObject({
+      id: tab.id,
+      kind: "chat",
+      initialCommand: "claude --resume captured-session-id",
+      agentSessionId: "captured-session-id",
+    });
+  });
+
   it("newChatTab throws tmux-missing when the probe says tmux is unavailable", async () => {
     useTmuxStatus.setState({
       status: { backend: "tmux", available: false, version: null, error: "missing" },

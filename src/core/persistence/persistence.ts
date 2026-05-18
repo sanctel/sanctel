@@ -65,6 +65,11 @@ export interface Persistence {
   saveTab(tab: PersistedTab): Promise<void>;
 
   renameTab(id: string, title: string): Promise<void>;
+  updateTabAgentSession(
+    id: string,
+    agentSessionId: string,
+    initialCommand: string,
+  ): Promise<void>;
   removeTab(id: string): Promise<void>;
 
   // Persist a new ordering for the tabs in `spaceId`. Tabs not in

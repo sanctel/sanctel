@@ -83,7 +83,8 @@ target specs as session/window/pane delimiters; the suffix separator is
   `tmux kill-session` is the one-shot close path.
 - An **AgentSession** belongs to one Worktree (key = cwd path), not to a Tab.
   A new chat Tab starts plain `claude`; it must not infer a resume target by
-  grabbing the newest transcript in the Worktree.
+  grabbing the newest transcript in the Worktree. After that Tab's own
+  transcript appears, the Tab persists the verified AgentSession id.
 
 ## The Persistence Anchor invariant
 

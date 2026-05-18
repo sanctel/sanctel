@@ -266,11 +266,11 @@ duplicates the other.
   reboot, tmux is gone and the tab reopens as an empty shell in the same
   Worktree — same cwd, fresh process. This is acceptable; it matches the
   user expectation that compute state dies on power-off.
-- **Chat tab**: a TabKind whose Tab record carries `worktreeId` and may
-  later carry an `agentSessionId` once Sanctel can identify that tab's own
-  transcript. New chat tabs start plain `claude`; they do not infer a
-  resume target from the newest transcript in the Worktree because that
-  file can belong to another Claude process.
+- **Chat tab**: a TabKind whose Tab record carries `worktreeId` and later
+  carries `agentSessionId` once Sanctel sees that tab's own transcript.
+  New chat tabs start plain `claude`; they do not infer a resume target
+  from the newest transcript in the Worktree because that file can belong
+  to another Claude process.
 
 ### What the SQLite Tab record holds for each kind
 
@@ -599,14 +599,14 @@ return; shells are fresh (expected) but tab metadata survives.
   `terminal_attach` (the algorithm already supports this).
 - `chat.html` gets its small header (title, agent label, stop button).
 - React computes `initialCommand = "claude"` for a new chat tab and
-  stores `agentSessionId = null` until Sanctel can identify that tab's own
-  transcript. It does not scan `~/.claude/projects/<encoded-cwd>/` at
-  create time.
+  stores `agentSessionId = null` at create time. It then polls
+  `~/.claude/projects/<encoded-cwd>/` for a post-create jsonl and updates
+  the Tab record to `claude --resume <agentSessionId>` after capture.
 
 **Demo:** chat with `claude` in a worktree, quit sanctel, reopen —
 conversation continues because the tmux session survived. `tmux
-kill-server`, reopen — Sanctel starts a fresh `claude` unless the Tab
-already carries a verified `agentSessionId`.
+kill-server`, reopen — Sanctel resumes with `claude --resume` once the
+Tab carries a verified `agentSessionId`.
 
 ### Step 6 — Edge cases & hardening (~½ day)
 
