@@ -275,12 +275,12 @@ describe("tabStore mutations persist", () => {
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
-    await (
-      useStore.getState().newChatTab as unknown as (
-        worktreeId: string,
-        createTimeAgentSessionId: string,
-      ) => Promise<unknown>
-    )("sanctel-main", "fresh-unrelated");
+    // Models a stale caller compiled against the old two-argument signature.
+    const staleCreateTimeCaller: (
+      worktreeId: string,
+      createTimeAgentSessionId: string,
+    ) => Promise<unknown> = useStore.getState().newChatTab;
+    await staleCreateTimeCaller("sanctel-main", "fresh-unrelated");
 
     const snap = await persistence.loadAll();
     expect(snap.tabs).toHaveLength(1);

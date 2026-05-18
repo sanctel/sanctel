@@ -22,10 +22,10 @@ relationship is many-to-many across Spaces and across Profiles.
 - `Worktree.profileId` is **forbidden**. Review rejects denormalized profile
   links on Worktree.
 - Many Tabs can share one Worktree (separate shells, same cwd, shared
-  Claude transcript). One Worktree can be referenced from Tabs in many
+  transcript directory). One Worktree can be referenced from Tabs in many
   Spaces.
-- AgentSession transcripts are keyed by cwd (Worktree.path), not by Tab or
-  Profile — so two Tabs in the same Worktree see the same `claude --resume`
-  history regardless of which Spaces they live in.
+- AgentSession transcript files are keyed by cwd (Worktree.path), not by Tab
+  or Profile. A chat Tab must still carry its own verified AgentSession id
+  before `claude --resume` is a valid startup command.
 - Worktree storage strategy (sibling / AppDir / InsideRepo / ClaudeDefault)
   is a separate tactical decision and not part of this ADR.

@@ -124,8 +124,8 @@ struct TabRecord {
     worktree_path: Option<String>,
     window_name: Option<String>,
     initial_command: Option<String>,
-    /// Forward-compat slot for chat tabs (Slice 6): the AgentSession id used
-    /// by `claude --resume`. Stored on the record but not yet consumed.
+    /// Forward-compat slot for chat tabs: a verified AgentSession id that can
+    /// be used by `claude --resume`. Stored on the record but not yet consumed.
     #[allow(dead_code)]
     agent_session_id: Option<String>,
 }
@@ -199,9 +199,8 @@ struct CreateTabReq {
     worktree_path: Option<String>,
     window_name: Option<String>,
     initial_command: Option<String>,
-    /// Forward-compat slot for chat tabs (Slice 6). Stored on the TabRecord
-    /// but not consumed in this slice — Slice 6's chat-tab flow turns it
-    /// into `initial_command = "claude --resume <agentSessionId>"`.
+    /// Forward-compat slot for chat tabs. Stored on the TabRecord, but only a
+    /// verified AgentSession id may later become a `claude --resume` target.
     agent_session_id: Option<String>,
 }
 

@@ -119,8 +119,8 @@ state of its own. See [ADR-0004](../../docs/adr/0004-persistence-anchor-pattern.
 > **Domain expert:** "**Tabs are ephemeral. Worktrees, transcripts, and
 > TmuxSessions are durable.** The Tab record is restored from disk on launch,
 > then re-attached to the Worktree's TmuxSession. Claude's **AgentSession**
-> transcript is keyed by the Worktree's path, so `claude --resume` picks up
-> the conversation."
+> transcript files are keyed by the Worktree's path, but a chat Tab only runs
+> `claude --resume` after it carries a verified AgentSession id."
 >
 > **Dev:** "Can one Space contain Tabs that reference different Worktrees?"
 >
