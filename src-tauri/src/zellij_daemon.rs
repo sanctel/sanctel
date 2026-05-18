@@ -1,7 +1,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 // zellij_daemon — supervises the `zellij web --start --port <free-port>`
-// child process for the spike backend (issue #16, slice 1 / issue #17), plus
-// the cookie-auth flow that `zellij web` requires (issue #23).
+// child process for the spike backend, plus the cookie-auth flow that
+// `zellij web` requires.
 //
 // Lifecycle:
 //   1. `ZellijDaemon::start(launcher, authenticator)` picks a free loopback
@@ -35,9 +35,9 @@ use std::time::Duration;
 
 use crate::zellij_auth::{self, TokenPair, ZellijAuthError};
 
-/// Ceiling on the restart backoff. Issue #17 requires the supervisor to
-/// restart the daemon within ~2 seconds when it dies externally; capping
-/// the backoff at this value satisfies that even after a long crash burst.
+/// Ceiling on the restart backoff. The supervisor must restart the daemon
+/// within ~2 seconds when it dies externally; capping the backoff at this
+/// value satisfies that even after a long crash burst.
 pub const BACKOFF_CAP: Duration = Duration::from_millis(2000);
 
 /// Poll cadence for `try_wait` while the daemon is alive. Small enough to
@@ -401,7 +401,6 @@ impl ChildProc for ZombieChild {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
     use std::time::Instant;
 
     /// 100ms, 200ms, 400ms, 800ms, 1600ms, then capped at 2000ms forever.
@@ -439,14 +438,14 @@ mod tests {
     /// supervisor performed.
     struct MockLauncher {
         launches: Arc<AtomicUsize>,
-        live_handles: Arc<StdMutex<Vec<Arc<AtomicBool>>>>,
+        live_handles: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
     }
 
     impl MockLauncher {
         fn new() -> Self {
             MockLauncher {
                 launches: Arc::new(AtomicUsize::new(0)),
-                live_handles: Arc::new(StdMutex::new(Vec::new())),
+                live_handles: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -455,7 +454,7 @@ mod tests {
     /// observes the "external kill" condition. Free function (not a method
     /// on MockLauncher) because the launcher is moved into
     /// `ZellijDaemon::start` and the tests hold the handles Arc separately.
-    fn kill_latest(handles: &StdMutex<Vec<Arc<AtomicBool>>>) {
+    fn kill_latest(handles: &Mutex<Vec<Arc<AtomicBool>>>) {
         if let Some(h) = handles.lock().unwrap().last() {
             h.store(false, Ordering::SeqCst);
         }

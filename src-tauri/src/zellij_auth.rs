@@ -2,8 +2,8 @@
 // zellij_auth — token-mint and HTTP login exchange against `zellij web`.
 //
 // `zellij web --start` boots an HTTP/WebSocket daemon whose auth middleware
-// requires a `session_token` cookie on every request — see the issue text
-// on #23 for the back-story. The flow this module implements:
+// requires a `session_token` cookie on every request. The flow this module
+// implements:
 //
 //   1. Mint an auth token: `zellij web --create-token --name <name>`.
 //      The token UUID lives on a `<name>: <UUID>` line on stdout. The
@@ -25,13 +25,13 @@
 //      user's `zellij web --list-tokens` doesn't accumulate sanctel
 //      tokens across runs.
 //
-// Why hand-rolled HTTP (Option A from the issue's interface section):
+// Why hand-rolled HTTP rather than a dependency like `ureq`:
 //
 //   The request is fixed-shape, localhost-only, no TLS, no streaming, no
-//   redirects. The hand-rolled path is ~60 LOC; adding `ureq` (~200KB
-//   compiled) buys ergonomic chaining we don't need for one POST. The
-//   parse and shape are exercised by unit tests so a future maintainer
-//   reading the wire bytes has the test cases as a reference.
+//   redirects. The hand-rolled path is ~60 LOC; `ureq` (~200KB compiled)
+//   would buy ergonomic chaining we don't need for one POST. The parse
+//   and shape are exercised by unit tests so a future maintainer reading
+//   the wire bytes has the test cases as a reference.
 // ───────────────────────────────────────────────────────────────────────────
 
 use std::fmt;
@@ -47,9 +47,8 @@ use std::time::Duration;
 /// we'd rather surface the error than block sanctel's startup.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Errors surfaced from the auth flow. The variants match the issue's
-/// "Key interfaces" section so callers can route into setup-screen
-/// messaging by the failure mode.
+/// Errors surfaced from the auth flow. Variants are kept distinct so
+/// callers can route into setup-screen messaging by the failure mode.
 #[derive(Debug, Clone)]
 pub enum ZellijAuthError {
     /// `zellij web --create-token` failed (non-zero exit, missing binary,

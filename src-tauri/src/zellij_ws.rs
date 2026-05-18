@@ -171,7 +171,7 @@ pub fn initial_command_frame(command: &str) -> Message {
 ///
 /// `session_token` is the cookie minted by `zellij_auth` against the
 /// supervised daemon; without it `zellij web`'s auth middleware would
-/// reject the WebSocket handshake with HTTP 401 (see issue #23).
+/// reject the WebSocket handshake with HTTP 401.
 ///
 /// The transient WS intentionally doesn't reuse `mount`: writing one shot
 /// of bytes doesn't need an `on_output` channel or the per-connection I/O
@@ -200,7 +200,7 @@ pub fn write_initial_command(
 /// Build a tungstenite client request for `url` carrying a
 /// `Cookie: session_token=<value>` header. zellij web's auth middleware
 /// reads that cookie to authorize the handshake; without it every
-/// handshake answers HTTP 401 (issue #23).
+/// handshake answers HTTP 401.
 ///
 /// Public so the cookie-injection contract is unit-testable without
 /// opening a real WebSocket.
@@ -442,7 +442,7 @@ mod tests {
     }
 
     /// `build_ws_request` must put the session_token cookie on every
-    /// request. zellij web's auth middleware (issue #23) reads `Cookie:
+    /// request. zellij web's auth middleware reads `Cookie:
     /// session_token=<value>` to authorize the handshake; a regression
     /// that dropped the cookie would re-introduce HTTP 401 across every
     /// terminal tab on the zellij backend.

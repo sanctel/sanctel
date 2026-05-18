@@ -793,10 +793,11 @@ pub fn run() {
                                 // Surface the spawn (or auth) failure through
                                 // the same available/error channel the
                                 // version probe uses; the frontend setup
-                                // screen renders identically. Auth failures
-                                // arrive here too — the issue-#23 acceptance
-                                // criterion ("error surfaced with diagnostic
-                                // detail" rather than an opaque 401 per tab).
+                                // screen renders identically. Routing auth
+                                // failures here is what keeps the failure
+                                // mode named (diagnostic detail in the
+                                // setup screen) rather than an opaque
+                                // HTTP 401 per terminal tab.
                                 *state.tmux_status.lock() = TmuxStatus {
                                     available: false,
                                     version: None,
