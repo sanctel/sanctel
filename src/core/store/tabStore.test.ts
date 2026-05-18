@@ -270,12 +270,17 @@ describe("tabStore mutations persist", () => {
     expect(snap.tabs[0].windowName).toBe("term-1");
   });
 
-  it("newChatTab with a prior agentSessionId persists initialCommand = claude --resume <id>", async () => {
+  it("newChatTab ignores a create-time agentSessionId candidate", async () => {
     const persistence = new InMemoryPersistence();
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
-    await useStore.getState().newChatTab("sanctel-main", "abc-123");
+    await (
+      useStore.getState().newChatTab as unknown as (
+        worktreeId: string,
+        createTimeAgentSessionId: string,
+      ) => Promise<unknown>
+    )("sanctel-main", "fresh-unrelated");
 
     const snap = await persistence.loadAll();
     expect(snap.tabs).toHaveLength(1);
@@ -283,12 +288,12 @@ describe("tabStore mutations persist", () => {
       kind: "chat",
       worktreeId: "sanctel-main",
       windowName: "term-1",
-      initialCommand: "claude --resume abc-123",
-      agentSessionId: "abc-123",
+      initialCommand: "claude",
+      agentSessionId: null,
     });
 
-    // create_tab carries the same identity so a fresh-window create runs
-    // the resume command (and a reattach skips it — that's Rust's job).
+    // The create_tab payload must not capture a create-time transcript
+    // candidate that could belong to another Claude process.
     const createTabCall = invokeMock.mock.calls.find(
       ([cmd]) => cmd === "create_tab",
     );
@@ -296,8 +301,8 @@ describe("tabStore mutations persist", () => {
       kind: "chat",
       worktreeId: "sanctel-main",
       windowName: "auto",
-      initialCommand: "claude --resume abc-123",
-      agentSessionId: "abc-123",
+      initialCommand: "claude",
+      agentSessionId: null,
     });
   });
 
@@ -306,7 +311,7 @@ describe("tabStore mutations persist", () => {
     const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
-    await useStore.getState().newChatTab("sanctel-main", null);
+    await useStore.getState().newChatTab("sanctel-main");
 
     const snap = await persistence.loadAll();
     expect(snap.tabs[0]).toMatchObject({
@@ -327,7 +332,7 @@ describe("tabStore mutations persist", () => {
     await useStore.getState().hydrate(persistence);
 
     await expect(
-      useStore.getState().newChatTab("sanctel-main", null),
+      useStore.getState().newChatTab("sanctel-main"),
     ).rejects.toThrow(/tmux-missing/);
   });
 

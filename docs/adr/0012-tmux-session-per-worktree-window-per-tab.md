@@ -144,10 +144,11 @@ clients to one session will exhibit it.
   user-editable UI; the session name is an immutable internal handle.
   Rename a tab and the tmux side is untouched (only the UI label
   changes).
-- **Chat tabs use the same mechanism** plus an `initialCommand` (e.g.,
-  `claude --resume <agentSessionId>`) consumed only when the session
-  is freshly created. Existing sessions on reattach are never
-  re-`--resume`d.
+- **Chat tabs use the same mechanism** plus an `initialCommand`
+  consumed only when the session is freshly created. New chat tabs start
+  with plain `claude`; `claude --resume <agentSessionId>` is only valid
+  once the Tab already carries a verified AgentSession id. Existing
+  sessions on reattach are never re-`--resume`d.
 
 ## Per-tab event subscription is delivered by this architecture
 

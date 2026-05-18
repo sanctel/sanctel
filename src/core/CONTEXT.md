@@ -82,7 +82,8 @@ target specs as session/window/pane delimiters; the suffix separator is
   same Worktree have **separate TmuxSessions sharing a name prefix**;
   `tmux kill-session` is the one-shot close path.
 - An **AgentSession** belongs to one Worktree (key = cwd path), not to a Tab.
-  Multiple Tabs in the same Worktree see the same `claude --resume` history.
+  A new chat Tab starts plain `claude`; it must not infer a resume target by
+  grabbing the newest transcript in the Worktree.
 
 ## The Persistence Anchor invariant
 

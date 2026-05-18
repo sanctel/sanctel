@@ -51,10 +51,7 @@ interface TabState {
   switchSpace: (id: string) => void;
   newTab: (kind: TabKind, url: string) => Promise<Tab>;
   newTerminalTab: (worktreeId: Worktree["id"] | null) => Promise<Tab>;
-  newChatTab: (
-    worktreeId: Worktree["id"],
-    agentSessionId: string | null,
-  ) => Promise<Tab>;
+  newChatTab: (worktreeId: Worktree["id"]) => Promise<Tab>;
   closeTab: (id: string) => Promise<void>;
   renameTab: (id: string, title: string) => Promise<void>;
   activateTab: (id: string) => Promise<void>;
@@ -389,7 +386,7 @@ export function createTabStore(): TabStoreHook {
       return tab;
     },
 
-    newChatTab: async (worktreeId, agentSessionId) => {
+    newChatTab: async (worktreeId) => {
       const space = get().activeSpace();
       if (!space) throw new Error("no active space");
       const profileId = space.profileId;
@@ -406,13 +403,7 @@ export function createTabStore(): TabStoreHook {
       const worktree = findWorktree(worktreeId);
       if (!worktree) throw new Error(`unknown worktreeId: ${worktreeId}`);
 
-      // Slice 6 / issue #7: a prior session means we resume; otherwise plain
-      // `claude` creates a fresh transcript on first message. Either way the
-      // command only fires on fresh tmux-window creation (Rust's job);
-      // reattach after a sanctel restart never re-runs it.
-      const initialCommand = agentSessionId
-        ? `claude --resume ${agentSessionId}`
-        : "claude";
+      const initialCommand = "claude";
 
       const id = crypto.randomUUID();
       const resp = await invoke<CreateTabResp>("create_tab", {
@@ -425,7 +416,7 @@ export function createTabStore(): TabStoreHook {
           worktreePath: worktree.path,
           windowName: AUTO_WINDOW_NAME,
           initialCommand,
-          agentSessionId: agentSessionId ?? null,
+          agentSessionId: null,
         },
       });
       const windowName = resp.windowName;
@@ -445,7 +436,7 @@ export function createTabStore(): TabStoreHook {
         worktreeId: worktree.id,
         windowName,
         initialCommand,
-        agentSessionId: agentSessionId ?? undefined,
+        agentSessionId: undefined,
         loading: false,
       };
 

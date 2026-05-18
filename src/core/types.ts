@@ -17,7 +17,7 @@
 //   - tab.spaceId         → Space   (visual grouping)
 //   - tab.worktreeId?     → Worktree (filesystem cwd; optional)
 //   - tab.windowName?     → TmuxSession window inside the Worktree's session
-//   - tab.agentSessionId? → AgentSession (claude --resume target)
+//   - tab.agentSessionId? → AgentSession (known resume target)
 //
 // The deeper insight: Tabs are ephemeral. Profiles, Worktrees, transcripts,
 // and tmux sessions are durable. On app launch, Tabs are reconstructed by
@@ -88,10 +88,11 @@ export interface Tab {
   worktreeId?: Worktree["id"];
   // Server-held identity for terminal/chat tabs. Persisted across launches
   // so the broken-tab/recreate flow can replay create_tab with the same
-  // tmux window and agent transcript.
+  // tmux window. Chat tabs start plain `claude`; agentSessionId is only
+  // populated once Sanctel can identify that tab's own transcript.
   windowName?: string;          // tmux window inside the Worktree's session
-  initialCommand?: string;      // first-shell command for chat tabs (Slice 6)
-  agentSessionId?: string;      // claude --resume target for chat tabs (Slice 6)
+  initialCommand?: string;      // first-shell command for chat tabs
+  agentSessionId?: string;      // known claude --resume target for chat tabs
   loading: boolean;
   favicon?: string;
 }
