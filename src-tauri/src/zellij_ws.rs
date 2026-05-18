@@ -29,7 +29,7 @@
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -112,17 +112,14 @@ pub fn decode_binary_frame(msg: &Message) -> Option<Vec<u8>> {
 }
 
 /// Per-tab handle returned by `mount`. Owns the send-side of the outgoing
-/// mpsc channels; drop closes them and the I/O threads exit cleanly.
+/// mpsc channels; drop closes them and the I/O threads observe the
+/// disconnect and exit. The threads detach (the `JoinHandle`s from
+/// `thread::spawn` are discarded) — we don't `.join()` on Drop because
+/// the I/O threads sleep up to a few ms between iterations and we don't
+/// want to block the caller for that.
 pub struct ZellijWsHandle {
     terminal_tx: Sender<Message>,
     control_tx: Sender<Message>,
-    // JoinHandles are kept so the threads are observable in tests / future
-    // diagnostics. They're joined implicitly when the handle drops by way
-    // of the senders closing; we don't explicitly `.join()` on Drop because
-    // the I/O threads sleep up to a few ms between iterations and we don't
-    // want to block the calling thread for that.
-    _terminal_thread: Option<JoinHandle<()>>,
-    _control_thread: Option<JoinHandle<()>>,
 }
 
 impl ZellijWsHandle {
@@ -163,7 +160,7 @@ pub fn mount(
     let (terminal_tx, terminal_rx) = mpsc::channel::<Message>();
     let (control_tx, control_rx) = mpsc::channel::<Message>();
 
-    let terminal_thread = thread::spawn(move || {
+    thread::spawn(move || {
         io_loop(terminal_ws, terminal_rx, move |msg| {
             if let Some(bytes) = decode_binary_frame(&msg) {
                 // Channel closed = webview gone; the I/O loop exits next
@@ -172,7 +169,7 @@ pub fn mount(
             }
         });
     });
-    let control_thread = thread::spawn(move || {
+    thread::spawn(move || {
         io_loop(control_ws, control_rx, |_| {
             // Inbound control messages are ignored in this slice. Future
             // slices may want to dispatch on them (e.g., daemon-side
@@ -180,12 +177,7 @@ pub fn mount(
         });
     });
 
-    Ok(ZellijWsHandle {
-        terminal_tx,
-        control_tx,
-        _terminal_thread: Some(terminal_thread),
-        _control_thread: Some(control_thread),
-    })
+    Ok(ZellijWsHandle { terminal_tx, control_tx })
 }
 
 fn connect_plain(url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ZellijWsError> {
