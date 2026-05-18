@@ -4,9 +4,9 @@
 // backend isn't usable.
 //
 // `backend` names which one was probed ("tmux" or "zellij") so the setup
-// screen can render backend-appropriate copy and install instructions
-// (issue #27). The field name is historical (the struct was added when
-// only tmux existed); both tmux probe and zellij probe write to it now.
+// screen can render backend-appropriate copy and install instructions.
+// The field name is historical (the struct was added when only tmux
+// existed); both tmux probe and zellij probe write to it now.
 //
 // Lifecycle:
 //   - On mount, App reads the current status synchronously via the
@@ -76,9 +76,8 @@ export const useTmuxStatus = create<TmuxStatusState>((set, get) => ({
 function normalize(s: TmuxStatus | undefined | null): TmuxStatus {
   if (!s) return INITIAL;
   return {
-    // Defensive fallback per issue #27 acceptance: an unrecognised or
-    // missing backend value renders the existing tmux copy rather than
-    // a blank setup screen.
+    // Defensive fallback: an unrecognised or missing backend value
+    // renders the existing tmux copy rather than a blank setup screen.
     backend: s.backend === "zellij" ? "zellij" : "tmux",
     available: !!s.available,
     version: s.version ?? null,

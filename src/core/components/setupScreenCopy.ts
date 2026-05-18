@@ -1,7 +1,7 @@
-// Backend-aware copy for the startup setup screen (issue #27). Pure so the
-// branching is unit-testable without rendering React. Defensive default:
-// any value other than `"zellij"` falls back to the tmux copy so a missing
-// or malformed `backend` field off the wire renders the existing UI rather
+// Backend-aware copy for the startup setup screen. Pure so the branching
+// is unit-testable without rendering React. Defensive default: any value
+// other than `"zellij"` falls back to the tmux copy so a missing or
+// malformed `backend` field off the wire renders the existing UI rather
 // than blank.
 
 export interface SetupScreenCopy {

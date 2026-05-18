@@ -103,7 +103,7 @@ mod tests {
     }
 
     /// The wire name must round-trip with the env value the user types —
-    /// the frontend setup screen (issue #27) keys its copy off it.
+    /// the frontend setup screen keys its copy off it.
     #[test]
     fn name_matches_env_value() {
         assert_eq!(Backend::Tmux.name(), "tmux");

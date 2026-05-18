@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { setupScreenCopy } from "./setupScreenCopy";
 
 describe("setupScreenCopy", () => {
-  // Issue #27 acceptance criterion: when SANCTEL_BACKEND=zellij is active
-  // and a zellij setup step fails, the setup screen shows zellij-flavoured
-  // copy with zellij install instructions — not tmux's.
+  // When SANCTEL_BACKEND=zellij is active and a zellij setup step fails,
+  // the setup screen shows zellij-flavoured copy with zellij install
+  // instructions — not tmux's.
   it("returns zellij heading and install commands when backend is zellij", () => {
     const copy = setupScreenCopy("zellij");
     expect(copy.heading.toLowerCase()).toContain("zellij");
@@ -23,9 +23,9 @@ describe("setupScreenCopy", () => {
     expect(copy.install).not.toContain("zellij");
   });
 
-  // Defensive fallback per the issue's acceptance list: if the backend
-  // value is missing or malformed coming off the wire, the frontend must
-  // render the existing tmux copy rather than going blank.
+  // Defensive fallback: if the backend value is missing or malformed
+  // coming off the wire, the frontend must render the existing tmux copy
+  // rather than going blank.
   it("falls back to tmux copy when backend is missing or unknown", () => {
     expect(setupScreenCopy(undefined).heading).toBe("Sanctel needs tmux");
     expect(setupScreenCopy("garbage").heading).toBe("Sanctel needs tmux");

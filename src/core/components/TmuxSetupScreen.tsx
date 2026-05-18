@@ -3,10 +3,10 @@ import { setupScreenCopy } from "./setupScreenCopy";
 
 // Shown when the Rust-side startup probe could not find a usable backend.
 // Issue #8: replaces tab-by-tab failures with one clear setup screen at app
-// launch. Issue #27: the copy and install instructions follow which backend
-// actually failed (`status.backend`) — a zellij failure must not tell the
-// user to install tmux. React stays in this state until the user installs
-// the right backend and restarts sanctel — the probe runs once per launch.
+// launch. The copy and install instructions follow which backend actually
+// failed (`status.backend`) — a zellij failure must not tell the user to
+// install tmux. React stays in this state until the user installs the
+// right backend and restarts sanctel — the probe runs once per launch.
 export default function TmuxSetupScreen() {
   const backend = useTmuxStatus((s) => s.status.backend);
   const error = useTmuxStatus((s) => s.status.error);

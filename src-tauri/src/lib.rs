@@ -110,11 +110,10 @@ impl AllocationLocks {
 /// and also readable via the `tmux_status` command so React can render
 /// synchronously on first paint without waiting for the event.
 ///
-/// The name is historical (slice 7 wired tmux first); the struct is now
-/// the structural "current backend ready" signal for whichever backend
-/// `SANCTEL_BACKEND` selected. `backend` identifies which one — the
-/// frontend setup screen (issue #27) keys its copy and install
-/// instructions off it so a zellij failure doesn't render "needs tmux".
+/// The struct name is historical (tmux was the only backend when the
+/// field was added). `backend` identifies which backend was probed so
+/// the frontend setup screen can render the appropriate copy and install
+/// instructions — a zellij failure must not render "needs tmux".
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TmuxStatus {
@@ -1006,8 +1005,8 @@ mod tests {
         assert!(result.error.is_none());
     }
 
-    /// Issue #27: the tmux probe must name itself on the `backend` field so
-    /// the frontend setup screen renders tmux-flavoured copy and install
+    /// The tmux probe must name itself on the `backend` field so the
+    /// frontend setup screen renders tmux-flavoured copy and install
     /// instructions even when the probe fails. Pinned on both branches —
     /// success AND failure — because the setup screen only shows up on the
     /// failure branch and that's where mis-labelling would mislead a user.
@@ -1068,11 +1067,11 @@ mod tests {
         );
     }
 
-    /// Issue #27: the zellij probe writes `backend: "zellij"` so the
-    /// frontend setup-screen renders zellij-flavoured copy and install
-    /// instructions when the spike backend is the one that failed. Pinned
-    /// on both branches so the failure path (where the setup screen is
-    /// actually rendered) is covered.
+    /// The zellij probe writes `backend: "zellij"` so the frontend setup-
+    /// screen renders zellij-flavoured copy and install instructions when
+    /// the spike backend is the one that failed. Pinned on both branches
+    /// so the failure path (where the setup screen is actually rendered)
+    /// is covered.
     #[test]
     fn zellij_probe_names_backend_in_status() {
         let status = Mutex::new(TmuxStatus::default());
@@ -1086,9 +1085,9 @@ mod tests {
 
     /// The default value of the field — what `TmuxStatus::default()` yields
     /// before any probe has run — must be `"tmux"`. This matches the
-    /// frontend's defensive fallback (issue #27 acceptance: if the field
-    /// is missing or malformed, render the existing tmux copy) so the two
-    /// sides agree on which backend is implied by a bare status.
+    /// frontend's defensive fallback (a missing or malformed value renders
+    /// the existing tmux copy) so the two sides agree on which backend is
+    /// implied by a bare status.
     #[test]
     fn default_status_names_tmux_backend() {
         assert_eq!(TmuxStatus::default().backend, "tmux");
