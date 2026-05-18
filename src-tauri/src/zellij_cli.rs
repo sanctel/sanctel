@@ -428,12 +428,14 @@ mod tests {
         assert_eq!(seen[0].cwd.as_deref(), Some("/home/me/wt"));
     }
 
-    /// initial_command is accepted but not transmitted to zellij at this
-    /// slice — it's threaded into the pane via the WebSocket attach path
-    /// (slice 3). The unit test pins that behavior so a future change that
-    /// silently appends it to the argv is caught.
+    /// `initial_command` is accepted for API symmetry but is NOT spliced
+    /// into the CLI argv — zellij has no clean CLI flag to start a session
+    /// with a command running. The byte-stream reaches the pane via the
+    /// attach path instead. This test catches a regression that silently
+    /// appends to argv (which zellij would ignore or misinterpret as a
+    /// session-name fragment depending on the version).
     #[test]
-    fn new_session_ignores_initial_command_in_argv_for_now() {
+    fn new_session_does_not_splice_initial_command_into_argv() {
         let mock = MockRunner::new(vec![MockCall {
             expect_args_contain: Some(vec!["attach", "--create-background", "foo"]),
             result: ok(""),
@@ -443,12 +445,9 @@ mod tests {
             .unwrap();
         let seen = cli.runner.seen();
         assert_eq!(seen.len(), 1);
-        // The initial_command must NOT have been spliced into argv —
-        // doing so would either be ignored by zellij or interpreted as
-        // a session name fragment, depending on the version.
         assert!(
             !seen[0].args.iter().any(|a| a.contains("claude")),
-            "initial_command must not appear in argv (slice 2 contract): {:?}",
+            "initial_command must not appear in argv: {:?}",
             seen[0].args,
         );
     }
