@@ -490,48 +490,14 @@ mod tests {
         }
     }
 
-    /// In-memory authenticator. Records every authenticate / revoke call so
-    /// tests can assert "auth ran once per (re)launch" and "revoke ran on
-    /// clean shutdown". Returns a synthetic token shaped like
-    /// `session-<N>` where N is the call ordinal — so tests can also
-    /// assert the daemon's `session_token()` advanced after a respawn.
-    struct CountingAuth {
-        auth_calls: Arc<AtomicUsize>,
-        revoke_calls: Arc<AtomicUsize>,
-    }
-
-    impl CountingAuth {
-        fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-            let auth_calls = Arc::new(AtomicUsize::new(0));
-            let revoke_calls = Arc::new(AtomicUsize::new(0));
-            (
-                CountingAuth {
-                    auth_calls: Arc::clone(&auth_calls),
-                    revoke_calls: Arc::clone(&revoke_calls),
-                },
-                auth_calls,
-                revoke_calls,
-            )
-        }
-    }
-
-    impl Authenticator for CountingAuth {
-        fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
-            let n = self.auth_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(TokenPair {
-                auth_token_name: format!("token_{n}"),
-                session_token: format!("session-{n}"),
-            })
-        }
-        fn revoke(&self, _token_name: &str) {
-            self.revoke_calls.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// Authenticator that records the exact token names it was asked to
-    /// revoke. Tests use this to assert the shutdown path revokes every
-    /// token minted across the daemon's lifetime — not just the last one,
-    /// and not the wrong one.
+    /// In-memory authenticator. Records every authenticate call (via a
+    /// counter — tests assert "auth ran once per (re)launch") and every
+    /// revoke call by name (tests assert "shutdown revoked exactly the
+    /// names that were minted, in mint order"). The revoke count comes
+    /// for free as `revoked_names.lock().unwrap().len()`. Returns a
+    /// synthetic `token_<N>` / `session-<N>` pair where N is the
+    /// authenticate-call ordinal — so tests can also assert the daemon's
+    /// `session_token()` advanced after a respawn.
     struct RecordingAuth {
         auth_calls: Arc<AtomicUsize>,
         revoked_names: Arc<Mutex<Vec<String>>>,
@@ -585,7 +551,7 @@ mod tests {
     fn start_spawns_daemon_once_synchronously_and_authenticates() {
         let launcher = MockLauncher::new();
         let launch_count = Arc::clone(&launcher.launches);
-        let (auth, auth_calls, _revoke_calls) = CountingAuth::new();
+        let (auth, auth_calls, _revoked_names) = RecordingAuth::new();
         let daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
         assert!(daemon.port() > 0);
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
@@ -626,7 +592,7 @@ mod tests {
         let launcher = MockLauncher::new();
         let launches = Arc::clone(&launcher.launches);
         let handles = Arc::clone(&launcher.live_handles);
-        let (auth, auth_calls, _revoke_calls) = CountingAuth::new();
+        let (auth, auth_calls, _revoked_names) = RecordingAuth::new();
         let daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
@@ -692,13 +658,13 @@ mod tests {
         let launcher = MockLauncher::new();
         let launches = Arc::clone(&launcher.launches);
         let handles = Arc::clone(&launcher.live_handles);
-        let (auth, _auth_calls, revoke_calls) = CountingAuth::new();
+        let (auth, _auth_calls, revoked_names) = RecordingAuth::new();
         let mut daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
 
         daemon.shutdown();
         let after_shutdown = launches.load(Ordering::SeqCst);
         assert_eq!(
-            revoke_calls.load(Ordering::SeqCst),
+            revoked_names.lock().unwrap().len(),
             1,
             "shutdown must run revoke exactly once",
         );
