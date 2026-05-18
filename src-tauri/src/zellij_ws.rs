@@ -377,6 +377,30 @@ mod tests {
         assert_eq!(bytes, b"claude\n");
     }
 
+    /// High-throughput byte path sanity check: a 10 MiB payload (the size
+    /// the spike's stress criterion #5 calls out, `cat /dev/urandom |
+    /// head -c 10M`) survives `encode_binary_frame` → `decode_binary_frame`
+    /// byte-identical. The full criterion is a manual acceptance run on a
+    /// dev box (sandcastle has no zellij, no xterm.js to receive the
+    /// output); this CI artefact rules out a silent length cap in the
+    /// in-process byte helpers as the failure mode. A regression that
+    /// silently truncated the frame at 1 MB / 16 MB / a u16 length field
+    /// would surface here as a length mismatch before reaching a manual
+    /// acceptance run.
+    #[test]
+    fn binary_frame_round_trips_ten_megabytes() {
+        let payload: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
+        let frame = encode_binary_frame(payload.clone());
+        let decoded = decode_binary_frame(&frame).expect("binary frame decodes");
+        assert_eq!(decoded.len(), payload.len());
+        // Compare a few bytes from each end + a checksum of the whole — the
+        // assertEq itself fails fast on length mismatch; the byte spot
+        // checks pin that the content didn't get scrambled.
+        assert_eq!(&decoded[..16], &payload[..16]);
+        assert_eq!(&decoded[decoded.len() - 16..], &payload[payload.len() - 16..]);
+        assert_eq!(decoded, payload);
+    }
+
     /// Non-binary frames decode to `None` so the production reader can
     /// ignore them without misforwarding text or control frames into the
     /// byte channel.

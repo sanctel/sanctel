@@ -425,6 +425,41 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), after_shutdown);
     }
 
+    /// Repeated-kill stress: five back-to-back external kills, each timed
+    /// for a respawn within `BACKOFF_CAP`. The single-kill test above
+    /// proves the first recovery; this one proves the recovery loop
+    /// doesn't degrade under sustained pressure (the spike's criterion #7
+    /// asks specifically for the supervisor to survive ongoing crashes,
+    /// not just one). A regression that, e.g., dropped the `attempt = 0`
+    /// reset on a healthy spawn would surface here as exponential blow-out
+    /// past the cap on the fifth iteration.
+    #[test]
+    fn supervisor_recovers_from_repeated_external_kills() {
+        const KILLS: usize = 5;
+        let launcher = MockLauncher::new();
+        let launches = Arc::clone(&launcher.launches);
+        let handles = Arc::clone(&launcher.live_handles);
+        let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
+
+        for n in 1..=KILLS {
+            let before = launches.load(Ordering::SeqCst);
+            kill_latest(&handles);
+            let start = Instant::now();
+            while launches.load(Ordering::SeqCst) <= before {
+                if start.elapsed() > BACKOFF_CAP + Duration::from_millis(500) {
+                    panic!(
+                        "kill #{n}: supervisor did not respawn within BACKOFF_CAP+500ms; launches={}",
+                        launches.load(Ordering::SeqCst)
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // Total launches = 1 initial + KILLS respawns.
+        assert_eq!(launches.load(Ordering::SeqCst), 1 + KILLS);
+        drop(daemon);
+    }
+
     /// Drop is a path the rest of the codebase relies on (AppState owns
     /// the daemon; Tauri shutdown drops AppState). It must call shutdown,
     /// joining the supervisor before the test thread exits — otherwise
