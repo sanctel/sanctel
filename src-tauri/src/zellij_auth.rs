@@ -372,20 +372,15 @@ pub fn parse_create_client_response(bytes: &[u8]) -> Result<String, ZellijAuthEr
 /// Returns None on malformed input — the caller surfaces it as
 /// `ClientRegistrationInvalid` with the original body for diagnostics.
 fn extract_web_client_id(body: &str) -> Option<String> {
-    // Find the `"web_client_id"` key, then the quoted value that follows
-    // its colon. A small ad-hoc parser is fine here — the response shape
-    // is fixed and a serde_json dependency for one field would be
-    // overkill alongside the rest of this module's hand-rolled HTTP.
-    let key = "\"web_client_id\"";
-    let key_pos = body.find(key)?;
-    let after_key = &body[key_pos + key.len()..];
-    let colon_pos = after_key.find(':')?;
-    let after_colon = &after_key[colon_pos + 1..];
-    let quote_open = after_colon.find('"')?;
-    let value_start = quote_open + 1;
-    let after_open = &after_colon[value_start..];
-    let quote_close = after_open.find('"')?;
-    let value = &after_open[..quote_close];
+    // Walk past the `"web_client_id"` key, the colon, and the opening
+    // quote; everything up to the next quote is the value. A small ad-hoc
+    // parser is fine here — the response shape is fixed and a serde_json
+    // dependency for one field would be overkill alongside the rest of
+    // this module's hand-rolled HTTP.
+    let (_, after_key) = body.split_once("\"web_client_id\"")?;
+    let (_, after_colon) = after_key.split_once(':')?;
+    let (_, after_open_quote) = after_colon.split_once('"')?;
+    let (value, _) = after_open_quote.split_once('"')?;
     if value.is_empty() {
         return None;
     }
