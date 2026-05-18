@@ -38,8 +38,31 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 use std::fmt;
+use std::path::Path;
 
 use crate::tmux_cli::{CommandRunner, RealCommandRunner};
+
+/// Set `ZELLIJ_SOCKET_DIR` to `path` and best-effort create the directory.
+///
+/// The default `$TMPDIR`-derived socket directory zellij computes overflows
+/// macOS's 104-byte `sockaddr_un.sun_path` limit once combined with sanctel's
+/// `sanctel_wt_<wt>__<window>` session names — zellij prints "the IPC socket
+/// path is too long" and the recommended fix is to point `ZELLIJ_SOCKET_DIR`
+/// at a shorter path. Linux's 108-byte limit plus the short default `$TMPDIR`
+/// (`/tmp`) keeps it under the cap, so this is a no-op semantically there.
+///
+/// Called once in `lib.rs::run()` for the `Backend::Zellij` arm BEFORE any
+/// zellij subprocess is spawned (version probe, daemon launch, auth flow).
+/// Every child process then inherits the env var. Test fixtures call the
+/// `ensure_test_socket_dir` cousin in the test module for the same reason.
+///
+/// Directory creation is best-effort: a failure to create the dir is
+/// recoverable (the env var is still set and zellij surfaces a clear error
+/// of its own if it can't write to the dir).
+pub(crate) fn set_zellij_socket_dir(path: &Path) {
+    let _ = std::fs::create_dir_all(path);
+    std::env::set_var("ZELLIJ_SOCKET_DIR", path);
+}
 
 /// Errors surfaced from the zellij wrapper. Shape mirrors `TmuxError` —
 /// callers either retry (Race) or surface to the user (everything else).
@@ -316,6 +339,59 @@ mod tests {
             self.record(program, args, Some(cwd));
             self.next(args)
         }
+    }
+
+    /// Set `ZELLIJ_SOCKET_DIR` to a process-unique short path for tests that
+    /// spawn real `zellij`. Without this, macOS tests fail with "the IPC
+    /// socket path is too long" because the default `$TMPDIR` plus zellij's
+    /// per-session path overflows the 104-byte `sockaddr_un.sun_path` cap.
+    ///
+    /// Process-unique (`-test-<pid>`) so parallel cargo-test processes don't
+    /// share state; safe to call multiple times within one process
+    /// (`set_var` and `create_dir_all` are both idempotent).
+    pub(crate) fn ensure_test_socket_dir() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/sanctel-zellij-test-{}",
+            std::process::id()
+        ));
+        super::set_zellij_socket_dir(&path);
+    }
+
+    /// Pins the helper's behavior: env var is set, path is short enough that
+    /// even the longest sanctel session name keeps the total under macOS's
+    /// 104-byte `sockaddr_un.sun_path` cap, the directory exists after the
+    /// call, and a second call on the same path is idempotent. One combined
+    /// test because parallel cargo-test workers in the same process share
+    /// `std::env`; running these as two separate tests would let one
+    /// overwrite the other's env var mid-assertion.
+    #[test]
+    fn set_zellij_socket_dir_sets_env_creates_dir_and_is_idempotent() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/sanctel-zellij-unit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+
+        super::set_zellij_socket_dir(&path);
+        assert!(path.exists(), "directory must be created");
+        // Headroom: zellij appends `contract_version_<N>/` (~20 bytes) and
+        // a session name like `sanctel_wt_<wt>__term-N` (~31 bytes). The
+        // socket-dir prefix has 53 bytes to play with under macOS's
+        // 104-byte cap. A future refactor that moved the dir back under
+        // `$TMPDIR` would fail this assertion on macOS.
+        assert!(
+            path.as_os_str().len() <= 53,
+            "socket dir prefix must leave room under macOS sun_path cap (got {} bytes)",
+            path.as_os_str().len(),
+        );
+
+        // Second call on the same path doesn't panic. We can't reliably
+        // read back `ZELLIJ_SOCKET_DIR` here because parallel tests in
+        // this process also call the helper with different paths; the
+        // dir-existence + length checks above are the load-bearing
+        // invariants.
+        super::set_zellij_socket_dir(&path);
+        assert!(path.exists());
     }
 
     fn ok(stdout: &str) -> std::io::Result<CommandOutput> {
@@ -703,6 +779,7 @@ mod tests {
             eprintln!("skipping: zellij not installed");
             return;
         }
+        ensure_test_socket_dir();
 
         let cli = ZellijCli::default();
         let session = format!("sanctel-cli-test-{}", std::process::id());
@@ -769,6 +846,7 @@ mod tests {
             eprintln!("skipping: zellij not installed");
             return;
         }
+        ensure_test_socket_dir();
 
         let cli = ZellijCli::default();
         let pid = std::process::id();
