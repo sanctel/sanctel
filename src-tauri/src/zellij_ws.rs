@@ -392,12 +392,9 @@ mod tests {
         let payload: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
         let frame = encode_binary_frame(payload.clone());
         let decoded = decode_binary_frame(&frame).expect("binary frame decodes");
-        assert_eq!(decoded.len(), payload.len());
-        // Compare a few bytes from each end + a checksum of the whole — the
-        // assertEq itself fails fast on length mismatch; the byte spot
-        // checks pin that the content didn't get scrambled.
-        assert_eq!(&decoded[..16], &payload[..16]);
-        assert_eq!(&decoded[decoded.len() - 16..], &payload[payload.len() - 16..]);
+        // Length check first so a silent cap regression (the failure mode
+        // this test exists for) panics with two numbers, not a 10 MB diff.
+        assert_eq!(decoded.len(), payload.len(), "frame size cap regression?");
         assert_eq!(decoded, payload);
     }
 
