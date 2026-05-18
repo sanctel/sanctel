@@ -32,6 +32,11 @@ export type AgentSessionCaptureStarter = (
   opts: Omit<AgentSessionCaptureOptions, "home" | "fs">,
 ) => AgentSessionCapture;
 
+type AgentSessionDiscoveryOptions = Pick<
+  AgentSessionCaptureOptions,
+  "worktreePath" | "startedAt" | "home" | "fs"
+>;
+
 const JSONL_RE = /\.jsonl$/;
 
 export function encodeCwd(cwd: string): string {
@@ -43,18 +48,18 @@ export function pickFirstSessionAfter(
   entries: readonly AgentSessionFsEntry[],
   startedAt: number,
 ): string | null {
-  let best: AgentSessionFsEntry | null = null;
+  let earliest: AgentSessionFsEntry | null = null;
   for (const e of entries) {
     if (!JSONL_RE.test(e.name)) continue;
     if (e.mtime < startedAt) continue;
-    if (!best || e.mtime < best.mtime) best = e;
+    if (!earliest || e.mtime < earliest.mtime) earliest = e;
   }
-  if (!best) return null;
-  return best.name.replace(JSONL_RE, "");
+  if (!earliest) return null;
+  return earliest.name.replace(JSONL_RE, "");
 }
 
 export async function discoverCapturedAgentSession(
-  opts: Pick<AgentSessionCaptureOptions, "worktreePath" | "startedAt" | "home" | "fs">,
+  opts: AgentSessionDiscoveryOptions,
 ): Promise<string | null> {
   const dir = `${opts.home}/.claude/projects/${encodeCwd(opts.worktreePath)}`;
   try {
