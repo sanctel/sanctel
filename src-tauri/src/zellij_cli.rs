@@ -51,10 +51,8 @@ use crate::tmux_cli::{CommandRunner, RealCommandRunner};
 /// at a shorter path. Linux's 108-byte limit plus the short default `$TMPDIR`
 /// (`/tmp`) keeps it under the cap, so this is a no-op semantically there.
 ///
-/// Called once in `lib.rs::run()` for the `Backend::Zellij` arm BEFORE any
-/// zellij subprocess is spawned (version probe, daemon launch, auth flow).
-/// Every child process then inherits the env var. Test fixtures call the
-/// `ensure_test_socket_dir` cousin in the test module for the same reason.
+/// Must be invoked BEFORE any zellij subprocess is spawned (version probe,
+/// daemon launch, auth flow); every child inherits the env var.
 ///
 /// Directory creation is best-effort: a failure to create the dir is
 /// recoverable (the env var is still set and zellij surfaces a clear error

@@ -784,11 +784,9 @@ pub fn run() {
                 }
                 Backend::Zellij => {
                     // Must run BEFORE the version probe and daemon launch so
-                    // every child zellij subprocess inherits a short socket
-                    // path. macOS's `sockaddr_un.sun_path` caps at 104 bytes
-                    // and the default `$TMPDIR` (`/var/folders/...`) plus
-                    // zellij's per-session path overflows it. See
-                    // `zellij_cli::set_zellij_socket_dir` for the full story.
+                    // every child zellij subprocess inherits the short socket
+                    // path. See `zellij_cli::set_zellij_socket_dir` for the
+                    // macOS sun_path arithmetic.
                     crate::zellij_cli::set_zellij_socket_dir(
                         std::path::Path::new("/tmp/sanctel-zellij"),
                     );
