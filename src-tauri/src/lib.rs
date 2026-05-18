@@ -106,15 +106,32 @@ impl AllocationLocks {
     }
 }
 
-/// Result of the one-time `tmux -V` probe. Emitted as a Tauri event and also
-/// readable via the `tmux_status` command so React can render synchronously
-/// on first paint without waiting for the event.
-#[derive(Clone, Debug, Default, Serialize)]
+/// Result of the one-time backend startup probe. Emitted as a Tauri event
+/// and also readable via the `tmux_status` command so React can render
+/// synchronously on first paint without waiting for the event.
+///
+/// The struct name is historical (tmux was the only backend when the
+/// field was added). `backend` identifies which backend was probed so
+/// the frontend setup screen can render the appropriate copy and install
+/// instructions — a zellij failure must not render "needs tmux".
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TmuxStatus {
+    backend: String,
     available: bool,
     version: Option<String>,
     error: Option<String>,
+}
+
+impl Default for TmuxStatus {
+    fn default() -> Self {
+        Self {
+            backend: Backend::Tmux.name().to_string(),
+            available: false,
+            version: None,
+            error: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -706,18 +723,22 @@ fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
     status: &Mutex<TmuxStatus>,
     tmux: &TmuxCli<R>,
 ) {
+    let backend = Backend::Tmux.name().to_string();
     let resolved = match tmux.version() {
         Ok(v) => TmuxStatus {
+            backend,
             available: true,
             version: Some(v),
             error: None,
         },
         Err(TmuxError::NotFound(msg)) => TmuxStatus {
+            backend,
             available: false,
             version: None,
             error: Some(format!("tmux not installed: {msg}")),
         },
         Err(other) => TmuxStatus {
+            backend,
             available: false,
             version: None,
             error: Some(other.to_string()),
@@ -737,18 +758,22 @@ fn probe_zellij_into<R: crate::tmux_cli::CommandRunner>(
     status: &Mutex<TmuxStatus>,
     zellij: &ZellijCli<R>,
 ) {
+    let backend = Backend::Zellij.name().to_string();
     let resolved = match zellij.version() {
         Ok(v) => TmuxStatus {
+            backend,
             available: true,
             version: Some(v),
             error: None,
         },
         Err(ZellijError::NotFound(msg)) => TmuxStatus {
+            backend,
             available: false,
             version: None,
             error: Some(format!("zellij not installed: {msg}")),
         },
         Err(other) => TmuxStatus {
+            backend,
             available: false,
             version: None,
             error: Some(other.to_string()),
@@ -806,6 +831,7 @@ pub fn run() {
                                 // setup screen) rather than an opaque
                                 // HTTP 401 per terminal tab.
                                 *state.tmux_status.lock() = TmuxStatus {
+                                    backend: Backend::Zellij.name().to_string(),
                                     available: false,
                                     version: None,
                                     error: Some(format!(
@@ -979,6 +1005,22 @@ mod tests {
         assert!(result.error.is_none());
     }
 
+    /// The tmux probe must name itself on the `backend` field so the
+    /// frontend setup screen renders tmux-flavoured copy and install
+    /// instructions even when the probe fails. Pinned on both branches —
+    /// success AND failure — because the setup screen only shows up on the
+    /// failure branch and that's where mis-labelling would mislead a user.
+    #[test]
+    fn tmux_probe_names_backend_in_status() {
+        let status = Mutex::new(TmuxStatus::default());
+        probe_tmux_into(&status, &TmuxCli::new("test", OkRunner));
+        assert_eq!(status.lock().backend, "tmux");
+
+        let status = Mutex::new(TmuxStatus::default());
+        probe_tmux_into(&status, &TmuxCli::new("test", FailingRunner));
+        assert_eq!(status.lock().backend, "tmux");
+    }
+
     // ─── zellij probe (spike slice 1 / issue #17) ────────────────────────
 
     struct ZellijOkRunner;
@@ -1023,6 +1065,32 @@ mod tests {
             err.contains("zellij not installed"),
             "error should name zellij, got: {err}"
         );
+    }
+
+    /// The zellij probe writes `backend: "zellij"` so the frontend setup-
+    /// screen renders zellij-flavoured copy and install instructions when
+    /// the spike backend is the one that failed. Pinned on both branches
+    /// so the failure path (where the setup screen is actually rendered)
+    /// is covered.
+    #[test]
+    fn zellij_probe_names_backend_in_status() {
+        let status = Mutex::new(TmuxStatus::default());
+        probe_zellij_into(&status, &ZellijCli::new(ZellijOkRunner));
+        assert_eq!(status.lock().backend, "zellij");
+
+        let status = Mutex::new(TmuxStatus::default());
+        probe_zellij_into(&status, &ZellijCli::new(FailingRunner));
+        assert_eq!(status.lock().backend, "zellij");
+    }
+
+    /// The default value of the field — what `TmuxStatus::default()` yields
+    /// before any probe has run — must be `"tmux"`. This matches the
+    /// frontend's defensive fallback (a missing or malformed value renders
+    /// the existing tmux copy) so the two sides agree on which backend is
+    /// implied by a bare status.
+    #[test]
+    fn default_status_names_tmux_backend() {
+        assert_eq!(TmuxStatus::default().backend, "tmux");
     }
 
     /// The dispatcher acceptance criterion: `Backend::from_env_value(None)`

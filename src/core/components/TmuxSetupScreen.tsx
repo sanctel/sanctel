@@ -1,11 +1,16 @@
 import { useTmuxStatus } from "../store/tmuxStatusStore";
+import { setupScreenCopy } from "./setupScreenCopy";
 
-// Shown when the Rust-side `tmux -V` startup probe could not find a usable
-// tmux. Issue #8: replaces tab-by-tab failures with one clear setup screen
-// at app launch. React stays in this state until the user installs tmux
-// and restarts sanctel — the probe runs once per app launch.
+// Shown when the Rust-side startup probe could not find a usable backend.
+// Issue #8: replaces tab-by-tab failures with one clear setup screen at app
+// launch. The copy and install instructions follow which backend actually
+// failed (`status.backend`) — a zellij failure must not tell the user to
+// install tmux. React stays in this state until the user installs the
+// right backend and restarts sanctel — the probe runs once per launch.
 export default function TmuxSetupScreen() {
+  const backend = useTmuxStatus((s) => s.status.backend);
   const error = useTmuxStatus((s) => s.status.error);
+  const copy = setupScreenCopy(backend);
 
   return (
     <div
@@ -26,11 +31,10 @@ export default function TmuxSetupScreen() {
       }}
     >
       <h1 style={{ fontSize: 20, margin: 0, color: "#fca5a5" }}>
-        Sanctel needs tmux
+        {copy.heading}
       </h1>
       <p style={{ maxWidth: 520, lineHeight: 1.5, color: "#a1a1aa", margin: 0 }}>
-        Sanctel's terminal and chat tabs are backed by tmux. Install it from
-        your package manager and relaunch:
+        {copy.intro}
       </p>
       <pre
         style={{
@@ -43,7 +47,7 @@ export default function TmuxSetupScreen() {
           margin: 0,
         }}
       >
-        {"# macOS\nbrew install tmux\n\n# Debian / Ubuntu\nsudo apt install tmux"}
+        {copy.install}
       </pre>
       {error && (
         <details style={{ color: "#71717a", fontSize: 12 }}>
