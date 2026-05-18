@@ -40,7 +40,9 @@ use crate::terminal_runtime::{
     attach_tab_to_tmux, attach_tab_to_zellij, AttachParams, TerminalRegistry,
 };
 use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
-use crate::zellij_cli::{ZellijCli, ZellijError};
+use crate::zellij_cli::{
+    cleanup_stale_zellij_sockets, list_zellij_sessions_via_socket_dir, ZellijCli, ZellijError,
+};
 use crate::zellij_daemon::{RealAuthenticator, RealLauncher, ZellijDaemon};
 
 // ─── shared state ─────────────────────────────────────────────────────────
@@ -74,6 +76,13 @@ struct AppState {
     // tab is its own session — the lock now serializes the allocator
     // across the *group* of sessions sharing a Worktree base.
     allocation_locks: AllocationLocks,
+    // Session names sanctel has allocated for the zellij backend but
+    // whose unix socket hasn't appeared on disk yet (the WS terminal
+    // handler creates the socket lazily on first attach). Combined with
+    // the on-disk dir scan in `allocate_session_for_zellij_tab` so a
+    // second allocation between create_tab and terminal_attach doesn't
+    // pick the same `term-N`. Drained by `close_tab`.
+    zellij_reserved_sessions: Mutex<std::collections::HashSet<String>>,
     // Supervised `zellij web` daemon for the spike backend (issue #16 /
     // issue #17). Populated only when `SANCTEL_BACKEND=zellij` is set and
     // the zellij version probe succeeded; `None` otherwise. Drop on this
@@ -282,38 +291,23 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
                 .map_err(|e| e.to_string())?
             }
             Backend::Zellij => {
-                let zellij = ZellijCli::default();
-                let window_name =
-                    allocate_session_for_zellij_tab(locks, &zellij, &base, &cwd)
-                        .map_err(|e| e.to_string())?;
-                // Zellij has no CLI flag to start a session with a running
-                // command, so the chat tab's initial_command rides over a
-                // transient WebSocket (see `write_initial_command`). The
-                // transient WS needs its own `web_client_id` minted via
-                // `register_client` — zellij's WS handlers reject the
-                // handshake with HTTP 400 if it's missing.
-                if let Some(cmd) = req.initial_command.as_deref() {
-                    let state = app.state::<AppState>();
-                    let (port, session_token) = {
-                        let daemon = state.zellij_daemon.lock();
-                        let d = daemon.as_ref().ok_or_else(|| {
-                            "zellij daemon not running — startup probe failed".to_string()
-                        })?;
-                        (d.port(), d.session_token())
-                    };
-                    let web_client_id =
-                        crate::zellij_auth::register_client(port, &session_token)
-                            .map_err(|e| e.to_string())?;
-                    let session = format!("{base}__{window_name}");
-                    zellij_ws::write_initial_command(
-                        &session,
-                        port,
-                        &session_token,
-                        &web_client_id,
-                        cmd,
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
+                let socket_dir = std::env::var("ZELLIJ_SOCKET_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/sanctel-zellij"));
+                let reserved = &app.state::<AppState>().zellij_reserved_sessions;
+                let window_name = allocate_session_for_zellij_tab(
+                    locks, reserved, &socket_dir, &base,
+                )
+                .map_err(|e| e.to_string())?;
+                // Chat tab's initial_command is written on the persistent
+                // WS in attach_tab_to_zellij, not via a transient WS here.
+                // A transient WS would pre-attach the session, and zellij
+                // closes the subsequent re-attach from the persistent WS
+                // prematurely (verified empirically — Normal close right
+                // after handshake). Holding the command until first attach
+                // keeps the session creation and command write on the
+                // same connection.
+                let _ = req.initial_command.as_deref();
                 window_name
             }
         };
@@ -465,23 +459,48 @@ fn allocate_session_for_tab<R: CommandRunner>(
 /// same `term-N` against the same Worktree. The WebSocket write done by
 /// the caller post-allocator is per-session (uniquely named at this point)
 /// and doesn't need additional serialisation.
-fn allocate_session_for_zellij_tab<R: CommandRunner>(
+fn allocate_session_for_zellij_tab(
     locks: &AllocationLocks,
-    zellij: &ZellijCli<R>,
+    reserved: &Mutex<std::collections::HashSet<String>>,
+    socket_dir: &std::path::Path,
     base: &str,
-    cwd: &str,
 ) -> Result<String, ZellijError> {
     let lock = locks.lock_for(base);
     let _guard = lock.lock();
+    // Sweep dead sockets first. `zellij list-sessions` and zellij's web
+    // server both hang indefinitely when stale session sockets are in
+    // the dir (they try to handshake with each one); see
+    // `cleanup_stale_zellij_sockets` docs.
+    cleanup_stale_zellij_sockets(socket_dir);
     let prefix = format!("{base}__");
-    let existing_suffixes: Vec<String> = zellij
-        .list_sessions()?
-        .into_iter()
+    // Two-source discovery:
+    //   (a) on-disk sockets — sessions that have been created (either by
+    //       a previous sanctel run's zellij-server processes that
+    //       outlived sanctel, or by the WS handler creating the session
+    //       on first attach).
+    //   (b) in-memory reservations — sessions sanctel allocated but
+    //       hasn't WS-attached yet, so no socket exists.
+    // Both reads happen INSIDE the per-base mutex so the union snapshot
+    // is atomic with the pick + insert below.
+    let on_disk = list_zellij_sessions_via_socket_dir(socket_dir);
+    let reserved_now = reserved.lock();
+    let existing_suffixes: Vec<String> = on_disk
+        .iter()
+        .chain(reserved_now.iter())
         .filter_map(|s| s.strip_prefix(&prefix).map(str::to_string))
         .collect();
+    drop(reserved_now);
     let window_name = allocate_window_name(&existing_suffixes);
     let session = format!("{base}__{window_name}");
-    zellij.new_session(&session, cwd, None)?;
+    // Note: we deliberately do NOT call `zellij attach --create-background`
+    // here. zellij closes the WS prematurely when a name is pre-created
+    // and then attached via WS; the WS handler's `spawn_session_if_needed`
+    // path is what zellij's own browser client uses, and what works.
+    // Verified empirically: pre-create → io_loop exits on Normal close;
+    // no pre-create → terminal renders. The reservation guards collision
+    // avoidance in place of the on-disk socket the pre-create used to
+    // leave behind.
+    reserved.lock().insert(session);
     Ok(window_name)
 }
 
@@ -509,6 +528,15 @@ fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
                     }
                     Backend::Zellij => {
                         let _ = ZellijCli::default().kill_session(&handle.session);
+                        // Drop the in-memory reservation in case this
+                        // tab was closed before its WS ever attached
+                        // (so the on-disk socket never appeared and
+                        // a later allocator would otherwise see the
+                        // name as taken forever).
+                        state
+                            .zellij_reserved_sessions
+                            .lock()
+                            .remove(&handle.session);
                     }
                 }
             }
@@ -1407,315 +1435,197 @@ mod tests {
 
     // ─── zellij allocator ────────────────────────────────────────────────
 
-    /// A zellij-shaped runner that maintains a session set in memory.
-    /// `list-sessions` returns the sorted set; `attach --create-background
-    /// <name>` adds (collision = "session already exists"); `kill-session
-    /// <name>` removes. Mirrors `TmuxStateRunner`'s shape so the zellij
-    /// allocator tests can reuse the same concurrency-stress pattern.
-    struct ZellijStateRunner {
-        sessions: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Build a fresh per-test socket dir under $TMPDIR with a unique name.
+    /// The allocator scans this path the same way it would scan
+    /// $ZELLIJ_SOCKET_DIR in production. Returns the dir's path.
+    fn fresh_test_socket_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        // Use `/tmp` directly rather than `env::temp_dir()` (which on
+        // macOS resolves to a long `/var/folders/...` path that overflows
+        // the 104-byte SUN_LEN limit once combined with our session
+        // names). Same reason production sanctel sets ZELLIJ_SOCKET_DIR
+        // to `/tmp/sanctel-zellij`.
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/sanctel-test-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("contract_version_1")).unwrap();
+        dir
     }
 
-    impl ZellijStateRunner {
-        fn new() -> Self {
-            ZellijStateRunner {
-                sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            }
-        }
-        fn clone_shared(&self) -> Self {
-            ZellijStateRunner {
-                sessions: Arc::clone(&self.sessions),
-            }
-        }
-        fn session_names(&self) -> Vec<String> {
-            self.sessions.lock().iter().cloned().collect()
-        }
-        fn seed(&self, names: &[&str]) {
-            let mut s = self.sessions.lock();
-            for n in names {
-                s.insert((*n).to_string());
-            }
-        }
+    /// Bind real Unix listening sockets in the test socket dir so they
+    /// (a) appear in `list_zellij_sessions_via_socket_dir` and (b) accept
+    /// `connect()` from `cleanup_stale_zellij_sockets` so the sweep
+    /// doesn't delete them. Returns the listeners so the caller keeps
+    /// them alive for the test duration; dropping them closes the
+    /// sockets (file remains on disk but connect would then refuse).
+    #[must_use = "caller must keep the listeners alive for the test"]
+    fn seed_socket_dir(
+        socket_dir: &std::path::Path,
+        names: &[&str],
+    ) -> Vec<std::os::unix::net::UnixListener> {
+        names
+            .iter()
+            .map(|name| {
+                let path = socket_dir.join("contract_version_1").join(name);
+                let _ = std::fs::remove_file(&path);
+                std::os::unix::net::UnixListener::bind(&path)
+                    .expect("bind test session socket")
+            })
+            .collect()
     }
 
-    impl CommandRunner for ZellijStateRunner {
-        fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
-            let sub = args
-                .iter()
-                .find(|a| matches!(**a, "list-sessions" | "kill-session"))
-                .copied()
-                .unwrap_or("");
-            match sub {
-                "list-sessions" => {
-                    let mut names: Vec<String> =
-                        self.sessions.lock().iter().cloned().collect();
-                    names.sort();
-                    if names.is_empty() {
-                        return Ok(CommandOutput {
-                            status: 1,
-                            stdout: vec![],
-                            stderr: b"No active zellij sessions found.\n".to_vec(),
-                        });
-                    }
-                    Ok(CommandOutput {
-                        status: 0,
-                        stdout: format!("{}\n", names.join("\n")).into_bytes(),
-                        stderr: vec![],
-                    })
-                }
-                "kill-session" => {
-                    let pos = args.iter().position(|a| *a == "kill-session").unwrap();
-                    let name = args.get(pos + 1).copied().unwrap_or("");
-                    self.sessions.lock().remove(name);
-                    Ok(CommandOutput {
-                        status: 0,
-                        stdout: vec![],
-                        stderr: vec![],
-                    })
-                }
-                _ => Ok(CommandOutput {
-                    status: 0,
-                    stdout: vec![],
-                    stderr: vec![],
-                }),
-            }
-        }
-
-        fn run_in_dir(
-            &self,
-            program: &str,
-            args: &[&str],
-            _cwd: &str,
-        ) -> std::io::Result<CommandOutput> {
-            // `new_session` invokes `zellij attach --create-background <name>`.
-            if args.contains(&"--create-background") {
-                let name = args.last().copied().unwrap_or("");
-                let mut sessions = self.sessions.lock();
-                if sessions.contains(name) {
-                    return Ok(CommandOutput {
-                        status: 1,
-                        stdout: vec![],
-                        stderr: format!("session already exists: {name}").into_bytes(),
-                    });
-                }
-                sessions.insert(name.to_string());
-                return Ok(CommandOutput {
-                    status: 0,
-                    stdout: vec![],
-                    stderr: vec![],
-                });
-            }
-            self.run(program, args)
-        }
-    }
-
-    /// N concurrent callers against the same Worktree base each land on
-    /// their OWN session, not on a shared one. Without the per-base mutex
-    /// (which the allocator inherits from the tmux version via
-    /// `AllocationLocks`), the cold-start path would see `list-sessions`
-    /// return empty for all callers and they would all pick `term-1`,
-    /// colliding on `new_session`. Per-tab session isolation is the
-    /// load-bearing invariant captured in ADR-0012.
+    /// N concurrent callers against the same base must produce N
+    /// distinct `term-N` names with no holes. Without the per-base mutex
+    /// + in-memory reservation set, two callers would scan the empty
+    /// dir, both pick `term-1`, and collide downstream. Reservation is
+    /// the source of truth because the allocator no longer pre-creates
+    /// the on-disk socket (pre-create caused zellij to close the WS on
+    /// re-attach — verified empirically).
     #[test]
     fn allocate_session_for_zellij_tab_serializes_concurrent_callers() {
         const N: usize = 12;
         let base = "sanctel_wt_race-test";
-        let cwd = "/tmp";
 
         let locks = Arc::new(AllocationLocks::default());
-        let runner = ZellijStateRunner::new();
+        let reserved = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let socket_dir = Arc::new(fresh_test_socket_dir("race"));
 
         let handles: Vec<_> = (0..N)
             .map(|_| {
-                let runner_clone = runner.clone_shared();
                 let locks = Arc::clone(&locks);
+                let reserved = Arc::clone(&reserved);
+                let socket_dir = Arc::clone(&socket_dir);
                 let base = base.to_string();
-                let cwd = cwd.to_string();
                 std::thread::spawn(move || {
-                    let zellij = ZellijCli::new(runner_clone);
-                    allocate_session_for_zellij_tab(&locks, &zellij, &base, &cwd)
+                    allocate_session_for_zellij_tab(&locks, &reserved, &socket_dir, &base)
                 })
             })
             .collect();
-
-        let sort_by_term_index = |v: &mut Vec<String>| {
-            v.sort_by_key(|s| {
-                s.rsplit("term-")
-                    .next()
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .expect("name ends in term-N")
-            });
-        };
 
         let mut got: Vec<String> = handles
             .into_iter()
             .map(|h| h.join().unwrap().expect("allocation must succeed"))
             .collect();
-        sort_by_term_index(&mut got);
+        got.sort_by_key(|s| {
+            s.rsplit("term-")
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .expect("name ends in term-N")
+        });
 
-        let expected_names: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
+        let expected: Vec<String> = (1..=N).map(|i| format!("term-{i}")).collect();
         assert_eq!(
-            got, expected_names,
+            got, expected,
             "N concurrent callers must produce N distinct term-N names with no holes"
         );
-
-        let mut sessions = runner.session_names();
-        sort_by_term_index(&mut sessions);
-        let expected_sessions: Vec<String> = (1..=N)
-            .map(|i| format!("{base}__term-{i}"))
-            .collect();
-        assert_eq!(sessions, expected_sessions);
     }
 
-    /// On a fresh zellij server, the allocator's `list_sessions()` call
-    /// hits the cold-start path (zellij exits non-zero with "No active
-    /// zellij sessions found."). `zellij_cli::list_sessions` translates
-    /// that to `Ok(Vec::new())`; the allocator must then pick `term-1`.
-    /// This is the very first chat-tab on a freshly started sanctel —
-    /// regression here breaks every "new chat" on a new install.
+    /// Cold start: empty socket dir, empty reservation set → first
+    /// allocation picks `term-1`. Regression here would break every new
+    /// terminal/chat tab on a fresh install.
     #[test]
     fn allocate_session_for_zellij_tab_picks_term_1_on_cold_start() {
         let locks = AllocationLocks::default();
-        let runner = ZellijStateRunner::new();
-        let zellij = ZellijCli::new(runner.clone_shared());
-        let next =
-            allocate_session_for_zellij_tab(&locks, &zellij, "sanctel_wt_a", "/tmp")
-                .unwrap();
+        let reserved = Mutex::new(std::collections::HashSet::new());
+        let socket_dir = fresh_test_socket_dir("cold");
+        let next = allocate_session_for_zellij_tab(
+            &locks,
+            &reserved,
+            &socket_dir,
+            "sanctel_wt_a",
+        )
+        .unwrap();
         assert_eq!(next, "term-1");
-        assert!(runner
-            .session_names()
-            .iter()
-            .any(|s| s == "sanctel_wt_a__term-1"));
+        assert!(reserved.lock().contains("sanctel_wt_a__term-1"));
     }
 
-    /// Allocator scan correctness on the zellij path: the next allocation
-    /// continues the monotonic `term-N` counter against the target base,
-    /// ignoring siblings on other Worktrees and any non-`term-N`-suffix
-    /// sessions left over from prior sanctel versions / external creates.
+    /// Allocator scan correctness on the disk source: when sockets from
+    /// previous sanctel runs (or surviving zellij-server processes) are
+    /// present in the dir, the allocator picks the next free `term-N`,
+    /// ignoring siblings on other Worktrees and any external sessions
+    /// that don't match our naming pattern.
     #[test]
     fn allocate_session_for_zellij_tab_scans_existing_zellij_sessions() {
         let locks = AllocationLocks::default();
-        let runner = ZellijStateRunner::new();
-        runner.seed(&[
-            "sanctel_wt_target__term-1",
-            "sanctel_wt_target__term-3",
-            "sanctel_wt_other__term-1",
-            // An external `zellij`-created session that doesn't match our
-            // naming pattern — must not perturb the counter.
-            "my-debug-session",
-        ]);
+        let reserved = Mutex::new(std::collections::HashSet::new());
+        let socket_dir = fresh_test_socket_dir("scan");
+        let _seeded = seed_socket_dir(
+            &socket_dir,
+            &[
+                "sanctel_wt_target__term-1",
+                "sanctel_wt_target__term-3",
+                "sanctel_wt_other__term-1",
+                // An external `zellij`-created session that doesn't match
+                // our naming pattern — must not perturb the counter.
+                "my-debug-session",
+            ],
+        );
 
-        let zellij = ZellijCli::new(runner.clone_shared());
-        let next =
-            allocate_session_for_zellij_tab(&locks, &zellij, "sanctel_wt_target", "/tmp")
-                .unwrap();
+        let next = allocate_session_for_zellij_tab(
+            &locks,
+            &reserved,
+            &socket_dir,
+            "sanctel_wt_target",
+        )
+        .unwrap();
         // Max term-N on target is 3 → next is term-4.
         assert_eq!(next, "term-4");
-        let sessions = runner.session_names();
-        assert!(sessions.contains(&"sanctel_wt_target__term-4".to_string()));
-        // Sibling Worktree's session is untouched.
-        assert!(sessions.contains(&"sanctel_wt_other__term-1".to_string()));
+        assert!(reserved.lock().contains("sanctel_wt_target__term-4"));
     }
 
-    /// Different Worktree bases don't serialize against each other on
-    /// the zellij path either: two callers against distinct bases both
-    /// get `term-1`. The per-base keying mirrors the tmux allocator's
-    /// behavior so two Worktrees can have parallel chat-tab spawns.
+    /// Reservation-set source: when a sibling allocation has already
+    /// claimed `term-1` but hasn't been WS-attached yet (so no socket
+    /// exists on disk), the next allocator must still pick `term-2`.
+    /// This is the case the pre-create-via-CLI flow used to cover via
+    /// the on-disk socket; the in-memory reservation replaces it.
+    #[test]
+    fn allocate_session_for_zellij_tab_skips_in_flight_reservations() {
+        let locks = AllocationLocks::default();
+        let reserved = Mutex::new(std::collections::HashSet::new());
+        reserved
+            .lock()
+            .insert("sanctel_wt_a__term-1".to_string());
+        let socket_dir = fresh_test_socket_dir("reservation");
+
+        let next = allocate_session_for_zellij_tab(
+            &locks,
+            &reserved,
+            &socket_dir,
+            "sanctel_wt_a",
+        )
+        .unwrap();
+        assert_eq!(next, "term-2");
+    }
+
+    /// Different Worktree bases don't serialize against each other: two
+    /// callers against distinct bases both get `term-1`. The per-base
+    /// mutex keys on the base, so parallel allocations across Worktrees
+    /// run concurrently.
     #[test]
     fn allocate_session_for_zellij_tab_does_not_serialize_distinct_worktrees() {
         let locks = AllocationLocks::default();
-        let runner = ZellijStateRunner::new();
-        let zellij_a = ZellijCli::new(runner.clone_shared());
-        let zellij_b = ZellijCli::new(runner.clone_shared());
-        let a =
-            allocate_session_for_zellij_tab(&locks, &zellij_a, "sanctel_wt_a", "/tmp")
-                .unwrap();
-        let b =
-            allocate_session_for_zellij_tab(&locks, &zellij_b, "sanctel_wt_b", "/tmp")
-                .unwrap();
+        let reserved = Mutex::new(std::collections::HashSet::new());
+        let socket_dir = fresh_test_socket_dir("distinct");
+        let a = allocate_session_for_zellij_tab(
+            &locks,
+            &reserved,
+            &socket_dir,
+            "sanctel_wt_a",
+        )
+        .unwrap();
+        let b = allocate_session_for_zellij_tab(
+            &locks,
+            &reserved,
+            &socket_dir,
+            "sanctel_wt_b",
+        )
+        .unwrap();
         assert_eq!(a, "term-1");
         assert_eq!(b, "term-1");
     }
 
-    /// The allocator never splices `initial_command` into zellij's argv —
-    /// `attach --create-background` has no CLI flag for it, and the
-    /// chat-tab command instead reaches the pane via the WS write that
-    /// `create_tab` does separately. `zellij_cli::new_session` already
-    /// pins the no-splice contract at its layer; this test pins it at the
-    /// allocator layer so a future contributor can't sneak it in here
-    /// either.
-    #[test]
-    fn allocate_session_for_zellij_tab_does_not_pass_initial_command_to_new_session() {
-        // Recording runner: pushes argv into an external Arc<Mutex<Vec>>
-        // so the assertions can read it back without touching ZellijCli's
-        // private `runner` field.
-        struct RecordingRunner {
-            seen: Arc<Mutex<Vec<Vec<String>>>>,
-        }
-        impl CommandRunner for RecordingRunner {
-            fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
-                self.seen
-                    .lock()
-                    .push(args.iter().map(|s| s.to_string()).collect());
-                if args.contains(&"list-sessions") {
-                    return Ok(CommandOutput {
-                        status: 1,
-                        stdout: vec![],
-                        stderr: b"No active zellij sessions found.\n".to_vec(),
-                    });
-                }
-                Ok(CommandOutput {
-                    status: 0,
-                    stdout: vec![],
-                    stderr: vec![],
-                })
-            }
-            fn run_in_dir(
-                &self,
-                _: &str,
-                args: &[&str],
-                _: &str,
-            ) -> std::io::Result<CommandOutput> {
-                self.seen
-                    .lock()
-                    .push(args.iter().map(|s| s.to_string()).collect());
-                Ok(CommandOutput {
-                    status: 0,
-                    stdout: vec![],
-                    stderr: vec![],
-                })
-            }
-        }
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let zellij = ZellijCli::new(RecordingRunner {
-            seen: Arc::clone(&seen),
-        });
-        let locks = AllocationLocks::default();
-        allocate_session_for_zellij_tab(&locks, &zellij, "sanctel_wt_x", "/tmp").unwrap();
-        let calls = seen.lock().clone();
-        // No call should carry a `claude` token (or any token resembling
-        // a chat command) — the allocator's signature doesn't accept
-        // initial_command, but a future contributor adding it must not
-        // silently splice without redesign.
-        for argv in &calls {
-            assert!(
-                !argv.iter().any(|a| a.contains("claude")),
-                "argv must not splice initial_command: {argv:?}"
-            );
-        }
-        // The `attach --create-background` argv must be exactly three
-        // positional tokens — same shape `zellij_cli::tests` pins.
-        let attach_call = calls
-            .iter()
-            .find(|a| a.iter().any(|t| t == "--create-background"))
-            .expect("allocator must invoke attach --create-background");
-        assert_eq!(
-            attach_call,
-            &vec![
-                "attach".to_string(),
-                "--create-background".to_string(),
-                "sanctel_wt_x__term-1".to_string(),
-            ],
-        );
-    }
 }

@@ -75,14 +75,14 @@ export function mount(
     installClipboard(term, { clipboard: options.clipboard });
   }
 
-  // Compute the initial viewport size from the container's actual dimensions
-  // before talking to Rust, so the PTY starts at the right size.
-  fit.fit();
-
   // Output channel: raw bytes from the PTY → xterm.write. xterm accepts
   // Uint8Array directly; Tauri's Vec<u8> arrives as a number[] over the
   // wire, so coerce to Uint8Array. No UTF-8 decoding here — xterm handles
   // it correctly (including partial multi-byte chunks).
+  //
+  // The channel is installed BEFORE terminal_attach is invoked so the
+  // initial screen dump (for chat tabs reattaching to a surviving zellij
+  // session) is never missed.
   const onOutput = new Channel<number[] | Uint8Array>();
   onOutput.onmessage = (data) => {
     const bytes = data instanceof Uint8Array ? data : Uint8Array.from(data);
@@ -121,25 +121,36 @@ export function mount(
   });
   resizeObserver.observe(container);
 
-  // Attach. Rust looks up worktreeId / windowName / initialCommand by this
-  // webview's label from the TabRecord that create_tab stored.
-  invoke("terminal_attach", {
-    cols: term.cols,
-    rows: term.rows,
-    onOutput,
-  }).catch((e) => {
-    const parsed = parseAttachError(e);
-    if (parsed.kind === "worktree-missing") {
-      renderBrokenTab(container, parsed.path);
-      onDataDisposable.dispose();
-      term.dispose();
-      return;
-    }
-    // Other failures (tmux missing, spawn errors) — render inline in the
-    // terminal so the user sees what went wrong. tmux-missing should not
-    // reach here in practice because React gates create_tab on the startup
-    // probe, but defensive surfacing is cheap.
-    term.write(`\r\n\x1b[31mterminal_attach failed: ${parsed.message}\x1b[0m\r\n`);
+  // Defer terminal_attach until the container has a real (non-trivial)
+  // size. During hydrate, sanctel creates webviews while content_rect is
+  // still (0,0,0,0) (React hasn't reported its layout yet), so the
+  // container is clamped to 1×1 and `fit.fit()` would yield 0/1 cols.
+  // Attaching at that size tells zellij the grid is degenerate, so on a
+  // surviving-session reattach the existing screen content gets emitted
+  // for that broken grid and the user sees blank until they tab away and
+  // back. Wait for the show_webview pass to apply real dimensions
+  // before talking to Rust.
+  waitForRealContainerSize(container, fit, term).then(() => {
+    invoke("terminal_attach", {
+      cols: term.cols,
+      rows: term.rows,
+      onOutput,
+    }).catch((e) => {
+      const parsed = parseAttachError(e);
+      if (parsed.kind === "worktree-missing") {
+        renderBrokenTab(container, parsed.path);
+        onDataDisposable.dispose();
+        term.dispose();
+        return;
+      }
+      // Other failures (tmux missing, spawn errors) — render inline in the
+      // terminal so the user sees what went wrong. tmux-missing should not
+      // reach here in practice because React gates create_tab on the startup
+      // probe, but defensive surfacing is cheap.
+      term.write(
+        `\r\n\x1b[31mterminal_attach failed: ${parsed.message}\x1b[0m\r\n`,
+      );
+    });
   });
 
   return {
@@ -236,6 +247,43 @@ function buttonCss(): string {
     "font-size: 13px",
     "cursor: pointer",
   ].join(";");
+}
+
+// Resolve when the container has a layout size large enough for a useful
+// xterm grid (≥ one cell each direction). Runs `fit.fit()` on every
+// candidate size change so `term.cols` / `term.rows` reflect the final
+// dimensions by the time the caller invokes `terminal_attach`. Returns
+// immediately if the container is already sized at call time.
+//
+// We observe via ResizeObserver rather than polling so the resolution
+// fires on the same animation frame as the host's layout commit.
+function waitForRealContainerSize(
+  container: HTMLElement,
+  fit: FitAddon,
+  term: Terminal,
+): Promise<void> {
+  const tryFit = (): boolean => {
+    const { width, height } = container.getBoundingClientRect();
+    if (width < 2 || height < 2) return false;
+    try {
+      fit.fit();
+    } catch {
+      return false;
+    }
+    return term.cols > 1 && term.rows > 1;
+  };
+
+  if (tryFit()) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const ro = new ResizeObserver(() => {
+      if (tryFit()) {
+        ro.disconnect();
+        resolve();
+      }
+    });
+    ro.observe(container);
+  });
 }
 
 // The webview's label IS the tabId by construction (see

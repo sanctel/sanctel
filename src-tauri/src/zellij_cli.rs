@@ -62,6 +62,98 @@ pub(crate) fn set_zellij_socket_dir(path: &Path) {
     std::env::set_var("ZELLIJ_SOCKET_DIR", path);
 }
 
+/// Connect-probe every session socket in `socket_dir` and delete the dead
+/// ones. A "dead" socket is a file whose owning process is gone — `connect`
+/// returns `ECONNREFUSED` immediately. Live sockets (server still listening)
+/// accept the connection and stay untouched.
+///
+/// Why this is needed: `zellij attach --create-background <new_name>`
+/// internally enumerates the socket dir (to decide whether `new_name` is a
+/// resurrectable EXITED session) and tries to handshake with each socket on
+/// the way. A dead socket from a previous sanctel crash makes the entire
+/// attach call hang indefinitely. Symptom matches upstream
+/// https://github.com/zellij-org/zellij/issues/2074 — the zellij CLI has no
+/// built-in stale-socket cleanup, so we do it ourselves.
+///
+/// Idempotent and safe to call before every allocation. Subdirectories
+/// (notably `web_server_bus`) are skipped.
+pub(crate) fn cleanup_stale_zellij_sockets(socket_dir: &Path) {
+    let Ok(version_dirs) = std::fs::read_dir(socket_dir) else {
+        return;
+    };
+    for version_entry in version_dirs.flatten() {
+        let version_path = version_entry.path();
+        if !version_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&version_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                continue;
+            }
+            let socket_path = entry.path();
+            // A stale unix socket refuses connection immediately; a live
+            // one accepts (or at worst stalls briefly on the handshake).
+            // We deliberately don't keep the stream open — closing right
+            // away is fine, the server treats it as a client disconnect.
+            if std::os::unix::net::UnixStream::connect(&socket_path).is_err() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        }
+    }
+}
+
+/// Enumerate zellij session names by scanning the socket directory directly.
+///
+/// `zellij list-sessions -s` is the official discovery API, but it hangs
+/// indefinitely when a stale session socket is present in the socket dir
+/// (zellij's CLI tries to handshake with each socket; dead processes never
+/// respond). That's a real-world condition after any sanctel crash, so the
+/// CLI path can't be the allocator's source of truth.
+///
+/// Layout (zellij 0.44.x):
+///   $ZELLIJ_SOCKET_DIR/contract_version_1/<session_name>     ← unix socket
+///   $ZELLIJ_SOCKET_DIR/contract_version_1/web_server_bus/    ← directory
+///
+/// We list `contract_version_1/` and treat every non-directory entry as a
+/// session name. Stale sockets from dead sessions look identical to live
+/// ones on disk; that's acceptable because `zellij attach --create-background
+/// <name>` is idempotent — picking a non-colliding name is what matters, not
+/// liveness.
+///
+/// Returns an empty vec if the socket dir or the version subdirectory
+/// doesn't exist yet (cold start).
+pub(crate) fn list_zellij_sessions_via_socket_dir(socket_dir: &Path) -> Vec<String> {
+    let Ok(version_dirs) = std::fs::read_dir(socket_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for version_entry in version_dirs.flatten() {
+        let version_path = version_entry.path();
+        if !version_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&version_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // Skip subdirectories like `web_server_bus`. Session entries are
+            // unix sockets (file_type().is_dir() == false).
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Errors surfaced from the zellij wrapper. Shape mirrors `TmuxError` —
 /// callers either retry (Race) or surface to the user (everything else).
 #[derive(Debug, Clone)]

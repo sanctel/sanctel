@@ -279,56 +279,6 @@ pub fn initial_command_bytes(command: &str) -> Vec<u8> {
     format!("{command}\n").into_bytes()
 }
 
-/// Binary-frame wrapper around [`initial_command_bytes`]. Pure so the wire
-/// shape is unit-testable without opening a real WebSocket.
-pub fn initial_command_frame(command: &str) -> Message {
-    encode_binary_frame(initial_command_bytes(command))
-}
-
-/// One-shot: open a transient WebSocket to the given session's terminal
-/// endpoint, send `initial_command_frame(command)`, and close. Used by the
-/// `allocate_session_for_zellij_tab` caller to start `claude` (or
-/// `claude --resume <id>`) in a session that `zellij_cli::new_session` just
-/// created empty — zellij has no CLI flag for "start session with command
-/// running", so the byte-stream over WebSocket is the equivalent of tmux's
-/// `new-session ... <cmd>` argv splice.
-///
-/// `session_token` is the cookie minted by `zellij_auth` against the
-/// supervised daemon; without it `zellij web`'s auth middleware would
-/// reject the WebSocket handshake with HTTP 401.
-///
-/// `web_client_id` is the id minted by `zellij_auth::register_client` —
-/// zellij's WS handlers look the client up in an in-process connection
-/// table by this id at handshake time and reject the upgrade with HTTP
-/// 400 if it's missing or unknown. One id per transient WS is the right
-/// shape: zellij's connection_table garbage-collects clients when the
-/// WS closes, so a fresh id per one-shot is cheaper than caching.
-///
-/// The transient WS intentionally doesn't reuse `mount`: writing one shot
-/// of bytes doesn't need an `on_output` channel or the per-connection I/O
-/// thread machinery, and we want the connection closed before the user's
-/// webview opens its own persistent WS at attach time.
-pub fn write_initial_command(
-    session_name: &str,
-    port: u16,
-    session_token: &str,
-    web_client_id: &str,
-    command: &str,
-) -> Result<(), ZellijWsError> {
-    let url = terminal_ws_url(port, session_name, web_client_id);
-    let req = build_ws_request(&url, session_token)?;
-    let (mut ws, _resp) =
-        tungstenite::connect(req).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
-    ws.send(initial_command_frame(command))
-        .map_err(|e| ZellijWsError::Send(e.to_string()))?;
-    ws.flush()
-        .map_err(|e| ZellijWsError::Send(e.to_string()))?;
-    // Best-effort close handshake; the daemon may have already buffered the
-    // bytes when we get here, so a closed-without-handshake socket is fine.
-    let _ = ws.close(None);
-    Ok(())
-}
-
 /// `ws://127.0.0.1:<port>/ws/terminal/<session>?web_client_id=<id>`. Pure
 /// so the URL shape is unit-testable without opening a real socket.
 /// The id is URL-encoded so a future zellij version that swaps the UUID
@@ -413,7 +363,8 @@ pub fn mount(
     let control_url = control_ws_url(port, web_client_id);
 
     // Connect order is load-bearing. **Control first, with its initial
-    // envelopes flushed BEFORE the terminal WS opens.**
+    // envelopes written directly to the socket BEFORE the terminal WS
+    // opens.**
     //
     // zellij's server registers the per-client control_tx in its
     // connection table on the FIRST envelope message received on
@@ -423,18 +374,35 @@ pub fn mount(
     // send is dropped silently and the subsequent pipeline stalls.
     // Verified empirically via the issue #29 audit: opening both
     // sockets in parallel produced clean WS closes within milliseconds
-    // (the symptom). Opening control first, priming it with
-    // `TerminalResize` + `TerminalMetrics`, then opening terminal
-    // produces a live render stream.
-    let control_ws = connect_with_session(&control_url, session_token)?;
-    let (control_tx, control_rx) = mpsc::channel::<Message>();
+    // (the symptom).
+    //
+    // Writing the initial envelopes via the mpsc → io_loop chain
+    // doesn't work either, because the io_loop thread hasn't been
+    // spawned yet when we open terminal; queued mpsc messages never
+    // reach the wire in time. The envelopes have to be written
+    // **directly to the WebSocket in blocking mode** before nonblocking
+    // is enabled and before terminal opens.
+    let req = build_ws_request(&control_url, session_token)?;
+    let (mut control_ws, _) =
+        tungstenite::connect(req).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
     let initial_size = SizeState::default();
     let initial_msgs = initial_size.to_messages(web_client_id)?;
     for msg in initial_msgs {
-        control_tx
+        control_ws
             .send(msg)
             .map_err(|e| ZellijWsError::Send(e.to_string()))?;
     }
+    // Flush to ensure bytes are actually on the wire before we open
+    // the terminal WS. tungstenite::send in blocking mode usually
+    // writes synchronously, but flush forces it explicitly.
+    control_ws
+        .flush()
+        .map_err(|e| ZellijWsError::Send(e.to_string()))?;
+    // Now switch to nonblocking for the io_loop's polling pattern.
+    if let MaybeTlsStream::Plain(s) = control_ws.get_ref() {
+        let _ = s.set_nonblocking(true);
+    }
+    let (control_tx, control_rx) = mpsc::channel::<Message>();
 
     let terminal_ws = connect_with_session(&terminal_url, session_token)?;
     let (terminal_tx, terminal_rx) = mpsc::channel::<Message>();
@@ -719,19 +687,18 @@ mod tests {
     /// or the daemon refusing the frame, both manual-acceptance regressions
     /// we'd rather catch in CI.
     #[test]
-    fn initial_command_frame_appends_newline_as_binary() {
-        let frame = initial_command_frame("claude --resume abc-123");
-        let bytes = decode_binary_frame(&frame).expect("must be binary");
-        assert_eq!(bytes, b"claude --resume abc-123\n");
+    fn initial_command_bytes_appends_newline() {
+        assert_eq!(
+            initial_command_bytes("claude --resume abc-123"),
+            b"claude --resume abc-123\n"
+        );
     }
 
     /// And the plain `claude` (no `--resume`) shape — the first-chat
     /// acceptance criterion path (no prior .jsonl for the Worktree).
     #[test]
-    fn initial_command_frame_handles_plain_claude() {
-        let frame = initial_command_frame("claude");
-        let bytes = decode_binary_frame(&frame).expect("must be binary");
-        assert_eq!(bytes, b"claude\n");
+    fn initial_command_bytes_handles_plain_claude() {
+        assert_eq!(initial_command_bytes("claude"), b"claude\n");
     }
 
     /// High-throughput byte path sanity check: a 10 MiB payload (the size

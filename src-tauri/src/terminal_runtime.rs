@@ -313,28 +313,25 @@ pub fn attach_tab_to_zellij(
     // failed downstream.
     check_worktree_exists(&params.worktree_path)?;
 
-    // Probe BEFORE the (idempotent) `new_session` call so we can tell a
-    // fresh recreation from a true reattach. has_session=true → the user's
-    // prior process (e.g., a still-running claude) is alive across the
-    // sanctel restart and we must NOT re-fire `initial_command` or claude
-    // would receive the literal command string as input on its stdin.
-    // has_session=false → the session was wiped externally and we need to
-    // re-bootstrap with the chat tab's persisted command.
-    let session_existed = zellij.has_session(&params.session)?;
-
-    // `attach --create-background` is idempotent on existing sessions (see
-    // zellij_cli module docs) — calling it on the reattach path is cheap
-    // and avoids a list-sessions probe before every attach. The defensive
-    // `SessionAlreadyExists` recovery covers the rare zellij resurrectable-
-    // session edge case.
-    match zellij.new_session(
-        &params.session,
-        &params.worktree_path,
-        params.initial_command.as_deref(),
-    ) {
-        Ok(()) | Err(ZellijError::SessionAlreadyExists(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
+    // Distinguish "fresh allocation" from "reattach to a session that
+    // already existed at sanctel startup". For fresh sessions we fire the
+    // chat tab's `initial_command`; for reattach we MUST NOT, or claude
+    // would receive the literal command string on its stdin.
+    //
+    // Source of truth: the on-disk socket file. The allocator skips
+    // pre-create (zellij closes the WS prematurely on re-attach to a
+    // pre-created session — verified empirically), so on first attach
+    // the socket doesn't exist yet → fresh. On a re-attach in the same
+    // sanctel run, the WS handler created the socket on the prior
+    // attach → exists → reattach. On a new sanctel run with a surviving
+    // zellij-server process from a previous run, the socket also
+    // exists → reattach (correctly skipping initial_command).
+    let session_existed = std::env::var("ZELLIJ_SOCKET_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|d| d.join("contract_version_1").join(&params.session).exists())
+        .unwrap_or(false);
+    let _ = &zellij;
 
     // Register a per-tab `web_client_id` with the daemon. zellij's WS
     // handlers (`/ws/terminal/<s>`, `/ws/control`) require this id as a
