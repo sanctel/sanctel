@@ -41,6 +41,11 @@ ENV PATH="/home/agent/.local/bin:/home/agent/.cargo/bin:$PATH"
 # `-sys` crates (dbus-sys, webkit2gtk-sys, libsoup-sys, atk-sys, ...) whose
 # build.rs scripts call pkg-config at check time and abort if the .pc files
 # are missing.
+#
+# tmux is installed in the same root block because the four
+# `_against_real_{tmux,zellij}` integration tests in src-tauri/ gate on
+# binary availability and silently skip when absent — without tmux + zellij
+# in CI, those tests pass-by-skipping rather than verifying anything.
 USER root
 RUN apt-get update && apt-get install -y \
   build-essential \
@@ -54,7 +59,30 @@ RUN apt-get update && apt-get install -y \
   libatk1.0-dev \
   libayatana-appindicator3-dev \
   librsvg2-dev \
+  tmux \
   && rm -rf /var/lib/apt/lists/*
+
+# Install zellij pinned to v0.44.3 (matches the maintainer's dev machine,
+# so CI and local behavior diverge only when the test catches the drift).
+# Prebuilt musl tarball — `cargo install zellij` recompiles from source
+# (~5min) and doesn't pin. Arch-detected via dpkg, matching the gh install
+# pattern above, so the image builds on both amd64 and arm64 hosts.
+# Release URLs (v0.44.3):
+#   amd64: https://github.com/zellij-org/zellij/releases/download/v0.44.3/zellij-x86_64-unknown-linux-musl.tar.gz
+#   arm64: https://github.com/zellij-org/zellij/releases/download/v0.44.3/zellij-aarch64-unknown-linux-musl.tar.gz
+ARG ZELLIJ_VERSION=v0.44.3
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) target="x86_64-unknown-linux-musl" ;; \
+    arm64) target="aarch64-unknown-linux-musl" ;; \
+    *) echo "unsupported arch for zellij install: $arch" >&2; exit 1 ;; \
+  esac; \
+  curl -fsSL "https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/zellij-${target}.tar.gz" -o /tmp/zellij.tar.gz; \
+  tar -xzf /tmp/zellij.tar.gz -C /usr/local/bin zellij; \
+  chmod +x /usr/local/bin/zellij; \
+  rm /tmp/zellij.tar.gz; \
+  zellij --version
 USER ${AGENT_UID}:${AGENT_GID}
 
 WORKDIR /home/agent

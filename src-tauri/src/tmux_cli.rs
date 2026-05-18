@@ -383,10 +383,13 @@ impl<R: CommandRunner> TmuxCli<R> {
     /// `tmux kill-session -t <session>`. Used by `close_tab` for
     /// terminal/chat tabs: each tab owns its own session
     /// (`sanctel_wt_<wt>__term-N`), so killing the session is the one-shot
-    /// cleanup. Idempotent on a session that doesn't exist — `tmux`'s
-    /// "can't find session" error is swallowed so reattach/cleanup paths
-    /// remain safe to call without first probing `has-session`. See
-    /// ADR-0012 / issue #15.
+    /// cleanup. Idempotent on a session that doesn't exist AND on a server
+    /// that's no longer running — `tmux`'s "can't find session" /
+    /// "no server running" errors are both swallowed so reattach/cleanup
+    /// paths remain safe to call without first probing `has-session`.
+    /// (Killing the last session in a server tears the server down, so a
+    /// repeated kill races into the no-server case.) See ADR-0012 /
+    /// issue #15.
     pub fn kill_session(&self, session: &str) -> Result<(), TmuxError> {
         let target = format!("={session}");
         let out = self.run(&["kill-session", "-t", &target])?;
@@ -394,7 +397,13 @@ impl<R: CommandRunner> TmuxCli<R> {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("can't find session") || stderr.contains("session not found") {
+        // "no server running on …" surfaces when killing the last session
+        // tore the server down on a prior call (or no server ever ran).
+        // Same idempotency contract as session-not-found: the target is gone.
+        if stderr.contains("can't find session")
+            || stderr.contains("session not found")
+            || stderr.contains("no server running")
+        {
             return Ok(());
         }
         Err(TmuxError::Command {
@@ -859,6 +868,22 @@ mod tests {
         // Must succeed — close_tab cleanups call this without a
         // has-session probe.
         cli.kill_session("nope").unwrap();
+    }
+
+    /// Killing the last session on a tmux server tears the server down.
+    /// A subsequent kill_session call against any name on that socket
+    /// surfaces "no server running on …" — same target-is-gone outcome
+    /// as session-not-found, so the idempotency contract must cover it
+    /// too. The `idempotent_attach_against_real_tmux` integration test
+    /// (real-tmux backend) hits this path on its second kill.
+    #[test]
+    fn kill_session_is_idempotent_when_server_is_gone() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["kill-session"]),
+            result: err("no server running on /tmp/tmux-1000/sanctel"),
+        }]);
+        let cli = TmuxCli::new("s", mock);
+        cli.kill_session("any").unwrap();
     }
 
     #[test]

@@ -164,9 +164,14 @@ impl<R: CommandRunner> ZellijCli<R> {
     }
 
     /// `zellij kill-session <name>`. Idempotent on a session that doesn't
-    /// exist — zellij's "No session named ... found." error is swallowed
+    /// exist — zellij's "No session named ... found." message is swallowed
     /// so `close_tab`-style cleanups are safe to call without a
     /// has-session probe first. Same contract as `tmux_cli::kill_session`.
+    ///
+    /// Zellij v0.44.3 prints the not-found message on **stdout**, not
+    /// stderr (verified against the upstream binary), so the membership
+    /// check scans both streams. Earlier zellij versions may emit on
+    /// stderr; supporting both keeps the contract version-tolerant.
     #[allow(dead_code)] // Wired up by slice 3 (`close_tab` zellij path).
     pub fn kill_session(&self, name: &str) -> Result<(), ZellijError> {
         let out = self
@@ -177,11 +182,14 @@ impl<R: CommandRunner> ZellijCli<R> {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("No session named")
-            || stderr.contains("not found")
-            || stderr.contains("no active zellij sessions")
-            || stderr.contains("No active zellij sessions")
-        {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let is_missing = |s: &str| {
+            s.contains("No session named")
+                || s.contains("not found")
+                || s.contains("no active zellij sessions")
+                || s.contains("No active zellij sessions")
+        };
+        if is_missing(&stderr) || is_missing(&stdout) {
             return Ok(());
         }
         Err(ZellijError::Command {
@@ -569,6 +577,25 @@ mod tests {
         cli.kill_session("nope").unwrap();
     }
 
+    /// Zellij v0.44.3 prints the "No session named X found." message on
+    /// **stdout**, not stderr, when killing a nonexistent session (verified
+    /// against the upstream 0.44.3 binary). The idempotency contract has
+    /// to scan both streams, otherwise close_tab on an already-killed
+    /// session surfaces a phantom Command error.
+    #[test]
+    fn kill_session_is_idempotent_when_missing_message_on_stdout() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["kill-session"]),
+            result: Ok(CommandOutput {
+                status: 1,
+                stdout: b"No session named \"nope\" found.\n".to_vec(),
+                stderr: vec![],
+            }),
+        }]);
+        let cli = ZellijCli::new(mock);
+        cli.kill_session("nope").unwrap();
+    }
+
     /// Anything that isn't the missing-session class surfaces as
     /// `Command` — e.g., a permission denial reading the session socket.
     #[test]
@@ -719,16 +746,23 @@ mod tests {
     ///
     /// Skips when zellij isn't installed (sandcastle CI doesn't ship it).
     /// On a zellij-bearing dev box this exercises the full session-per-tab
-    /// model end-to-end: spawn two sessions, write distinct bytes through
-    /// each (via `zellij action write-chars` — the CLI primitive that
-    /// targets a session by name), capture each session's screen (via
-    /// `zellij action dump-screen`), assert each capture contains only its
-    /// own marker.
+    /// model end-to-end: spawn two sessions, give each one a bash pane via
+    /// `zellij run`, write distinct bytes into each pane via
+    /// `zellij action write-chars -p terminal_1`, capture each pane's
+    /// screen via `zellij action dump-screen -p terminal_1 --path`,
+    /// assert each capture contains only its own marker.
     ///
-    /// The PRD calls for polling-with-timeout rather than a fixed sleep,
-    /// because shell-boot timing made the tmux equivalent flaky: the
-    /// `dump-screen` may run before the shell has booted enough to echo
-    /// the marker. The loop budgets 5s total at 50ms intervals.
+    /// CLI shape note (zellij 0.44.3): a `attach --create-background`
+    /// session has no panes until `zellij run` creates one. Then
+    /// write-chars / dump-screen MUST be targeted with `-p terminal_1`
+    /// — without `-p`, both actions resolve to "the focused pane" which
+    /// is undefined for a session with no attached client and silently
+    /// no-ops. `dump-screen`'s file output goes through `--path FILE`
+    /// (positional path was removed in the 0.44 series).
+    ///
+    /// Polling-with-timeout rather than a fixed sleep: shell-boot timing
+    /// made the tmux equivalent flaky on cold containers, so the same
+    /// shape applies here. 5s budget (100 × 50ms).
     #[test]
     fn two_tabs_in_same_worktree_have_independent_output_against_real_zellij() {
         if !zellij_available() {
@@ -744,9 +778,16 @@ mod tests {
         let session_a = format!("sanctel_wt_test-wt-{pid}__term-1");
         let session_b = format!("sanctel_wt_test-wt-{pid}__term-2");
 
-        // Belt-and-braces cleanup if a prior run leaked.
-        let _ = cli.kill_session(&session_a);
-        let _ = cli.kill_session(&session_b);
+        // `delete-session -f` (not just kill) so a resurrectable stale
+        // session from a prior failed run can't shadow the fresh one.
+        let cleanup = |s: &str| {
+            let _ = cli.kill_session(s);
+            let _ = std::process::Command::new("zellij")
+                .args(["delete-session", s, "-f"])
+                .output();
+        };
+        cleanup(&session_a);
+        cleanup(&session_b);
 
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         cli.new_session(&session_a, &cwd, None).expect("create A");
@@ -758,39 +799,53 @@ mod tests {
         assert!(cli.has_session(&session_a).unwrap());
         assert!(cli.has_session(&session_b).unwrap());
 
+        // Spawn a bash pane in each session. `zellij run` returns the
+        // new pane's id; we don't need the value (it's always
+        // `terminal_1` for the first run in a background-created
+        // session) but we wait for the command to complete so the pane
+        // exists before we write to it.
+        let run_bash = |session: &str| {
+            std::process::Command::new("zellij")
+                .args(["--session", session, "run", "--", "bash"])
+                .output()
+                .expect("zellij run");
+        };
+        run_bash(&session_a);
+        run_bash(&session_b);
+
         let marker_a = "SANCTEL_ZELLIJ_TAB_A_MARKER";
         let marker_b = "SANCTEL_ZELLIJ_TAB_B_MARKER";
 
-        // `zellij --session <name> action write-chars <chars>` writes
-        // chars into the session's focused pane as if typed. The trailing
-        // '\n' in the chars string is interpreted as Enter, which the
-        // shell uses to execute the echoed command. Each session has its
-        // own focused pane; pre-fix, sharing a session would have meant
-        // both writes targeting the same pane.
         let send = |session: &str, marker: &str| {
             let chars = format!("echo {marker}\n");
-            let _ = std::process::Command::new("zellij")
-                .args(["--session", session, "action", "write-chars", &chars])
+            std::process::Command::new("zellij")
+                .args([
+                    "--session",
+                    session,
+                    "action",
+                    "write-chars",
+                    "-p",
+                    "terminal_1",
+                    &chars,
+                ])
                 .output()
                 .expect("zellij action write-chars");
         };
         send(&session_a, marker_a);
         send(&session_b, marker_b);
 
-        // `zellij --session <name> action dump-screen <path>` writes the
-        // pane's current screen content to a file. We poll this rather
-        // than sleep-then-capture: the bytes may arrive at the pane
-        // before the shell has booted enough to echo them, in which case
-        // the first dump is empty and a later poll catches the echo.
         let dump = |session: &str| -> String {
             let path = std::env::temp_dir().join(format!("{session}-{pid}.dump"));
             let _ = std::fs::remove_file(&path);
-            let _ = std::process::Command::new("zellij")
+            std::process::Command::new("zellij")
                 .args([
                     "--session",
                     session,
                     "action",
                     "dump-screen",
+                    "-p",
+                    "terminal_1",
+                    "--path",
                     path.to_str().unwrap(),
                 ])
                 .output()
@@ -798,8 +853,6 @@ mod tests {
             std::fs::read_to_string(&path).unwrap_or_default()
         };
 
-        // 100 iterations * 50ms = 5s budget. Exit early once both markers
-        // are visible so the happy path is fast.
         let mut cap_a = String::new();
         let mut cap_b = String::new();
         for _ in 0..100 {
@@ -831,9 +884,10 @@ mod tests {
             "tab B must NOT see A's marker. cap_b: {cap_b}",
         );
 
-        // Cleanup.
-        let _ = cli.kill_session(&session_a);
-        let _ = cli.kill_session(&session_b);
+        // Full cleanup — kill, then delete-session so resurrection
+        // state doesn't accumulate across re-runs.
+        cleanup(&session_a);
+        cleanup(&session_b);
     }
 
     fn zellij_available() -> bool {

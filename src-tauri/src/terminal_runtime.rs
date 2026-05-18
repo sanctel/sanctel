@@ -473,7 +473,13 @@ mod tests {
             return;
         }
 
-        let socket = format!("sanctel-test-{}", std::process::id());
+        // Per-test socket suffix: cargo runs tests in parallel within one
+        // binary, and the sibling integration test
+        // (`two_tabs_in_same_worktree_have_independent_output_against_real_tmux`)
+        // uses overlapping session names. Distinct sockets give each test
+        // its own tmux server so concurrent kill_session calls don't pull
+        // the carpet out from under the other test.
+        let socket = format!("sanctel-test-{}-idem", std::process::id());
         let tmux = TmuxCli::new(socket.clone(), crate::tmux_cli::RealCommandRunner);
 
         // Belt-and-braces cleanup if a prior run leaked.
@@ -551,7 +557,10 @@ mod tests {
             return;
         }
 
-        let socket = format!("sanctel-test-{}", std::process::id());
+        // Distinct socket suffix so this test runs against its own tmux
+        // server in parallel with `idempotent_attach_against_real_tmux`
+        // (see that test for the full rationale).
+        let socket = format!("sanctel-test-{}-indep", std::process::id());
         let tmux = TmuxCli::new(socket.clone(), crate::tmux_cli::RealCommandRunner);
         let _ = Command::new("tmux")
             .args(["-L", &socket, "kill-server"])
@@ -578,6 +587,13 @@ mod tests {
         // has its OWN `curw` (the bug fix), writing to A lands only in
         // A's pane. Pre-fix, A and B would have been one shared session
         // with one `curw`, so both writes would target the same pane.
+        //
+        // Target shape note: bare `<session>`, not `=<session>`. tmux 3.3a
+        // (bookworm's default) rejects `=name` as a pane-target lookup
+        // ("can't find pane: =name") because `=` resolves to a session
+        // and send-keys needs a pane. The unique PID-suffixed socket
+        // means no ambiguity — bare name resolves to this session's
+        // active pane unambiguously.
         let marker_a = "SANCTEL_TAB_A_MARKER";
         let marker_b = "SANCTEL_TAB_B_MARKER";
         let _ = Command::new("tmux")
@@ -586,7 +602,7 @@ mod tests {
                 &socket,
                 "send-keys",
                 "-t",
-                &format!("={session_a}"),
+                session_a,
                 &format!("printf '{marker_a}\\n'"),
                 "Enter",
             ])
@@ -598,35 +614,36 @@ mod tests {
                 &socket,
                 "send-keys",
                 "-t",
-                &format!("={session_b}"),
+                session_b,
                 &format!("printf '{marker_b}\\n'"),
                 "Enter",
             ])
             .output()
             .unwrap();
 
-        // Give the shells a beat to render. Short sleep is fine — the
-        // assertion is structural (which session saw which marker), not
-        // timing-sensitive.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
         let capture = |session: &str| -> String {
             let out = Command::new("tmux")
-                .args([
-                    "-L",
-                    &socket,
-                    "capture-pane",
-                    "-t",
-                    &format!("={session}"),
-                    "-p",
-                ])
+                .args(["-L", &socket, "capture-pane", "-t", session, "-p"])
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
 
-        let cap_a = capture(session_a);
-        let cap_b = capture(session_b);
+        // Poll-with-timeout rather than a fixed sleep. Shell boot on a
+        // cold container can exceed any short fixed sleep; the
+        // assertion is structural (which session saw which marker), so
+        // it's safe to wait until both markers actually appear. Mirrors
+        // the zellij analog's polling shape. 5s budget.
+        let mut cap_a = String::new();
+        let mut cap_b = String::new();
+        for _ in 0..100 {
+            cap_a = capture(session_a);
+            cap_b = capture(session_b);
+            if cap_a.contains(marker_a) && cap_b.contains(marker_b) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         // The post-fix invariant: each session sees only its own marker.
         // A failing assertion here means the sessions are sharing state —
