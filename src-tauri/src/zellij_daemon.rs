@@ -1,33 +1,39 @@
 // ───────────────────────────────────────────────────────────────────────────
 // zellij_daemon — supervises the `zellij web --start --port <free-port>`
-// child process for the spike backend (issue #16, slice 1 / issue #17).
+// child process for the spike backend (issue #16, slice 1 / issue #17), plus
+// the cookie-auth flow that `zellij web` requires (issue #23).
 //
 // Lifecycle:
-//   1. `ZellijDaemon::start(launcher)` picks a free loopback TCP port,
-//      synchronously spawns the daemon once (so a missing binary is
-//      observed at startup, not asynchronously), and hands ownership of
-//      the child to a supervisor thread.
+//   1. `ZellijDaemon::start(launcher, authenticator)` picks a free loopback
+//      TCP port, synchronously spawns the daemon, runs the authenticator's
+//      mint-token + login exchange against the daemon, and hands ownership
+//      of the child + auth state to a supervisor thread.
 //   2. The supervisor polls `try_wait` every 50ms while watching a
 //      shutdown channel. On child exit (crash, external `pkill`,
-//      anything) the supervisor sleeps a backoff and respawns; the
-//      backoff caps at the issue's 2-second acceptance criterion.
+//      anything) the supervisor sleeps a backoff, respawns, and re-runs
+//      the authenticator against the fresh daemon — the session_token
+//      from the dead process is invalidated, so any subsequent
+//      WebSocket open must use the freshly-minted one.
 //   3. `shutdown()` (also called by `Drop`) signals the supervisor
-//      through the channel; the supervisor kills the live child and
-//      returns. This is the path that fires when Tauri tears down
-//      AppState at app exit.
+//      through the channel; the supervisor kills the live child,
+//      revokes the auth token best-effort, and returns.
 //
-// Abstractions for testability: the `Launcher` and `ChildProc` traits let
-// unit tests script the lifecycle without spawning a real zellij. The real
-// implementations (`RealLauncher`, `RealChild`) are thin wrappers over
-// `std::process::{Command, Child}`.
+// Auth state is shared through `Arc<Mutex<String>>` so the rest of the
+// codebase (zellij_ws::mount, zellij_ws::write_initial_command) can read
+// the *current* session_token at connection time without worrying about
+// whether a respawn has happened in the meantime.
 // ───────────────────────────────────────────────────────────────────────────
 
+use std::fmt;
 use std::io;
 use std::net::TcpListener;
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use crate::zellij_auth::{self, TokenPair, ZellijAuthError};
 
 /// Ceiling on the restart backoff. Issue #17 requires the supervisor to
 /// restart the daemon within ~2 seconds when it dies externally; capping
@@ -38,6 +44,46 @@ pub const BACKOFF_CAP: Duration = Duration::from_millis(2000);
 /// notice a crash quickly (well under the 2s acceptance criterion) and
 /// large enough to keep idle CPU negligible.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Fixed sanctel auth token name. Deterministic per machine so re-runs
+/// replace rather than accumulate entries in `zellij web --list-tokens`.
+/// One sanctel instance per user is assumed; two concurrent instances
+/// would still share the same token (auth tokens are per-machine, not
+/// per-process — the session_token is what's per-process).
+pub const DEFAULT_TOKEN_NAME: &str = "sanctel";
+
+/// Errors the daemon's start path can surface. `Io` wraps the existing
+/// spawn failures; the new variants surface auth-flow failures so the
+/// setup-screen message can name the specific failure mode rather than
+/// dumping an opaque HTTP 401 into the tab.
+#[derive(Debug)]
+pub enum ZellijDaemonError {
+    Io(io::Error),
+    Auth(ZellijAuthError),
+}
+
+impl fmt::Display for ZellijDaemonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ZellijDaemonError::Io(e) => write!(f, "zellij daemon: {e}"),
+            ZellijDaemonError::Auth(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ZellijDaemonError {}
+
+impl From<io::Error> for ZellijDaemonError {
+    fn from(e: io::Error) -> Self {
+        ZellijDaemonError::Io(e)
+    }
+}
+
+impl From<ZellijAuthError> for ZellijDaemonError {
+    fn from(e: ZellijAuthError) -> Self {
+        ZellijDaemonError::Auth(e)
+    }
+}
 
 /// Exponential backoff schedule: 100ms, 200ms, 400ms, 800ms, 1600ms, then
 /// `BACKOFF_CAP` for every attempt after that. Pure function so tests can
@@ -77,6 +123,18 @@ pub trait ChildProc: Send {
     fn kill(&mut self) -> io::Result<()>;
 }
 
+/// The auth flow as a trait so tests don't need to spawn `zellij web` to
+/// drive the supervisor — production uses `RealAuthenticator` which
+/// shells out to `zellij web --create-token` + POSTs the login exchange.
+pub trait Authenticator: Send + 'static {
+    /// Mint + login against the daemon listening on `port`. Returns a
+    /// freshly-issued (token_name, session_token) pair.
+    fn authenticate(&self, port: u16) -> Result<TokenPair, ZellijAuthError>;
+    /// Best-effort revoke at shutdown. Failures are swallowed by the caller
+    /// (Drop path doesn't have a place to surface errors).
+    fn revoke(&self, token_name: &str);
+}
+
 /// Production launcher: shells out to `zellij web --start --port <port>`.
 pub struct RealLauncher;
 
@@ -86,6 +144,29 @@ impl Launcher for RealLauncher {
             .args(["web", "--start", "--port", &port.to_string()])
             .spawn()?;
         Ok(Box::new(RealChild(child)))
+    }
+}
+
+/// Production authenticator: shells out to `zellij web --create-token` and
+/// POSTs the login exchange. See `zellij_auth` for the wire-shape details.
+pub struct RealAuthenticator {
+    pub token_name: String,
+}
+
+impl Default for RealAuthenticator {
+    fn default() -> Self {
+        RealAuthenticator {
+            token_name: DEFAULT_TOKEN_NAME.into(),
+        }
+    }
+}
+
+impl Authenticator for RealAuthenticator {
+    fn authenticate(&self, port: u16) -> Result<TokenPair, ZellijAuthError> {
+        zellij_auth::authenticate(port, &self.token_name)
+    }
+    fn revoke(&self, token_name: &str) {
+        zellij_auth::revoke_token(token_name);
     }
 }
 
@@ -118,44 +199,67 @@ impl ChildProc for RealChild {
 /// alive for the duration of the daemon's lifetime; drop it (or call
 /// `shutdown`) to tear the daemon down.
 pub struct ZellijDaemon {
-    // The picked loopback port. Consumed by `zellij_ws` in slice 3+ to
-    // open WebSocket connections to the running daemon; the field is
-    // already wired through here so the supervisor and the future ws
-    // client agree on a single source of truth. Marked dead_code for
-    // the slice-1 build where only the daemon supervision contract is
-    // exercised.
-    #[allow(dead_code)]
     port: u16,
     shutdown_tx: Option<Sender<()>>,
     supervisor: Option<JoinHandle<()>>,
+    /// Current session_token cookie value, refreshed on every (re)auth by
+    /// the supervisor. Cloned by `zellij_ws` callers at WebSocket-open
+    /// time so a freshly-restarted daemon's cookie reaches new mounts
+    /// without any extra plumbing.
+    session_token: Arc<Mutex<String>>,
 }
 
 impl ZellijDaemon {
-    /// Pick a free port, spawn the daemon once synchronously, and hand the
-    /// child to a supervisor thread. Returns immediately on spawn success;
-    /// returns an error if the initial spawn fails (zellij not on PATH,
-    /// port couldn't be bound, etc.). Subsequent crashes are handled by
-    /// the supervisor and are NOT surfaced through this Result.
-    pub fn start<L: Launcher>(launcher: L) -> io::Result<Self> {
+    /// Pick a free port, spawn the daemon once synchronously, authenticate
+    /// against it, and hand the child + auth state to a supervisor thread.
+    /// Returns immediately on success; returns an error if the initial
+    /// spawn fails OR if the auth flow against the freshly-started daemon
+    /// fails (so a setup-screen surfaces the failure rather than letting
+    /// `terminal_attach` hit an opaque 401 per tab).
+    pub fn start<L: Launcher, A: Authenticator>(
+        launcher: L,
+        authenticator: A,
+    ) -> Result<Self, ZellijDaemonError> {
         let port = find_free_loopback_port()?;
         let initial = launcher.launch(port)?;
+        let pair = authenticator.authenticate(port)?;
+        let session_token = Arc::new(Mutex::new(pair.session_token));
+        let token_name = pair.token_name;
+        let session_token_for_supervisor = Arc::clone(&session_token);
         let (tx, rx) = mpsc::channel();
         let supervisor = thread::spawn(move || {
-            supervisor_loop(launcher, port, initial, rx);
+            supervisor_loop(
+                launcher,
+                authenticator,
+                port,
+                initial,
+                session_token_for_supervisor,
+                token_name,
+                rx,
+            );
         });
         Ok(ZellijDaemon {
             port,
             shutdown_tx: Some(tx),
             supervisor: Some(supervisor),
+            session_token,
         })
     }
 
     /// The port the daemon was started on. Stable for the daemon's
-    /// lifetime — respawns reuse it so `zellij_ws` clients (slice 3+) can
-    /// keep their connection target.
-    #[allow(dead_code)]
+    /// lifetime — respawns reuse it so `zellij_ws` clients can keep their
+    /// connection target.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Snapshot of the current session_token cookie. Callers should grab
+    /// this immediately before opening a WebSocket; if the daemon respawns
+    /// between snapshot and connect, the connect will fail with 401 and
+    /// the user (or frontend) re-triggers an attach, which picks up the
+    /// fresh token.
+    pub fn session_token(&self) -> String {
+        self.session_token.lock().unwrap().clone()
     }
 
     /// Tell the supervisor to kill the current child and exit. Idempotent;
@@ -173,9 +277,10 @@ impl ZellijDaemon {
 impl Drop for ZellijDaemon {
     fn drop(&mut self) {
         // AppState owns the daemon; when Tauri tears down state at app
-        // exit, this Drop fires and kills the zellij web process. That's
-        // the path acceptance criterion #3 calls out ("On clean sanctel
-        // shutdown, the spawned `zellij web` process is terminated").
+        // exit, this Drop fires and kills the zellij web process. The
+        // supervisor's exit branch handles the token revoke before
+        // returning, so by the time shutdown() resolves the revoke has
+        // already run (or been attempted).
         self.shutdown();
     }
 }
@@ -183,10 +288,13 @@ impl Drop for ZellijDaemon {
 /// The supervisor's body. Owns the launcher (so respawns are possible),
 /// the port (stable across respawns), the currently-live child, and the
 /// shutdown channel. Returns only when shutdown is signaled.
-fn supervisor_loop<L: Launcher>(
+fn supervisor_loop<L: Launcher, A: Authenticator>(
     launcher: L,
+    authenticator: A,
     port: u16,
     initial_child: Box<dyn ChildProc>,
+    session_token: Arc<Mutex<String>>,
+    token_name: String,
     shutdown_rx: Receiver<()>,
 ) {
     let mut child = initial_child;
@@ -202,6 +310,9 @@ fn supervisor_loop<L: Launcher>(
             }
             WatchOutcome::Shutdown => {
                 let _ = child.kill();
+                // Best-effort revoke before returning. Failure is silent
+                // because Drop has no place to surface it.
+                authenticator.revoke(&token_name);
                 return;
             }
         }
@@ -211,6 +322,7 @@ fn supervisor_loop<L: Launcher>(
         // immediately rather than running an unwanted respawn.
         let delay = next_backoff(attempt);
         if shutdown_rx.recv_timeout(delay).is_ok() {
+            authenticator.revoke(&token_name);
             return;
         }
         attempt = attempt.saturating_add(1);
@@ -223,6 +335,22 @@ fn supervisor_loop<L: Launcher>(
             Ok(new_child) => {
                 child = new_child;
                 attempt = 0; // healthy spawn — reset the schedule
+                // Re-authenticate against the fresh daemon — the old
+                // session_token died with the previous process. If auth
+                // fails (e.g., the daemon crashed mid-restart) the loop
+                // falls back through backoff and tries again, which is
+                // the same shape we use for spawn failures.
+                match authenticator.authenticate(port) {
+                    Ok(pair) => {
+                        *session_token.lock().unwrap() = pair.session_token;
+                    }
+                    Err(_) => {
+                        // Treat as a degenerate exit: kill the child and
+                        // loop back through backoff.
+                        let _ = child.kill();
+                        child = Box::new(ZombieChild);
+                    }
+                }
             }
             Err(_) => {
                 // Substitute a zombie placeholder so the next loop iteration
@@ -273,7 +401,7 @@ impl ChildProc for ZombieChild {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex as StdMutex;
     use std::time::Instant;
 
     /// 100ms, 200ms, 400ms, 800ms, 1600ms, then capped at 2000ms forever.
@@ -311,14 +439,14 @@ mod tests {
     /// supervisor performed.
     struct MockLauncher {
         launches: Arc<AtomicUsize>,
-        live_handles: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+        live_handles: Arc<StdMutex<Vec<Arc<AtomicBool>>>>,
     }
 
     impl MockLauncher {
         fn new() -> Self {
             MockLauncher {
                 launches: Arc::new(AtomicUsize::new(0)),
-                live_handles: Arc::new(Mutex::new(Vec::new())),
+                live_handles: Arc::new(StdMutex::new(Vec::new())),
             }
         }
     }
@@ -327,7 +455,7 @@ mod tests {
     /// observes the "external kill" condition. Free function (not a method
     /// on MockLauncher) because the launcher is moved into
     /// `ZellijDaemon::start` and the tests hold the handles Arc separately.
-    fn kill_latest(handles: &Mutex<Vec<Arc<AtomicBool>>>) {
+    fn kill_latest(handles: &StdMutex<Vec<Arc<AtomicBool>>>) {
         if let Some(h) = handles.lock().unwrap().last() {
             h.store(false, Ordering::SeqCst);
         }
@@ -360,36 +488,150 @@ mod tests {
         }
     }
 
+    /// In-memory authenticator. Records every authenticate / revoke call so
+    /// tests can assert "auth ran once per (re)launch" and "revoke ran on
+    /// clean shutdown". Returns a synthetic token shaped like
+    /// `session-<N>` where N is the call ordinal — so tests can also
+    /// assert the daemon's `session_token()` advanced after a respawn.
+    struct CountingAuth {
+        auth_calls: Arc<AtomicUsize>,
+        revoke_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingAuth {
+        fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let auth_calls = Arc::new(AtomicUsize::new(0));
+            let revoke_calls = Arc::new(AtomicUsize::new(0));
+            (
+                CountingAuth {
+                    auth_calls: Arc::clone(&auth_calls),
+                    revoke_calls: Arc::clone(&revoke_calls),
+                },
+                auth_calls,
+                revoke_calls,
+            )
+        }
+    }
+
+    impl Authenticator for CountingAuth {
+        fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
+            let n = self.auth_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(TokenPair {
+                token_name: "test-token".into(),
+                session_token: format!("session-{n}"),
+            })
+        }
+        fn revoke(&self, _token_name: &str) {
+            self.revoke_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A no-op authenticator used by tests that don't care about auth
+    /// (the existing shutdown / drop / backoff schedule tests).
+    struct NoopAuth;
+    impl Authenticator for NoopAuth {
+        fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
+            Ok(TokenPair {
+                token_name: "test-token".into(),
+                session_token: "session-noop".into(),
+            })
+        }
+        fn revoke(&self, _token_name: &str) {}
+    }
+
     /// `ZellijDaemon::start` must spawn the daemon exactly once
     /// synchronously and return a handle whose `port()` is the picked
-    /// loopback port. The single spawn matches acceptance criterion #2.
+    /// loopback port. Auth runs exactly once on start.
     #[test]
-    fn start_spawns_daemon_once_synchronously() {
+    fn start_spawns_daemon_once_synchronously_and_authenticates() {
         let launcher = MockLauncher::new();
         let launch_count = Arc::clone(&launcher.launches);
-        let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
+        let (auth, auth_calls, _revoke_calls) = CountingAuth::new();
+        let daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
         assert!(daemon.port() > 0);
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        // Initial token is observable via the accessor.
+        assert_eq!(daemon.session_token(), "session-1");
         drop(daemon);
+    }
+
+    /// Auth failure on initial start is a hard error (not a silent retry).
+    /// This is the path the setup-screen catches when `zellij web` is
+    /// installed but the daemon crashed between spawn and our login POST.
+    #[test]
+    fn start_surfaces_initial_auth_failure() {
+        struct FailingAuth;
+        impl Authenticator for FailingAuth {
+            fn authenticate(&self, _port: u16) -> Result<TokenPair, ZellijAuthError> {
+                Err(ZellijAuthError::TokenMintFailed {
+                    stderr: "synthetic".into(),
+                })
+            }
+            fn revoke(&self, _: &str) {}
+        }
+        let launcher = MockLauncher::new();
+        match ZellijDaemon::start(launcher, FailingAuth) {
+            Err(ZellijDaemonError::Auth(ZellijAuthError::TokenMintFailed { .. })) => {}
+            Err(other) => panic!("expected Auth(TokenMintFailed), got {other:?}"),
+            Ok(_) => panic!("expected Auth(TokenMintFailed), got Ok(daemon)"),
+        }
     }
 
     /// External-kill recovery: simulate `pkill -f 'zellij web'` by
     /// flipping the alive flag, then observe the supervisor spawn a
-    /// replacement within the BACKOFF_CAP window (acceptance criterion
-    /// #5: "supervisor restarts it within ~2 seconds").
+    /// replacement AND re-authenticate against the fresh daemon. The new
+    /// session_token replaces the old one in the Arc<Mutex<String>>.
+    #[test]
+    fn supervisor_reauthenticates_on_external_kill() {
+        let launcher = MockLauncher::new();
+        let launches = Arc::clone(&launcher.launches);
+        let handles = Arc::clone(&launcher.live_handles);
+        let (auth, auth_calls, _revoke_calls) = CountingAuth::new();
+        let daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(daemon.session_token(), "session-1");
+
+        kill_latest(&handles);
+
+        // Wait for the supervisor to respawn AND re-authenticate. Both
+        // counts must reach 2 within the acceptance window.
+        let start = Instant::now();
+        loop {
+            if launches.load(Ordering::SeqCst) >= 2 && auth_calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            if start.elapsed() > Duration::from_millis(1500) {
+                panic!(
+                    "respawn/reauth did not happen: launches={}, auth_calls={}",
+                    launches.load(Ordering::SeqCst),
+                    auth_calls.load(Ordering::SeqCst),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // session_token advanced — proves the daemon-state mutex is wired
+        // to the supervisor's auth path. A regression that updated some
+        // *other* string (e.g., a copy) would still see "session-1".
+        assert_eq!(daemon.session_token(), "session-2");
+        drop(daemon);
+    }
+
+    /// External-kill recovery (legacy contract): supervisor restarts within
+    /// the `BACKOFF_CAP` window. Kept as a separate assertion so a
+    /// regression on the timing path is distinguishable from a regression
+    /// on the auth path.
     #[test]
     fn supervisor_restarts_on_external_kill_within_cap() {
         let launcher = MockLauncher::new();
         let launches = Arc::clone(&launcher.launches);
         let handles = Arc::clone(&launcher.live_handles);
-        let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
+        let daemon = ZellijDaemon::start(launcher, NoopAuth).expect("start succeeds");
         assert_eq!(launches.load(Ordering::SeqCst), 1);
 
         kill_latest(&handles);
 
-        // First respawn fires after a ~100ms backoff. Allow generous
-        // headroom; we're asserting "within the acceptance window", not
-        // a tight bound. Cap is 2s; we wait up to 1s here.
         let start = Instant::now();
         while launches.load(Ordering::SeqCst) < 2 {
             if start.elapsed() > Duration::from_millis(1000) {
@@ -404,42 +646,45 @@ mod tests {
     }
 
     /// `shutdown()` must stop the supervisor so subsequent crashes don't
-    /// trigger respawns. Without this, Drop wouldn't be a clean teardown
-    /// and ghost daemons would survive sanctel quit.
+    /// trigger respawns, AND fire the revoke best-effort so the user's
+    /// `zellij web --list-tokens` doesn't accumulate sanctel entries.
     #[test]
-    fn shutdown_stops_supervisor_and_no_further_respawns() {
+    fn shutdown_stops_supervisor_and_revokes_token() {
         let launcher = MockLauncher::new();
         let launches = Arc::clone(&launcher.launches);
         let handles = Arc::clone(&launcher.live_handles);
-        let mut daemon = ZellijDaemon::start(launcher).expect("start succeeds");
+        let (auth, _auth_calls, revoke_calls) = CountingAuth::new();
+        let mut daemon = ZellijDaemon::start(launcher, auth).expect("start succeeds");
 
         daemon.shutdown();
         let after_shutdown = launches.load(Ordering::SeqCst);
+        assert_eq!(
+            revoke_calls.load(Ordering::SeqCst),
+            1,
+            "shutdown must run revoke exactly once",
+        );
 
         // Try to provoke a respawn by killing the (now-already-dead)
         // latest child. If the supervisor is still running, it would
-        // observe this and spawn again. Wait a generous window covering
-        // the longest possible initial backoff to confirm it doesn't.
+        // observe this and spawn again. Wait a window covering the
+        // initial backoff to confirm it doesn't.
         kill_latest(&handles);
         thread::sleep(Duration::from_millis(300));
         assert_eq!(launches.load(Ordering::SeqCst), after_shutdown);
     }
 
     /// Repeated-kill stress: five back-to-back external kills, each timed
-    /// for a respawn within `BACKOFF_CAP`. The single-kill test above
-    /// proves the first recovery; this one proves the recovery loop
-    /// doesn't degrade under sustained pressure (the spike's criterion #7
-    /// asks specifically for the supervisor to survive ongoing crashes,
-    /// not just one). A regression that, e.g., dropped the `attempt = 0`
-    /// reset on a healthy spawn would surface here as exponential blow-out
-    /// past the cap on the fifth iteration.
+    /// for a respawn within `BACKOFF_CAP`. The single-kill test proves the
+    /// first recovery; this one proves the recovery loop doesn't degrade
+    /// under sustained pressure (the spike's criterion #7 asks for the
+    /// supervisor to survive ongoing crashes).
     #[test]
     fn supervisor_recovers_from_repeated_external_kills() {
         const KILLS: usize = 5;
         let launcher = MockLauncher::new();
         let launches = Arc::clone(&launcher.launches);
         let handles = Arc::clone(&launcher.live_handles);
-        let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
+        let daemon = ZellijDaemon::start(launcher, NoopAuth).expect("start succeeds");
 
         for n in 1..=KILLS {
             let before = launches.load(Ordering::SeqCst);
@@ -462,14 +707,13 @@ mod tests {
 
     /// Drop is a path the rest of the codebase relies on (AppState owns
     /// the daemon; Tauri shutdown drops AppState). It must call shutdown,
-    /// joining the supervisor before the test thread exits — otherwise
-    /// the supervisor would leak across tests in the same process.
+    /// joining the supervisor before the test thread exits.
     #[test]
     fn drop_kills_supervisor() {
         let launcher = MockLauncher::new();
         let launches = Arc::clone(&launcher.launches);
         let handles = Arc::clone(&launcher.live_handles);
-        let daemon = ZellijDaemon::start(launcher).expect("start succeeds");
+        let daemon = ZellijDaemon::start(launcher, NoopAuth).expect("start succeeds");
         let after_start = launches.load(Ordering::SeqCst);
         drop(daemon);
         kill_latest(&handles);

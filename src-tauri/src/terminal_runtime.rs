@@ -297,6 +297,7 @@ pub fn attach_tab_to_tmux(
 pub fn attach_tab_to_zellij(
     zellij: &ZellijCli,
     daemon_port: u16,
+    session_token: &str,
     params: AttachParams,
     on_output: Channel<Vec<u8>>,
 ) -> Result<TerminalHandle, AttachError> {
@@ -328,7 +329,7 @@ pub fn attach_tab_to_zellij(
         Err(e) => return Err(e.into()),
     }
 
-    let ws = zellij_ws::mount(&params.session, daemon_port, on_output)?;
+    let ws = zellij_ws::mount(&params.session, daemon_port, session_token, on_output)?;
     // Tell zellij what size to render at. The frontend would otherwise
     // see zellij's default pane dimensions until the first user-driven
     // resize, which is jarring.

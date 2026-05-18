@@ -34,6 +34,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::handshake::client::Request;
+use tungstenite::http::HeaderValue;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -166,20 +169,24 @@ pub fn initial_command_frame(command: &str) -> Message {
 /// running", so the byte-stream over WebSocket is the equivalent of tmux's
 /// `new-session ... <cmd>` argv splice.
 ///
+/// `session_token` is the cookie minted by `zellij_auth` against the
+/// supervised daemon; without it `zellij web`'s auth middleware would
+/// reject the WebSocket handshake with HTTP 401 (see issue #23).
+///
 /// The transient WS intentionally doesn't reuse `mount`: writing one shot
 /// of bytes doesn't need an `on_output` channel or the per-connection I/O
 /// thread machinery, and we want the connection closed before the user's
-/// webview opens its own persistent WS at attach time (zellij correctly
-/// handles multiple WS clients per session, but minimising overlap keeps
-/// the failure mode boring).
+/// webview opens its own persistent WS at attach time.
 pub fn write_initial_command(
     session_name: &str,
     port: u16,
+    session_token: &str,
     command: &str,
 ) -> Result<(), ZellijWsError> {
     let url = format!("ws://127.0.0.1:{port}/ws/terminal/{session_name}");
+    let req = build_ws_request(&url, session_token)?;
     let (mut ws, _resp) =
-        tungstenite::connect(&url).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
+        tungstenite::connect(req).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
     ws.send(initial_command_frame(command))
         .map_err(|e| ZellijWsError::Send(e.to_string()))?;
     ws.flush()
@@ -190,21 +197,43 @@ pub fn write_initial_command(
     Ok(())
 }
 
+/// Build a tungstenite client request for `url` carrying a
+/// `Cookie: session_token=<value>` header. zellij web's auth middleware
+/// reads that cookie to authorize the handshake; without it every
+/// handshake answers HTTP 401 (issue #23).
+///
+/// Public so the cookie-injection contract is unit-testable without
+/// opening a real WebSocket.
+pub fn build_ws_request(url: &str, session_token: &str) -> Result<Request, ZellijWsError> {
+    let mut req = url
+        .into_client_request()
+        .map_err(|e| ZellijWsError::Connect(e.to_string()))?;
+    let cookie = format!("session_token={session_token}");
+    let value = HeaderValue::from_str(&cookie)
+        .map_err(|e| ZellijWsError::Connect(format!("invalid cookie value: {e}")))?;
+    req.headers_mut().insert("Cookie", value);
+    Ok(req)
+}
+
 /// Open the two WebSocket connections for one attached tab and start the
 /// I/O threads. Binary frames from `/ws/terminal/<session>` are forwarded
 /// to `on_output`; bytes pushed through the returned handle's
 /// `write_bytes` flow back the other way. The control endpoint carries
 /// resize / set-config messages.
+///
+/// `session_token` is the cookie minted by `zellij_auth` — see
+/// `build_ws_request` for the auth-middleware contract.
 pub fn mount(
     session_name: &str,
     port: u16,
+    session_token: &str,
     on_output: Channel<Vec<u8>>,
 ) -> Result<ZellijWsHandle, ZellijWsError> {
     let terminal_url = format!("ws://127.0.0.1:{port}/ws/terminal/{session_name}");
     let control_url = format!("ws://127.0.0.1:{port}/ws/control");
 
-    let terminal_ws = connect_plain(&terminal_url)?;
-    let control_ws = connect_plain(&control_url)?;
+    let terminal_ws = connect_with_session(&terminal_url, session_token)?;
+    let control_ws = connect_with_session(&control_url, session_token)?;
 
     let (terminal_tx, terminal_rx) = mpsc::channel::<Message>();
     let (control_tx, control_rx) = mpsc::channel::<Message>();
@@ -229,9 +258,13 @@ pub fn mount(
     Ok(ZellijWsHandle { terminal_tx, control_tx })
 }
 
-fn connect_plain(url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ZellijWsError> {
+fn connect_with_session(
+    url: &str,
+    session_token: &str,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ZellijWsError> {
+    let req = build_ws_request(url, session_token)?;
     let (ws, _resp) =
-        tungstenite::connect(url).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
+        tungstenite::connect(req).map_err(|e| ZellijWsError::Connect(e.to_string()))?;
     if let MaybeTlsStream::Plain(s) = ws.get_ref() {
         let _ = s.set_nonblocking(true);
     }
@@ -406,5 +439,31 @@ mod tests {
         assert!(decode_binary_frame(&Message::Text("hi".into())).is_none());
         assert!(decode_binary_frame(&Message::Ping(vec![].into())).is_none());
         assert!(decode_binary_frame(&Message::Pong(vec![].into())).is_none());
+    }
+
+    /// `build_ws_request` must put the session_token cookie on every
+    /// request. zellij web's auth middleware (issue #23) reads `Cookie:
+    /// session_token=<value>` to authorize the handshake; a regression
+    /// that dropped the cookie would re-introduce HTTP 401 across every
+    /// terminal tab on the zellij backend.
+    #[test]
+    fn build_ws_request_carries_session_token_cookie() {
+        let req = build_ws_request("ws://127.0.0.1:9123/ws/terminal/foo", "test-session-token")
+            .expect("request builds");
+        let cookie = req
+            .headers()
+            .get("Cookie")
+            .expect("Cookie header must be present");
+        assert_eq!(cookie.to_str().unwrap(), "session_token=test-session-token");
+    }
+
+    /// Same cookie shape applies to the control endpoint — both URLs hit
+    /// the same auth middleware so both must carry the cookie.
+    #[test]
+    fn build_ws_request_carries_cookie_on_control_endpoint_too() {
+        let req = build_ws_request("ws://127.0.0.1:9123/ws/control", "abc-123")
+            .expect("request builds");
+        let cookie = req.headers().get("Cookie").expect("Cookie present");
+        assert_eq!(cookie.to_str().unwrap(), "session_token=abc-123");
     }
 }
