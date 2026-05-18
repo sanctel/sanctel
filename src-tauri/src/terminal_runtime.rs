@@ -278,13 +278,22 @@ pub fn attach_tab_to_tmux(
     })
 }
 
-/// Spike slice 3 (issue #19) — zellij analog of [`attach_tab_to_tmux`].
-/// Ensures the named session exists via `zellij attach --create-background`,
-/// opens the two WebSocket connections (terminal + control) to the
-/// supervised `zellij web` daemon, sends an initial resize, and returns a
-/// handle whose `write_bytes` / `resize` route through the WS pair. Caller
+/// Zellij analog of [`attach_tab_to_tmux`]. Ensures the named session
+/// exists via `zellij attach --create-background`, opens the two
+/// WebSocket connections (terminal + control) to the supervised
+/// `zellij web` daemon, sends an initial resize, and returns a handle
+/// whose `write_bytes` / `resize` route through the WS pair. Caller
 /// signature matches the tmux side so the dispatcher in lib.rs is one
 /// match arm.
+///
+/// If the session was missing at probe time (e.g., the user ran
+/// `zellij kill-all-sessions` externally between sanctel runs), the chat
+/// tab's persisted `initial_command` (typically
+/// `claude --resume <agentSessionId>`) is written into the new pane via
+/// the persistent WS so claude can rehydrate from its on-disk transcript.
+/// On a true reattach (session still alive across sanctel restart) the
+/// initial_command is suppressed — re-firing it would feed the literal
+/// command string into the running process's stdin.
 pub fn attach_tab_to_zellij(
     zellij: &ZellijCli,
     daemon_port: u16,
@@ -295,6 +304,15 @@ pub fn attach_tab_to_zellij(
     // UI is the same wire contract regardless of which backend would have
     // failed downstream.
     check_worktree_exists(&params.worktree_path)?;
+
+    // Probe BEFORE the (idempotent) `new_session` call so we can tell a
+    // fresh recreation from a true reattach. has_session=true → the user's
+    // prior process (e.g., a still-running claude) is alive across the
+    // sanctel restart and we must NOT re-fire `initial_command` or claude
+    // would receive the literal command string as input on its stdin.
+    // has_session=false → the session was wiped externally and we need to
+    // re-bootstrap with the chat tab's persisted command.
+    let session_existed = zellij.has_session(&params.session)?;
 
     // `attach --create-background` is idempotent on existing sessions (see
     // zellij_cli module docs) — calling it on the reattach path is cheap
@@ -315,6 +333,18 @@ pub fn attach_tab_to_zellij(
     // see zellij's default pane dimensions until the first user-driven
     // resize, which is jarring.
     let _ = ws.resize(params.cols, params.rows);
+
+    // The session was missing when we probed, so `new_session` just
+    // created an empty shell. Fire the chat tab's persisted command so
+    // claude can rehydrate from its on-disk transcript. When the session
+    // pre-existed (true reattach), skip — the prior process is still
+    // running and re-firing would feed the command into its stdin.
+    if !session_existed {
+        if let Some(cmd) = params.initial_command.as_deref() {
+            ws.write_bytes(zellij_ws::initial_command_bytes(cmd))
+                .map_err(|e| AttachError::Other(e.to_string()))?;
+        }
+    }
 
     Ok(TerminalHandle {
         inner: TerminalHandleInner::Zellij { ws },
