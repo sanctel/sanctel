@@ -47,6 +47,16 @@ impl Backend {
             _ => Backend::Tmux,
         }
     }
+
+    /// Stable, lowercase identifier used on the wire (Tauri event payloads,
+    /// command responses). Matches the accepted `SANCTEL_BACKEND` env values
+    /// so the frontend can switch on the same strings the user types.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Tmux => "tmux",
+            Backend::Zellij => "zellij",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -90,5 +100,13 @@ mod tests {
         assert_eq!(Backend::from_env_value(Some("zellij ")), Backend::Zellij);
         assert_eq!(Backend::from_env_value(Some("  zellij  ")), Backend::Zellij);
         assert_eq!(Backend::from_env_value(Some("\tzellij\n")), Backend::Zellij);
+    }
+
+    /// The wire name must round-trip with the env value the user types —
+    /// the frontend setup screen (issue #27) keys its copy off it.
+    #[test]
+    fn name_matches_env_value() {
+        assert_eq!(Backend::Tmux.name(), "tmux");
+        assert_eq!(Backend::Zellij.name(), "zellij");
     }
 }

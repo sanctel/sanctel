@@ -27,7 +27,7 @@ import { useTmuxStatus } from "./tmuxStatusStore";
 
 function markTmuxAvailable() {
   useTmuxStatus.setState({
-    status: { available: true, version: "tmux 3.4", error: null },
+    status: { backend: "tmux", available: true, version: "tmux 3.4", error: null },
     loaded: true,
   });
 }
@@ -318,7 +318,7 @@ describe("tabStore mutations persist", () => {
 
   it("newChatTab throws tmux-missing when the probe says tmux is unavailable", async () => {
     useTmuxStatus.setState({
-      status: { available: false, version: null, error: "missing" },
+      status: { backend: "tmux", available: false, version: null, error: "missing" },
       loaded: true,
     });
 
