@@ -29,6 +29,7 @@
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -64,52 +65,116 @@ impl std::fmt::Display for ZellijWsError {
 
 impl std::error::Error for ZellijWsError {}
 
-/// JSON-tagged-enum control messages exchanged on `/ws/control`. Mirrors the
-/// shape used by zellij's `web_client/control_message.rs` — internally
-/// tagged on a `type` discriminator, snake_case variants. Only the two
-/// variants this slice actually emits are modeled; the read side accepts
-/// unknown variants via `serde(other)` would be nice but isn't necessary
-/// here (we don't act on inbound control messages in slice 3).
+/// Outbound payloads on `/ws/control`. Wire shape mirrors zellij's
+/// `WebClientToWebServerControlMessagePayload` enum (internally tagged on
+/// `type`, PascalCase variant names — `#[serde(tag = "type")]` with no
+/// `rename_all` matches zellij's Rust idents byte-for-byte). The inner
+/// fields stay snake_case via Rust naming.
+///
+/// Verified against `zellij-client/src/web_client/control_message.rs`
+/// and `zellij-client/assets/websockets.js` (issue #29 audit).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ControlMessage {
-    /// Tells zellij the embedded terminal is now `rows`x`cols`. Sent on
-    /// every xterm.js resize event so the PTY pane size matches.
+#[serde(tag = "type")]
+pub enum ControlPayload {
+    /// Grid dimensions in character cells. Server uses this to size the
+    /// PTY. Sent on connect and on every xterm resize.
     TerminalResize { rows: u16, cols: u16 },
-    /// Pushes a config blob to zellij at attach time. The body is opaque
-    /// to sanctel — we treat it as a string so the field is forward-compat
-    /// with whatever shape zellij accepts.
-    SetConfig { config: String },
+    /// Pixel-precise display geometry. Zellij forwards these to apps that
+    /// query screen size via CSI 14t / 16t / OSC 11. Sent immediately
+    /// after TerminalResize on connect and on resize, mirroring zellij's
+    /// own client.
+    TerminalMetrics {
+        cell_pixel_width: u32,
+        cell_pixel_height: u32,
+        text_area_pixel_width: u32,
+        text_area_pixel_height: u32,
+    },
 }
 
-impl ControlMessage {
-    /// Serialize to the JSON string that goes on the wire as a text frame.
+/// Outer envelope wrapping every control message sanctel sends. Mirrors
+/// zellij's `WebClientToWebServerControlMessage`. The `web_client_id`
+/// field is what triggers zellij's server-side `add_client_control_tx`
+/// on first receipt — without an envelope, the message fails JSON
+/// validation server-side and the connection eventually closes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlEnvelope {
+    pub web_client_id: String,
+    pub payload: ControlPayload,
+}
+
+impl ControlEnvelope {
+    /// Build an envelope wrapping `payload` with the given client id. Pure
+    /// so the wire shape is unit-testable.
+    pub fn new(web_client_id: &str, payload: ControlPayload) -> Self {
+        Self {
+            web_client_id: web_client_id.to_string(),
+            payload,
+        }
+    }
+
+    /// Serialize to the JSON text frame that goes on the wire.
     pub fn encode(&self) -> Result<String, ZellijWsError> {
         serde_json::to_string(self).map_err(|e| ZellijWsError::Encode(e.to_string()))
     }
-
-    /// Parse a text frame received from `/ws/control`. Used by tests pinning
-    /// the round-trip; production code in slice 3 only sends control
-    /// messages — inbound control frames are ignored.
-    #[allow(dead_code)]
-    pub fn decode(s: &str) -> Result<Self, ZellijWsError> {
-        serde_json::from_str(s).map_err(|e| ZellijWsError::Encode(e.to_string()))
-    }
 }
 
-/// Wrap raw PTY bytes for the `/ws/terminal/<session>` endpoint. Pure
-/// function so the binary-frame contract is unit-testable without a real
-/// WebSocket.
+/// Inbound messages from `/ws/control`. Mirrors zellij's
+/// `WebServerToWebClientControlMessage`. We only act on
+/// `QueryTerminalSize` (re-emit a size update); the rest are accepted
+/// silently so unknown future variants don't break the WS read loop.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum ServerControlMessage {
+    /// Zellij asks the client for current grid + pixel dimensions. We
+    /// respond with the latest `TerminalResize` + `TerminalMetrics`.
+    QueryTerminalSize,
+    /// Theme / font / cursor config. Sanctel doesn't apply these (xterm
+    /// is styled by the webview), so this is informational.
+    SetConfig(serde_json::Value),
+    Log { #[allow(dead_code)] lines: Vec<String> },
+    LogError { #[allow(dead_code)] lines: Vec<String> },
+    SwitchedSession { #[allow(dead_code)] new_session_name: String },
+    /// Forward-compat: any variant we don't yet model. Keeps the read
+    /// loop alive across zellij version bumps that introduce new message
+    /// types.
+    #[serde(other)]
+    Other,
+}
+
+/// Default cell pixel dimensions used when the frontend hasn't reported
+/// real measurements yet. 7×14 is a common monospace cell on a 1× display
+/// at the font sizes terminal apps typically use. The values are only
+/// load-bearing for OSC-11 / CSI-14t queries (screen size in pixels);
+/// the grid dimensions in `TerminalResize` are what actually drive the
+/// PTY size. Refined when xterm emits a real resize event.
+const DEFAULT_CELL_PIXEL_WIDTH: u32 = 7;
+const DEFAULT_CELL_PIXEL_HEIGHT: u32 = 14;
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_COLS: u16 = 80;
+
+/// Wrap raw PTY bytes for outbound on `/ws/terminal/<session>`. We send
+/// as `Message::Binary` rather than `Message::Text` because keystrokes
+/// from xterm.js can include non-UTF-8 byte sequences (binary pastes,
+/// raw escape codes) and `Message::Text` would force a UTF-8
+/// validation that those payloads would fail. zellij's terminal-WS
+/// handler accepts both Binary and Text inbound and routes both
+/// through the same `parse_stdin` helper, so binary outbound is the
+/// safer choice.
 pub fn encode_binary_frame(bytes: Vec<u8>) -> Message {
     Message::Binary(bytes.into())
 }
 
-/// Extract bytes from an inbound `/ws/terminal/<session>` frame. Returns
-/// None for non-binary frames (text, ping/pong, close, etc.) — the data
-/// path is binary-only by design (no UTF-8 transcoding on PTY output).
+/// Extract PTY output bytes from an inbound `/ws/terminal/<session>`
+/// frame. **zellij sends terminal output as `Message::Text` frames**
+/// (verified empirically via the issue #29 audit — sanctel's earlier
+/// binary-only acceptance was the load-bearing data-path failure
+/// behind the closed-channel symptom). Accepts both text and binary so
+/// a future zellij version that switches frame types doesn't silently
+/// stop forwarding output again.
 pub fn decode_binary_frame(msg: &Message) -> Option<Vec<u8>> {
     match msg {
         Message::Binary(b) => Some(b.to_vec()),
+        Message::Text(t) => Some(t.as_bytes().to_vec()),
         _ => None,
     }
 }
@@ -121,8 +186,55 @@ pub fn decode_binary_frame(msg: &Message) -> Option<Vec<u8>> {
 /// the I/O threads sleep up to a few ms between iterations and we don't
 /// want to block the caller for that.
 pub struct ZellijWsHandle {
+    web_client_id: String,
     terminal_tx: Sender<Message>,
     control_tx: Sender<Message>,
+    /// Last known grid + cell dimensions. Updated on `resize()` and read
+    /// by the control inbound handler when responding to
+    /// `QueryTerminalSize`. Shared with the io_loop thread.
+    last_size: Arc<Mutex<SizeState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SizeState {
+    rows: u16,
+    cols: u16,
+    cell_pixel_width: u32,
+    cell_pixel_height: u32,
+}
+
+impl SizeState {
+    fn default() -> Self {
+        Self {
+            rows: DEFAULT_ROWS,
+            cols: DEFAULT_COLS,
+            cell_pixel_width: DEFAULT_CELL_PIXEL_WIDTH,
+            cell_pixel_height: DEFAULT_CELL_PIXEL_HEIGHT,
+        }
+    }
+
+    fn to_messages(&self, web_client_id: &str) -> Result<[Message; 2], ZellijWsError> {
+        let resize = ControlEnvelope::new(
+            web_client_id,
+            ControlPayload::TerminalResize {
+                rows: self.rows,
+                cols: self.cols,
+            },
+        );
+        let metrics = ControlEnvelope::new(
+            web_client_id,
+            ControlPayload::TerminalMetrics {
+                cell_pixel_width: self.cell_pixel_width,
+                cell_pixel_height: self.cell_pixel_height,
+                text_area_pixel_width: u32::from(self.cols) * self.cell_pixel_width,
+                text_area_pixel_height: u32::from(self.rows) * self.cell_pixel_height,
+            },
+        );
+        Ok([
+            Message::Text(resize.encode()?.into()),
+            Message::Text(metrics.encode()?.into()),
+        ])
+    }
 }
 
 impl ZellijWsHandle {
@@ -134,13 +246,25 @@ impl ZellijWsHandle {
             .map_err(|e| ZellijWsError::Send(e.to_string()))
     }
 
-    /// Notify zellij that the pane is now `cols`x`rows`. Goes out as a text
-    /// frame with a `TerminalResize` JSON body on the control endpoint.
+    /// Notify zellij that the pane is now `cols`×`rows`. Sends BOTH a
+    /// `TerminalResize` and a `TerminalMetrics` envelope on the control
+    /// endpoint, mirroring zellij's own client (see
+    /// `zellij-client/assets/websockets.js::sendSizeUpdate`). Sending only
+    /// `TerminalResize` leaves stale pixel dimensions cached in zellij;
+    /// apps querying screen size via CSI 14t / 16t / OSC 11 then get
+    /// outdated answers.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), ZellijWsError> {
-        let msg = ControlMessage::TerminalResize { rows, cols };
-        self.control_tx
-            .send(Message::Text(msg.encode()?.into()))
-            .map_err(|e| ZellijWsError::Send(e.to_string()))
+        let mut size = self.last_size.lock().unwrap();
+        size.rows = rows;
+        size.cols = cols;
+        let msgs = size.to_messages(&self.web_client_id)?;
+        drop(size);
+        for msg in msgs {
+            self.control_tx
+                .send(msg)
+                .map_err(|e| ZellijWsError::Send(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -288,11 +412,34 @@ pub fn mount(
     let terminal_url = terminal_ws_url(port, session_name, web_client_id);
     let control_url = control_ws_url(port, web_client_id);
 
-    let terminal_ws = connect_with_session(&terminal_url, session_token)?;
+    // Connect order is load-bearing. **Control first, with its initial
+    // envelopes flushed BEFORE the terminal WS opens.**
+    //
+    // zellij's server registers the per-client control_tx in its
+    // connection table on the FIRST envelope message received on
+    // `/ws/control`. The listener thread spawned by `handle_ws_terminal`
+    // calls `send_control(SwitchedSession{...})` shortly after
+    // attachment completes; if control_tx isn't registered yet, that
+    // send is dropped silently and the subsequent pipeline stalls.
+    // Verified empirically via the issue #29 audit: opening both
+    // sockets in parallel produced clean WS closes within milliseconds
+    // (the symptom). Opening control first, priming it with
+    // `TerminalResize` + `TerminalMetrics`, then opening terminal
+    // produces a live render stream.
     let control_ws = connect_with_session(&control_url, session_token)?;
-
-    let (terminal_tx, terminal_rx) = mpsc::channel::<Message>();
     let (control_tx, control_rx) = mpsc::channel::<Message>();
+    let initial_size = SizeState::default();
+    let initial_msgs = initial_size.to_messages(web_client_id)?;
+    for msg in initial_msgs {
+        control_tx
+            .send(msg)
+            .map_err(|e| ZellijWsError::Send(e.to_string()))?;
+    }
+
+    let terminal_ws = connect_with_session(&terminal_url, session_token)?;
+    let (terminal_tx, terminal_rx) = mpsc::channel::<Message>();
+
+    let last_size = Arc::new(Mutex::new(initial_size));
 
     thread::spawn(move || {
         io_loop(terminal_ws, terminal_rx, move |msg| {
@@ -303,15 +450,41 @@ pub fn mount(
             }
         });
     });
+
+    // Control inbound dispatcher: parse incoming text frames as
+    // `ServerControlMessage` and respond to `QueryTerminalSize` with the
+    // latest cached size. All other variants are accepted silently —
+    // dropping unknown variants on the floor is forward-compatible with
+    // zellij version bumps that add new server→client messages.
+    let control_tx_for_inbound = control_tx.clone();
+    let web_client_id_for_inbound = web_client_id.to_string();
+    let last_size_for_inbound = last_size.clone();
     thread::spawn(move || {
-        io_loop(control_ws, control_rx, |_| {
-            // Inbound control messages are ignored in this slice. Future
-            // slices may want to dispatch on them (e.g., daemon-side
-            // notifications about session state changes).
+        io_loop(control_ws, control_rx, move |msg| {
+            let Message::Text(text) = msg else {
+                return;
+            };
+            let parsed: Result<ServerControlMessage, _> = serde_json::from_str(&text);
+            if let Ok(ServerControlMessage::QueryTerminalSize) = parsed {
+                let size = *last_size_for_inbound.lock().unwrap();
+                let Ok(reply_msgs) = size.to_messages(&web_client_id_for_inbound) else {
+                    return;
+                };
+                for reply in reply_msgs {
+                    if control_tx_for_inbound.send(reply).is_err() {
+                        return;
+                    }
+                }
+            }
         });
     });
 
-    Ok(ZellijWsHandle { terminal_tx, control_tx })
+    Ok(ZellijWsHandle {
+        web_client_id: web_client_id.to_string(),
+        terminal_tx,
+        control_tx,
+        last_size,
+    })
 }
 
 fn connect_with_session(
@@ -378,47 +551,142 @@ fn io_loop(
 mod tests {
     use super::*;
 
-    /// `TerminalResize` round-trips through serde_json. The JSON shape is
-    /// the wire contract with zellij web's `/ws/control` endpoint — a
-    /// silent change to the tag name or field names would land here as a
-    /// failing assertion before it reached a manual acceptance run.
+    /// Outbound `TerminalResize` envelope matches zellij's wire shape
+    /// byte-for-byte. Pinned against the format `{web_client_id, payload:
+    /// {type: "TerminalResize", rows, cols}}` — the PascalCase tag,
+    /// outer envelope, and `payload`-keyed wrapping are all load-bearing
+    /// per `zellij-client/src/web_client/control_message.rs` and
+    /// `zellij-client/assets/websockets.js`. The previous shape sanctel
+    /// emitted (`{type:"terminal_resize",rows,cols}` — flat, snake_case,
+    /// no envelope) was the load-bearing failure mode behind issue #29.
     #[test]
-    fn terminal_resize_round_trips_through_json() {
-        let msg = ControlMessage::TerminalResize { rows: 24, cols: 80 };
-        let encoded = msg.encode().expect("encode");
-        // Tag + field shape pin: `{"type":"terminal_resize","rows":24,"cols":80}`.
-        assert!(encoded.contains("\"type\":\"terminal_resize\""), "got: {encoded}");
-        assert!(encoded.contains("\"rows\":24"), "got: {encoded}");
-        assert!(encoded.contains("\"cols\":80"), "got: {encoded}");
-        let decoded = ControlMessage::decode(&encoded).expect("decode");
-        assert_eq!(decoded, msg);
+    fn terminal_resize_envelope_matches_zellij_wire_shape() {
+        let env = ControlEnvelope::new(
+            "abc-123",
+            ControlPayload::TerminalResize { rows: 24, cols: 80 },
+        );
+        let encoded = env.encode().expect("encode");
+        assert!(
+            encoded.contains("\"web_client_id\":\"abc-123\""),
+            "outer envelope missing web_client_id: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"payload\":"),
+            "outer envelope missing payload wrapper: {encoded}"
+        );
+        // Tag and field shape pin: `type:"TerminalResize"` (PascalCase),
+        // snake_case `rows` / `cols` fields nested under payload.
+        assert!(
+            encoded.contains("\"type\":\"TerminalResize\""),
+            "PascalCase tag missing: {encoded}"
+        );
+        assert!(encoded.contains("\"rows\":24"), "rows missing: {encoded}");
+        assert!(encoded.contains("\"cols\":80"), "cols missing: {encoded}");
     }
 
-    /// `SetConfig` round-trips through serde_json. The body is opaque to
-    /// sanctel — modeled as a string so the field shape matches whatever
-    /// zellij accepts without sanctel having to mirror its config struct.
+    /// Outbound `TerminalMetrics` envelope matches zellij's wire shape
+    /// per `zellij-client/assets/websockets.js::sendSizeUpdate`. zellij
+    /// sends `TerminalResize` and `TerminalMetrics` as a pair on every
+    /// connect + resize; both must use the same envelope shape.
     #[test]
-    fn set_config_round_trips_through_json() {
-        let msg = ControlMessage::SetConfig {
-            config: "scroll_buffer_size = 10000".into(),
+    fn terminal_metrics_envelope_matches_zellij_wire_shape() {
+        let env = ControlEnvelope::new(
+            "abc-123",
+            ControlPayload::TerminalMetrics {
+                cell_pixel_width: 7,
+                cell_pixel_height: 14,
+                text_area_pixel_width: 560,
+                text_area_pixel_height: 336,
+            },
+        );
+        let encoded = env.encode().expect("encode");
+        assert!(
+            encoded.contains("\"type\":\"TerminalMetrics\""),
+            "PascalCase tag missing: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"cell_pixel_width\":7"),
+            "cell_pixel_width missing: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"text_area_pixel_height\":336"),
+            "text_area_pixel_height missing: {encoded}"
+        );
+    }
+
+    /// `SizeState::to_messages` produces the exact pair zellij expects on
+    /// connect: TerminalResize first, then TerminalMetrics. Order matters
+    /// because zellij's server registers the control channel on the
+    /// FIRST message received; if Metrics arrived before Resize, the
+    /// server might cache a stale grid size that subsequent resizes
+    /// would have to overwrite.
+    #[test]
+    fn size_state_emits_resize_then_metrics_in_order() {
+        let state = SizeState {
+            rows: 30,
+            cols: 100,
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
         };
-        let encoded = msg.encode().expect("encode");
-        assert!(encoded.contains("\"type\":\"set_config\""), "got: {encoded}");
-        assert!(encoded.contains("\"config\":"), "got: {encoded}");
-        let decoded = ControlMessage::decode(&encoded).expect("decode");
-        assert_eq!(decoded, msg);
+        let [msg1, msg2] = state.to_messages("client-id").expect("to_messages");
+        let Message::Text(text1) = msg1 else {
+            panic!("first message must be text frame");
+        };
+        let Message::Text(text2) = msg2 else {
+            panic!("second message must be text frame");
+        };
+        assert!(
+            text1.contains("\"type\":\"TerminalResize\""),
+            "first must be TerminalResize: {text1}"
+        );
+        assert!(
+            text2.contains("\"type\":\"TerminalMetrics\""),
+            "second must be TerminalMetrics: {text2}"
+        );
+        // text_area_pixel_* are derived from grid * cell pixel dims.
+        // Pin the math so a refactor that drops the multiplication
+        // surfaces here.
+        assert!(
+            text2.contains("\"text_area_pixel_width\":800"),
+            "100 cols × 8px = 800: {text2}"
+        );
+        assert!(
+            text2.contains("\"text_area_pixel_height\":480"),
+            "30 rows × 16px = 480: {text2}"
+        );
     }
 
-    /// A malformed JSON body surfaces as `Encode`, not a panic. The
-    /// production control loop ignores inbound messages in this slice
-    /// (see `mount`), but the decode helper is also called from tests
-    /// and any future inbound-message handling.
+    /// Inbound `QueryTerminalSize` parses into the matching variant.
+    /// Production code in `mount`'s control inbound dispatcher uses this
+    /// parse to decide whether to re-emit a size update.
     #[test]
-    fn decode_malformed_json_surfaces_as_encode_error() {
-        match ControlMessage::decode("{not json") {
-            Err(ZellijWsError::Encode(_)) => {}
-            other => panic!("expected Encode error, got {other:?}"),
-        }
+    fn server_control_message_parses_query_terminal_size() {
+        let text = r#"{"type":"QueryTerminalSize"}"#;
+        let parsed: ServerControlMessage = serde_json::from_str(text).expect("parse");
+        assert!(matches!(parsed, ServerControlMessage::QueryTerminalSize));
+    }
+
+    /// Unknown server message types fall into the `Other` variant rather
+    /// than failing the parse. Forward-compat with future zellij version
+    /// bumps that add new server→client message types.
+    #[test]
+    fn server_control_message_falls_back_to_other_on_unknown() {
+        let text = r#"{"type":"SomeFutureMessage","field":42}"#;
+        let parsed: ServerControlMessage = serde_json::from_str(text).expect("parse");
+        assert!(matches!(parsed, ServerControlMessage::Other));
+    }
+
+    /// Inbound text frames decode to bytes. **Verified empirically:
+    /// zellij's `/ws/terminal/<session>` endpoint sends PTY output as
+    /// `Message::Text` frames, not binary** (see issue #29 audit). A
+    /// regression that drops the Text arm from `decode_binary_frame`
+    /// would silently break every terminal tab; pin it here.
+    #[test]
+    fn decode_accepts_text_frame_from_zellij_output() {
+        let zellij_init = "\x1b[?1l\x1b=\x1b[r\x1b[?1000l\x1b[?1002l";
+        let text_frame = Message::Text(zellij_init.into());
+        let decoded = decode_binary_frame(&text_frame).expect("text frame decodes");
+        assert_eq!(decoded.as_slice(), zellij_init.as_bytes());
     }
 
     /// Binary frame round-trip: bytes go in via `encode_binary_frame`,
@@ -487,14 +755,16 @@ mod tests {
         assert_eq!(decoded, payload);
     }
 
-    /// Non-binary frames decode to `None` so the production reader can
-    /// ignore them without misforwarding text or control frames into the
-    /// byte channel.
+    /// Non-byte frames (ping/pong/close) decode to `None` so the
+    /// production reader can ignore them. **Text frames are accepted**
+    /// because zellij sends terminal output as text — see
+    /// `decode_accepts_text_frame_from_zellij_output` for the pinned
+    /// rationale.
     #[test]
-    fn non_binary_frames_decode_to_none() {
-        assert!(decode_binary_frame(&Message::Text("hi".into())).is_none());
+    fn non_byte_frames_decode_to_none() {
         assert!(decode_binary_frame(&Message::Ping(vec![].into())).is_none());
         assert!(decode_binary_frame(&Message::Pong(vec![].into())).is_none());
+        assert!(decode_binary_frame(&Message::Close(None)).is_none());
     }
 
     /// `build_ws_request` must put the session_token cookie on every

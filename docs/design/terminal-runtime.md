@@ -638,3 +638,134 @@ shows a clear error; the rest are unaffected.
 - **Mirrored-view tabs** (two tabs as two clients on one window) —
   designed-for but not built in v0.3.
 - **Windows / WSL** — ConPTY support deferred. macOS + Linux only for v0.3.
+
+## Zellij protocol reference (issue #29 audit)
+
+This section captures the empirically-verified protocol sanctel's
+zellij backend must speak with `zellij web`. Established via the
+issue #29 audit after a five-bug chain (#23 auth, #25 socket-dir, #26
+invalid CLI flag, #28 missing web_client_id, and the closed-channel
+symptom) revealed that source-reading-only briefs had been missing
+load-bearing protocol details. **This is empirical ground truth.**
+When zellij's version changes and behaviors shift, this section must
+be re-verified end-to-end via websocat (or equivalent), not just
+re-read from source.
+
+### Verified against zellij 0.44.3
+
+The complete handshake sanctel performs for one terminal tab:
+
+```
+1. Subprocess: `zellij web --create-token`
+   → stdout: "Created token successfully\n\ntoken_<N>: <UUID>\n"
+   → parse out (token_name, auth_token_uuid).
+
+2. HTTP: POST http://127.0.0.1:<port>/command/login
+   body: {"auth_token": "<UUID>", "remember_me": false}
+   headers: Content-Type: application/json
+   → response: Set-Cookie: session_token=<UUID>; HttpOnly; SameSite=Strict; Path=/
+   → parse out the session_token cookie value.
+
+3. HTTP: POST http://127.0.0.1:<port>/session
+   body: {}
+   headers: Content-Type: application/json, Cookie: session_token=<UUID>
+   → response: {"web_client_id": "<UUID>", "is_read_only": false}
+   → parse out web_client_id.
+
+4. WebSocket: open ws://127.0.0.1:<port>/ws/control
+   headers: Cookie: session_token=<UUID>
+   (no web_client_id query param on this endpoint — the id rides on
+    every message body)
+
+5. WebSocket SEND on /ws/control (TEXT frame, JSON):
+   {"web_client_id": "<UUID>",
+    "payload": {"type": "TerminalResize", "rows": 24, "cols": 80}}
+
+6. WebSocket SEND on /ws/control (TEXT frame, JSON):
+   {"web_client_id": "<UUID>",
+    "payload": {"type": "TerminalMetrics",
+                "cell_pixel_width": 7,
+                "cell_pixel_height": 14,
+                "text_area_pixel_width": 560,
+                "text_area_pixel_height": 336}}
+
+7. WebSocket: open ws://127.0.0.1:<port>/ws/terminal/<session>?web_client_id=<UUID>
+   headers: Cookie: session_token=<UUID>
+   (web_client_id is REQUIRED as a query parameter on this endpoint)
+
+8. Server pushes PTY output on /ws/terminal as TEXT frames.
+   Sanctel forwards the bytes to the webview's Channel<Vec<u8>>.
+
+9. Client sends keystrokes on /ws/terminal as Binary frames
+   (Text frames also accepted server-side; binary preferred so
+    non-UTF-8 paste content doesn't require transcoding).
+
+10. Server may at any time send inbound control messages on /ws/control:
+    - {"type": "QueryTerminalSize"} → client responds by re-sending
+      messages 5 and 6 with the latest size.
+    - {"type": "SetConfig", ...} → informational (sanctel ignores; xterm
+      is styled by the webview).
+    - {"type": "Log", "lines": [...]} → informational.
+    - {"type": "LogError", "lines": [...]} → informational.
+    - {"type": "SwitchedSession", "new_session_name": "..."} → server
+      switched the client to a different session; sanctel currently
+      ignores (future work).
+    - Any unknown type → silently ignored for forward-compat.
+
+11. On tab close: cleanly close both WebSockets, then subprocess
+    `zellij web --revoke-token <token_name>` to clean up.
+```
+
+### Load-bearing details that earlier briefs missed
+
+| Detail | What earlier briefs assumed | Empirical truth |
+|---|---|---|
+| Output frame type | binary | **text** |
+| Control message shape | `{type, ...fields}` flat | **`{web_client_id, payload: {type, ...fields}}` two-level envelope** |
+| Type tag casing | snake_case | **PascalCase** (matches zellij's Rust variant names) |
+| Connection order | open both in parallel | **control first + send envelopes, then terminal** (otherwise the listener's `send_control(SwitchedSession)` races the control_tx registration and silently fails) |
+| Initial size message | not sent (waited for resize event) | **must be sent on connect** — server uses it to register control_tx in connection_table |
+| QueryTerminalSize | could be ignored | **must respond** with the latest TerminalResize+TerminalMetrics pair |
+
+### Frame-type details
+
+- **Outbound (client → server) on /ws/terminal**: sanctel uses
+  `Message::Binary`. Zellij's `ws_handler_terminal` accepts both Binary
+  and Text and routes both through `parse_stdin`. Binary is preferred
+  because xterm.js can emit non-UTF-8 byte sequences (binary pastes)
+  that would fail Text frame's UTF-8 validation.
+
+- **Outbound (client → server) on /ws/control**: TEXT frames carrying
+  serialized `ControlEnvelope` JSON. Cannot be binary — zellij's control
+  handler expects JSON.
+
+- **Inbound (server → client) on /ws/terminal**: zellij sends TEXT
+  frames containing terminal escape sequences. Sanctel's
+  `decode_binary_frame` accepts BOTH `Message::Binary` and
+  `Message::Text` and extracts the bytes either way — defensive
+  against a future zellij version that switches frame types.
+
+- **Inbound (server → client) on /ws/control**: TEXT frames carrying
+  `WebServerToWebClientControlMessage` JSON. Sanctel parses via
+  `ServerControlMessage` with `#[serde(other)]` fallback for
+  forward-compatibility.
+
+### Where this lives in the codebase
+
+- `src-tauri/src/zellij_auth.rs` — steps 1, 2, 3, 11.
+- `src-tauri/src/zellij_ws.rs::mount` — steps 4–10. The function's
+  internal order matches the canonical sequence above.
+- `src-tauri/src/zellij_daemon.rs` — supervises `zellij web` itself.
+
+### Maintenance contract
+
+If you touch zellij integration:
+
+1. Run `cargo test --lib zellij_ws` and `cargo test --lib zellij_auth`.
+   These pin the wire shapes via unit tests.
+2. Run a real end-to-end test: `npm run tauri dev` with
+   `SANCTEL_BACKEND=zellij`, create a terminal tab, type, see output.
+3. If zellij's version has been bumped, re-walk this protocol
+   against the new version before claiming the integration works.
+   The wire shape can change between versions; the unit tests pin our
+   side but cannot detect server-side protocol drift.
