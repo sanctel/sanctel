@@ -75,6 +75,9 @@ describe("tabStore hydrate", () => {
     expect(snap.spaces).toHaveLength(1);
     expect(snap.spaces[0].id).toBe("space-default");
     expect(snap.tabs).toEqual([]);
+    expect(invokeMock.mock.calls).toEqual([
+      ["reap_orphan_tmux_sessions", { knownSessionNames: [] }],
+    ]);
   });
 
   it("replays create_tab for each persisted tab in sort order", async () => {
@@ -175,6 +178,93 @@ describe("tabStore hydrate", () => {
       ([cmd]) => cmd === "create_tab",
     );
     expect(createTabCalls).toHaveLength(2);
+  });
+
+  it("reports known tmux sessions to the reaper after replaying persisted tabs", async () => {
+    const persistence = new InMemoryPersistence();
+    await persistence.saveProfile({
+      id: "profile-default",
+      name: "Default",
+      color: null,
+      isDefault: true,
+    });
+    await persistence.saveSpace({
+      id: "space-default",
+      profileId: "profile-default",
+      name: "Default",
+      color: "#6366f1",
+      sortOrder: 0,
+    });
+    await persistence.saveTab({
+      id: "tab-browser",
+      spaceId: "space-default",
+      kind: "browser",
+      title: "duckduckgo",
+      sortOrder: 0,
+      url: "https://duckduckgo.com",
+      worktreeId: null,
+      windowName: null,
+      initialCommand: null,
+      agentSessionId: null,
+    });
+    await persistence.saveTab({
+      id: "tab-detached",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "detached",
+      sortOrder: 1,
+      url: "local://terminal",
+      worktreeId: null,
+      windowName: "term-1",
+      initialCommand: null,
+      agentSessionId: null,
+    });
+    await persistence.saveTab({
+      id: "tab-terminal",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "build watcher",
+      sortOrder: 2,
+      url: "local://terminal",
+      worktreeId: "sanctel-main",
+      windowName: "term-2",
+      initialCommand: null,
+      agentSessionId: null,
+    });
+    await persistence.saveTab({
+      id: "tab-chat",
+      spaceId: "space-default",
+      kind: "chat",
+      title: "chat",
+      sortOrder: 3,
+      url: "local://chat",
+      worktreeId: "sanctel-main",
+      windowName: "term-3",
+      initialCommand: "claude --resume abc",
+      agentSessionId: "abc",
+    });
+
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    const commands = invokeMock.mock.calls.map(([cmd]) => cmd);
+    expect(commands).toEqual([
+      "create_tab",
+      "create_tab",
+      "create_tab",
+      "create_tab",
+      "reap_orphan_tmux_sessions",
+    ]);
+    const reapCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "reap_orphan_tmux_sessions",
+    );
+    expect(reapCall?.[1]).toEqual({
+      knownSessionNames: [
+        "sanctel_detached_profile-default__term-1",
+        "sanctel_wt_sanctel-main__term-2",
+        "sanctel_wt_sanctel-main__term-3",
+      ],
+    });
   });
 });
 

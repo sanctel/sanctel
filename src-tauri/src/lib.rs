@@ -20,7 +20,7 @@ mod profile_isolation;
 mod terminal_runtime;
 mod tmux_cli;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -215,6 +215,13 @@ struct CreateTabResp {
     window_name: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReapReport {
+    reaped: usize,
+    failed: usize,
+}
+
 /// `"auto"` is the explicit sentinel from React asking Rust to allocate the
 /// next `term-N`. We also treat `None` the same way for terminal/chat tabs,
 /// so omitting the field is equivalent.
@@ -386,6 +393,52 @@ fn allocate_session_for_tab<R: CommandRunner>(
     let session = format!("{base}__{window_name}");
     tmux.ensure_session_window(&session, &window_name, cwd, initial_command)?;
     Ok(window_name)
+}
+
+fn is_sanctel_tmux_session(session: &str) -> bool {
+    session.starts_with("sanctel_wt_") || session.starts_with("sanctel_detached_")
+}
+
+/// Reap Sanctel-owned tmux sessions that no persisted TabRecord references.
+/// The caller supplies known names from the frontend SQLite hydrate so Rust
+/// does not read the frontend-owned persistence store.
+fn reap_orphan_sessions<R: CommandRunner>(
+    tmux: &TmuxCli<R>,
+    known_session_names: &HashSet<String>,
+) -> Result<ReapReport, TmuxError> {
+    let mut report = ReapReport {
+        reaped: 0,
+        failed: 0,
+    };
+    for session in tmux.list_sessions()? {
+        if !is_sanctel_tmux_session(&session) || known_session_names.contains(&session) {
+            continue;
+        }
+
+        match tmux.kill_session(&session) {
+            Ok(()) => report.reaped += 1,
+            Err(e) => {
+                report.failed += 1;
+                eprintln!("failed to reap stale tmux session {session}: {e}");
+            }
+        }
+    }
+
+    if report.reaped == 0 && report.failed == 0 {
+        eprintln!("reaped 0 stale tmux sessions");
+    } else {
+        eprintln!(
+            "reaped {} stale tmux sessions ({} failed)",
+            report.reaped, report.failed
+        );
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+fn reap_orphan_tmux_sessions(known_session_names: Vec<String>) -> Result<ReapReport, String> {
+    let known_session_names: HashSet<String> = known_session_names.into_iter().collect();
+    reap_orphan_sessions(&TmuxCli::default(), &known_session_names).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -665,6 +718,7 @@ pub fn run() {
             terminal_write,
             terminal_resize,
             tmux_status,
+            reap_orphan_tmux_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -836,6 +890,126 @@ mod tests {
     #[test]
     fn default_status_names_tmux_backend() {
         assert_eq!(TmuxStatus::default().backend, "tmux");
+    }
+
+    struct ReapRunner {
+        sessions: Arc<Mutex<Vec<String>>>,
+        killed: Arc<Mutex<Vec<String>>>,
+        fail_kills: HashSet<String>,
+    }
+
+    impl ReapRunner {
+        fn new(sessions: Vec<&str>) -> Self {
+            Self::with_failures(sessions, vec![])
+        }
+
+        fn with_failures(sessions: Vec<&str>, fail_kills: Vec<&str>) -> Self {
+            ReapRunner {
+                sessions: Arc::new(Mutex::new(
+                    sessions.into_iter().map(str::to_string).collect(),
+                )),
+                killed: Arc::new(Mutex::new(Vec::new())),
+                fail_kills: fail_kills.into_iter().map(str::to_string).collect(),
+            }
+        }
+    }
+
+    impl CommandRunner for ReapRunner {
+        fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            let sub = args
+                .iter()
+                .find(|a| matches!(**a, "list-sessions" | "kill-session"))
+                .copied()
+                .unwrap_or("");
+
+            match sub {
+                "list-sessions" => {
+                    let sessions = self.sessions.lock().join("\n");
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: format!("{sessions}\n").into_bytes(),
+                        stderr: vec![],
+                    })
+                }
+                "kill-session" => {
+                    let target = arg_after(args, "-t")
+                        .unwrap_or_default()
+                        .trim_start_matches('=')
+                        .to_string();
+                    let should_fail = self.fail_kills.contains(&target);
+                    self.killed.lock().push(target);
+                    if should_fail {
+                        return Ok(CommandOutput {
+                            status: 1,
+                            stdout: vec![],
+                            stderr: b"unexpected kill failure".to_vec(),
+                        });
+                    }
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
+                }
+                _ => Ok(CommandOutput {
+                    status: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn reap_orphan_sessions_kills_only_unknown_sanctel_sessions() {
+        let runner = ReapRunner::new(vec![
+            "sanctel_wt_main__term-1",
+            "sanctel_wt_main__term-2",
+            "sanctel_wt_main",
+            "sanctel_detached_profile-default",
+            "manual_session",
+        ]);
+        let killed = Arc::clone(&runner.killed);
+        let tmux = TmuxCli::new("test", runner);
+        let known = ["sanctel_wt_main__term-2".to_string()]
+            .into_iter()
+            .collect();
+
+        let report = reap_orphan_sessions(&tmux, &known).unwrap();
+
+        assert_eq!(report.reaped, 3);
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            *killed.lock(),
+            vec![
+                "sanctel_wt_main__term-1".to_string(),
+                "sanctel_wt_main".to_string(),
+                "sanctel_detached_profile-default".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn reap_orphan_sessions_continues_after_kill_failure() {
+        let runner = ReapRunner::with_failures(
+            vec!["sanctel_wt_main__term-1", "sanctel_wt_main__term-2"],
+            vec!["sanctel_wt_main__term-1"],
+        );
+        let killed = Arc::clone(&runner.killed);
+        let tmux = TmuxCli::new("test", runner);
+        let known = HashSet::new();
+
+        let report = reap_orphan_sessions(&tmux, &known).unwrap();
+
+        assert_eq!(report.reaped, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            *killed.lock(),
+            vec![
+                "sanctel_wt_main__term-1".to_string(),
+                "sanctel_wt_main__term-2".to_string(),
+            ],
+        );
     }
 
     // ─── windowName allocation under the per-Worktree mutex (issue #10/#15) ───

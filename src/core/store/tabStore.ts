@@ -550,6 +550,7 @@ export function createTabStore(
         // First launch — persist defaults so a clean re-read returns them.
         await p.saveProfile(profileToRow(DEFAULT_PROFILE));
         await p.saveSpace(spaceToRow(DEFAULT_SPACE, 0));
+        await reapOrphanTmuxSessions([], []);
         return;
       }
 
@@ -600,6 +601,8 @@ export function createTabStore(
           console.error("hydrate: create_tab failed for", t.id, e);
         }
       }
+
+      await reapOrphanTmuxSessions(tabs, spacesWithActive);
     },
   }));
 }
@@ -671,6 +674,41 @@ function buildCreateTabReq(t: Tab, space: Space) {
     initialCommand: t.initialCommand ?? null,
     agentSessionId: t.agentSessionId ?? null,
   };
+}
+
+async function reapOrphanTmuxSessions(
+  tabs: Tab[],
+  spaces: Space[],
+): Promise<void> {
+  const knownSessionNames = knownTmuxSessionNames(tabs, spaces);
+  await invoke("reap_orphan_tmux_sessions", { knownSessionNames }).catch((e) => {
+    console.error("reap_orphan_tmux_sessions failed", e);
+  });
+}
+
+function knownTmuxSessionNames(tabs: Tab[], spaces: Space[]): string[] {
+  return tabs.flatMap((t) => {
+    if (t.kind !== "terminal" && t.kind !== "chat") return [];
+    const space = spaces.find((sp) => sp.id === t.spaceId);
+    if (!space) return [];
+    const windowName = t.windowName ?? "term-1";
+    const base = t.worktreeId
+      ? `sanctel_wt_${tmuxSafe(t.worktreeId)}`
+      : `sanctel_detached_${tmuxSafe(space.profileId)}`;
+    return [`${base}__${windowName}`];
+  });
+}
+
+function tmuxSafe(value: string): string {
+  return Array.from(value)
+    .map((c) => {
+      const code = c.charCodeAt(0);
+      const alpha =
+        (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+      const digit = code >= 48 && code <= 57;
+      return alpha || digit || c === "_" || c === "-" ? c : "_";
+    })
+    .join("");
 }
 
 // Production singleton. App.tsx calls `hydrate(new SqlPersistence())` on
