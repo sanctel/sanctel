@@ -15,7 +15,6 @@
 // The webview's label IS the tabId.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -34,6 +33,8 @@ export interface MountOptions {
   linkHandler?: (event: MouseEvent, url: string) => void;
   /** Clipboard plugin bridge. Omit to disable copy/paste shortcuts. */
   clipboard?: ClipboardApi;
+  /** Wired by the host page to ask Core to close this Tab. */
+  closeTabHandler?: () => void;
 }
 
 export interface MountedTerminal {
@@ -161,7 +162,7 @@ export function mount(
     }).catch((e) => {
       const parsed = parseAttachError(e);
       if (parsed.kind === "worktree-missing") {
-        renderBrokenTab(container, parsed.path);
+        renderBrokenTab(container, parsed.path, options.closeTabHandler);
         onDataDisposable.dispose();
         term.dispose();
         return;
@@ -190,9 +191,12 @@ export function mount(
 // Inline broken-tab panel for the worktree-missing case. Replaces the xterm
 // canvas inside the container, leaves the sidebar entry untouched. "Recreate
 // from main" is a v0.3.x follow-up — for now the button is wired to a no-op
-// handler so the UI is complete and the click target is real. "Remove this
-// tab" invokes close_tab and lets React clean up the row.
-function renderBrokenTab(container: HTMLElement, path: string): void {
+// handler so the UI is complete and the click target is real.
+function renderBrokenTab(
+  container: HTMLElement,
+  path: string,
+  closeTabHandler?: () => void,
+): void {
   // Wipe xterm's DOM. The Terminal.dispose() call from the caller releases
   // the addon/renderer; this just clears the visual residue.
   container.innerHTML = "";
@@ -245,14 +249,7 @@ function renderBrokenTab(container: HTMLElement, path: string): void {
   remove.textContent = "Remove this tab";
   remove.style.cssText = buttonCss();
   remove.addEventListener("click", () => {
-    // close_tab takes the webview label as id; the webview's label IS the
-    // tabId by construction (see src-tauri/src/lib.rs `create_tab`).
-    const id = labelFromWebview();
-    if (id) {
-      invoke("close_tab", { id }).catch((err) =>
-        console.error("close_tab failed", err),
-      );
-    }
+    closeTabHandler?.();
   });
 
   buttons.append(recreate, remove);
@@ -307,17 +304,4 @@ function waitForRealContainerSize(
     });
     ro.observe(container);
   });
-}
-
-// The webview's label IS the tabId by construction (see
-// src-tauri/src/lib.rs `create_tab`). Tauri 2 exposes it via
-// getCurrentWebview().label. Returns null if Tauri isn't reachable (e.g.,
-// running under Vitest), which lets unit tests render the broken-tab UI
-// without invoking close_tab.
-function labelFromWebview(): string | null {
-  try {
-    return getCurrentWebview().label;
-  } catch {
-    return null;
-  }
 }

@@ -388,4 +388,22 @@ describe("tabStore mutations persist", () => {
     await useStore.getState().closeTab(tab.id);
     expect((await persistence.loadAll()).tabs).toEqual([]);
   });
+
+  it("closeTab removes the row when backend cleanup fails", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const persistence = new InMemoryPersistence();
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+    const tab = await useStore.getState().newTab("browser", "https://x");
+    invokeMock.mockImplementation((cmd) => {
+      if (cmd === "close_tab") return Promise.reject(new Error("boom"));
+      return Promise.resolve(undefined);
+    });
+
+    await useStore.getState().closeTab(tab.id);
+
+    expect((await persistence.loadAll()).tabs).toEqual([]);
+    expect(useStore.getState().tabs).toEqual([]);
+    errSpy.mockRestore();
+  });
 });

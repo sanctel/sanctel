@@ -486,9 +486,8 @@ export function createTabStore(
       agentSessionCaptures.get(id)?.stop();
       agentSessionCaptures.delete(id);
       await invoke("close_tab", { id }).catch(console.error);
-      // Persist row removal after the IPC succeeds so a failure mid-close
-      // leaves a row whose next-launch create_tab is benign (re-attaches to
-      // an empty session).
+      // Backend cleanup is best-effort: Core still removes the Tab pointer
+      // from persistence and memory if Rust cleanup fails.
       if (persistence) await persistence.removeTab(id);
       set((s) => {
         const tabs = s.tabs.filter((t) => t.id !== id);

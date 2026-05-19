@@ -44,6 +44,29 @@ export default function App() {
     };
   }, []);
 
+  // Terminal/chat webviews emit `sanctel://close-tab` when their broken-tab
+  // UI asks to remove itself. Route through Core's close lifecycle so state,
+  // persistence, and best-effort backend cleanup stay in one path.
+  useEffect(() => {
+    const unlistenP = listen<unknown>("sanctel://close-tab", (e) => {
+      const id =
+        e.payload &&
+        typeof e.payload === "object" &&
+        "id" in e.payload &&
+        typeof e.payload.id === "string"
+          ? e.payload.id
+          : null;
+      if (!id) return;
+
+      useTabStore.getState().closeTab(id).catch((err) => {
+        console.error("close-tab closeTab failed", err);
+      });
+    });
+    return () => {
+      unlistenP.then((u) => u()).catch(() => {});
+    };
+  }, []);
+
   // While the probe result is still in flight, show nothing — first paint
   // is fast and a transient empty screen beats flashing the setup UI then
   // hiding it.

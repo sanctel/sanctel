@@ -35,18 +35,25 @@
       import { invoke } from "@tauri-apps/api/core";
       import { mount } from "/src/terminal/terminal-runtime.ts";
       import { createLinkHandler } from "/src/terminal/link-handler.ts";
+      import { createCloseTabHandler } from "/src/terminal/close-tab-handler.ts";
       import {
         readText,
         writeText,
       } from "@tauri-apps/plugin-clipboard-manager";
       import { emit } from "@tauri-apps/api/event";
+      import { getCurrentWebview } from "@tauri-apps/api/webview";
 
       const linkHandler = createLinkHandler({
         openBrowserTab: (url) => emit("sanctel://open-url", { url }),
       });
+      const closeTabHandler = createCloseTabHandler({
+        currentTabId: () => getCurrentWebview().label,
+        requestCloseTab: (id) => emit("sanctel://close-tab", { id }),
+      });
 
       mount(document.getElementById("term"), {
         linkHandler,
+        closeTabHandler,
         clipboard: { readText, writeText },
       });
 
