@@ -64,7 +64,7 @@ pub struct TabExitedPayload {
 
 pub type TabExitedEmitter = Arc<dyn Fn(TabExitedPayload) + Send + Sync + 'static>;
 
-pub fn tab_exited_after_confirmed_session_death<R: CommandRunner>(
+pub fn tab_exited_payload_if_session_missing<R: CommandRunner>(
     tmux: &TmuxCli<R>,
     tab_id: &str,
     session: &str,
@@ -272,29 +272,25 @@ fn spawn_pty_reader(
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut reached_eof = false;
-        loop {
+        let reached_eof = loop {
             match reader.read(&mut buf) {
-                Ok(0) => {
-                    reached_eof = true;
-                    break;
-                }
+                Ok(0) => break true,
                 Ok(n) => {
                     if on_output.send(buf[..n].to_vec()).is_err() {
                         // Channel closed (webview gone). Stop draining.
-                        break;
+                        break false;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(_) => break false,
             }
-        }
+        };
 
         if !reached_eof {
             return;
         }
 
-        match tab_exited_after_confirmed_session_death(&TmuxCli::default(), &tab_id, &session) {
+        match tab_exited_payload_if_session_missing(&TmuxCli::default(), &tab_id, &session) {
             Ok(Some(payload)) => on_tab_exited(payload),
             Ok(None) => {}
             Err(e) => eprintln!("failed to confirm tmux session death for tab {tab_id}: {e}"),
@@ -372,8 +368,7 @@ mod tests {
     fn pty_eof_missing_tmux_session_produces_tab_exited_payload() {
         let tmux = TmuxCli::new("test", HasSessionRunner { exists: false });
 
-        let payload =
-            tab_exited_after_confirmed_session_death(&tmux, "tab-1", "session-1").unwrap();
+        let payload = tab_exited_payload_if_session_missing(&tmux, "tab-1", "session-1").unwrap();
 
         assert_eq!(
             payload,
@@ -387,8 +382,7 @@ mod tests {
     fn pty_eof_existing_tmux_session_does_not_produce_tab_exited_payload() {
         let tmux = TmuxCli::new("test", HasSessionRunner { exists: true });
 
-        let payload =
-            tab_exited_after_confirmed_session_death(&tmux, "tab-1", "session-1").unwrap();
+        let payload = tab_exited_payload_if_session_missing(&tmux, "tab-1", "session-1").unwrap();
 
         assert_eq!(payload, None);
     }
