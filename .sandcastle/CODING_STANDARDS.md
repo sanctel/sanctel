@@ -3,28 +3,9 @@
 Loaded by the reviewer agent during code review (via `@.sandcastle/CODING_STANDARDS.md`),
 so these standards are enforced without costing tokens during implementation.
 
-**Read `/CONTEXT.md` first** for domain vocabulary (Profile/Space/Tab/Worktree)
-and the planned architecture (plugin system §6, file editor §7, agent↔browser §8).
-The standards below assume that vocabulary.
-
-## Domain vocabulary (use these names — NOT alternatives)
-
-| Use | Not | Reason |
-|---|---|---|
-| `Profile` | `Workspace`, `Account` | identity / cookie boundary (Arc model, CONTEXT §3) |
-| `Space` | `Workspace`, `Group`, `Project` | organizational grouping inside a Profile (CONTEXT §3) |
-| `Tab` | `Pane`, `Window` | atomic sidebar entry, one webview each |
-| `TabKind` | `TabType` | enum: `browser | terminal | chat | file | diff` |
-| `Worktree` | `Branch dir`, `Workspace dir` | a real `git worktree`; filesystem entity |
-| `AgentSession` | `ChatSession`, `Conversation` | a Claude/Codex thread, keyed by cwd |
-| `TmuxSession` | `Shell`, `Pty` | server-side tmux session for persistence |
-
-Three names that meant different things across our references and which we
-have explicitly disambiguated — review will reject misuse:
-
-- "Session" must be qualified: `TmuxSession`, `AgentSession`, or a UI `Tab`.
-- "Workspace" must not appear in type names — use `Space` or `Profile`.
-- "Window" = OS / Tauri window only. tmux windows map to our `Tab`.
+Read `docs/agents/review-guardrails.md` for domain vocabulary, architecture
+invariants, and documentation update rules. Read `CONTEXT-MAP.md` and relevant
+ADRs for the source-of-truth domain context behind those guardrails.
 
 ## TypeScript / React (frontend)
 
@@ -50,7 +31,7 @@ have explicitly disambiguated — review will reject misuse:
   with named args; let Rust own state.
 - Frontend computes `profileId` from `space.profileId` before sending to
   `create_tab` — Rust receives the profile name, not space/workspace IDs.
-  (This is the Arc-model invariant from CONTEXT §3.)
+  See ADR-0003 and `docs/agents/review-guardrails.md`.
 
 ### Testing
 - Vitest for unit + integration. `<name>.test.ts(x)` next to the file under test.
@@ -82,7 +63,7 @@ have explicitly disambiguated — review will reject misuse:
   dispatcher.
 
 ### Plugin capability gates
-Per CONTEXT §6: any privileged plugin call (`fs:*`, `pty:*`, `net:http`,
+Per ADR-0008 and `docs/design/plugin-system.md`: any privileged plugin call (`fs:*`, `pty:*`, `net:http`,
 `exec:cli`, `worktree:*`, `tab:control`) **must** go through a Rust function
 that checks the plugin's manifest-declared capabilities. **Frontend cannot lie
 about capabilities** — the on-disk manifest is the source of truth.
@@ -90,7 +71,7 @@ about capabilities** — the on-disk manifest is the source of truth.
 If you add a new capability:
 1. Add the constant to `plugin_capabilities.rs` (or similar).
 2. Add a `plugin_<name>.rs` enforcement module.
-3. Update CONTEXT §6 to document the new tier.
+3. Update `docs/design/plugin-system.md` to document the new tier.
 
 ### Testing
 - `cargo test` for unit + integration. `#[cfg(test)]` modules co-located with
@@ -98,44 +79,8 @@ If you add a new capability:
 - Test boundary contracts (does this command accept what the manifest says it
   accepts? Does it reject what's not declared?).
 
-## Architecture invariants (review will enforce)
+## Code smells the reviewer will flag
 
-Drawn from CONTEXT.md. Violations are blockers, not nits.
-
-### Persistence Anchor (CONTEXT §3)
-- Tabs are ephemeral pointers. Worktrees, transcripts, profile data dirs, and
-  tmux sessions are durable. Code that tries to make Tab the source of truth
-  for something durable is wrong.
-- On launch, the app reconstructs Tabs from disk; it does NOT save Tab
-  in-memory state to disk during normal operation.
-
-### Profile invariants (CONTEXT §3)
-- A Space belongs to exactly one Profile. `Tab.profileId` is **derived from
-  Space.profileId**, never stored separately. Reviewer rejects denormalized
-  `profileId` on Tab.
-- `WebviewBuilder::with_profile_name(...)` takes the **profile id**, never
-  the space id. Test this with a "two spaces share one profile, cookies are
-  shared" assertion when feasible.
-
-### TabKind unification (CONTEXT §3 + §7)
-- New tab kinds add a `kind` enum variant + a bundled HTML page (or external
-  URL for browser). They do NOT add new tab-specific data structures unless
-  truly necessary.
-
-### Worktree orthogonality (CONTEXT §3)
-- A Worktree is a filesystem entity. Don't tie it to Profile in code. Don't
-  store `profileId` on Worktree.
-
-### TUICommander-style plugin capabilities (CONTEXT §6)
-- New plugin APIs MUST declare a capability tier (1/2/3/4).
-- Tier 3/4 privileged operations require manifest-declared capabilities,
-  checked at the Rust boundary.
-
-## Architecture/code "smells" the reviewer will flag
-
-- `Workspace` in a type or variable name (use `Profile` or `Space`).
-- `Tab.profileId` stored directly (it's derived; should be `space.profileId`).
-- `with_profile_name(space.id)` (it should be `with_profile_name(profile.id)`).
 - Unchecked `unwrap()` / `expect()` in command handlers.
 - `any` in TypeScript without a comment justification.
 - Components reaching into Zustand state with `getState()` outside actions —
@@ -143,15 +88,3 @@ Drawn from CONTEXT.md. Violations are blockers, not nits.
 - Tauri commands taking positional args.
 - Long blocking work in a Tauri command (should spawn a task and stream
   events).
-- New plugin capability without a matching Rust enforcement module.
-- New TabKind without updating CONTEXT §3 table.
-
-## Documentation discipline
-
-- New architectural decision → CONTEXT.md §2 decisions table (one row, with
-  rejected alternatives in the right column).
-- New planned subsystem → its own CONTEXT.md section with the same shape as
-  §6/§7/§8: status banner, decision, alternatives rejected, implementation
-  order, what's not in v1, references to study.
-- README.md is the build guide / extension plan; CONTEXT.md is the domain.
-- Don't duplicate. README points at CONTEXT, never re-states.

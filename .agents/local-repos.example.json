@@ -1,0 +1,22 @@
+{
+  "repos": {
+    "bushido": "../bushido",
+    "aizen": "../aizen",
+    "tuicommander": "../tuicommander",
+    "agent-deck": "../agent-deck",
+    "claude-squad": "../claude-squad",
+    "waveterm": "../waveterm",
+    "dmux": "../dmux",
+    "amux": "../amux",
+    "zen-browser": "../zen-browser",
+    "min": "../min",
+    "superset": "../superset",
+    "worktrunk": "../worktrunk",
+    "acpx": "../acpx",
+    "cmux": "../cmux",
+    "beaker": "../beaker",
+    "tmux": "../tmux",
+    "iterm2": "../iTerm2",
+    "xterm.js": "../xterm.js"
+  }
+}
