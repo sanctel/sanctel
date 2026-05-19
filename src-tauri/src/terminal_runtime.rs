@@ -21,9 +21,10 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
+use serde::Serialize;
 use tauri::ipc::Channel;
 
-use crate::tmux_cli::{TmuxCli, TmuxError};
+use crate::tmux_cli::{CommandRunner, TmuxCli, TmuxError};
 
 // ─── attach errors ────────────────────────────────────────────────────────
 
@@ -53,6 +54,27 @@ impl std::fmt::Display for AttachError {
 impl From<TmuxError> for AttachError {
     fn from(e: TmuxError) -> Self {
         AttachError::Other(e.to_string())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TabExitedPayload {
+    pub id: String,
+}
+
+pub type TabExitedEmitter = Arc<dyn Fn(TabExitedPayload) + Send + Sync + 'static>;
+
+pub fn tab_exited_after_confirmed_session_death<R: CommandRunner>(
+    tmux: &TmuxCli<R>,
+    tab_id: &str,
+    session: &str,
+) -> Result<Option<TabExitedPayload>, TmuxError> {
+    if tmux.has_session(session)? {
+        Ok(None)
+    } else {
+        Ok(Some(TabExitedPayload {
+            id: tab_id.to_string(),
+        }))
     }
 }
 
@@ -154,6 +176,8 @@ pub fn attach_tab_to_tmux(
     tmux: &TmuxCli,
     params: AttachParams,
     on_output: Channel<Vec<u8>>,
+    tab_id: String,
+    on_tab_exited: TabExitedEmitter,
 ) -> Result<TerminalHandle, AttachError> {
     // 0. The Worktree directory may have been deleted between sanctel
     //    sessions. We surface this as a structured error so the frontend can
@@ -224,7 +248,13 @@ pub fn attach_tab_to_tmux(
 
     // Forward bytes from the PTY to the channel. Raw bytes only — no UTF-8
     // transcoding on the data path (design invariant).
-    spawn_pty_reader(reader, on_output);
+    spawn_pty_reader(
+        reader,
+        on_output,
+        tab_id,
+        params.session.clone(),
+        on_tab_exited,
+    );
 
     Ok(TerminalHandle {
         writer: Mutex::new(writer),
@@ -236,12 +266,19 @@ pub fn attach_tab_to_tmux(
 fn spawn_pty_reader(
     mut reader: Box<dyn Read + Send>,
     on_output: Channel<Vec<u8>>,
+    tab_id: String,
+    session: String,
+    on_tab_exited: TabExitedEmitter,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut reached_eof = false;
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break, // EOF — PTY closed (e.g., tmux detached or died).
+                Ok(0) => {
+                    reached_eof = true;
+                    break;
+                }
                 Ok(n) => {
                     if on_output.send(buf[..n].to_vec()).is_err() {
                         // Channel closed (webview gone). Stop draining.
@@ -252,6 +289,16 @@ fn spawn_pty_reader(
                 Err(_) => break,
             }
         }
+
+        if !reached_eof {
+            return;
+        }
+
+        match tab_exited_after_confirmed_session_death(&TmuxCli::default(), &tab_id, &session) {
+            Ok(Some(payload)) => on_tab_exited(payload),
+            Ok(None) => {}
+            Err(e) => eprintln!("failed to confirm tmux session death for tab {tab_id}: {e}"),
+        }
     });
 }
 
@@ -260,7 +307,26 @@ fn spawn_pty_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux_cli::{CommandOutput, CommandRunner};
     use std::process::Command;
+
+    struct HasSessionRunner {
+        exists: bool,
+    }
+
+    impl CommandRunner for HasSessionRunner {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CommandOutput> {
+            Ok(CommandOutput {
+                status: if self.exists { 0 } else { 1 },
+                stdout: vec![],
+                stderr: if self.exists {
+                    vec![]
+                } else {
+                    b"can't find session".to_vec()
+                },
+            })
+        }
+    }
 
     fn tmux_available() -> bool {
         Command::new("tmux")
@@ -300,6 +366,31 @@ mod tests {
     fn check_worktree_exists_accepts_extant_path() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         check_worktree_exists(&home).expect("HOME exists");
+    }
+
+    #[test]
+    fn pty_eof_missing_tmux_session_produces_tab_exited_payload() {
+        let tmux = TmuxCli::new("test", HasSessionRunner { exists: false });
+
+        let payload =
+            tab_exited_after_confirmed_session_death(&tmux, "tab-1", "session-1").unwrap();
+
+        assert_eq!(
+            payload,
+            Some(TabExitedPayload {
+                id: "tab-1".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn pty_eof_existing_tmux_session_does_not_produce_tab_exited_payload() {
+        let tmux = TmuxCli::new("test", HasSessionRunner { exists: true });
+
+        let payload =
+            tab_exited_after_confirmed_session_death(&tmux, "tab-1", "session-1").unwrap();
+
+        assert_eq!(payload, None);
     }
 
     /// `TerminalHandle::write_bytes` on a tmux-variant handle reaches the

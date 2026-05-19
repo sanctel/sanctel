@@ -30,7 +30,9 @@ use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
 use crate::profile_isolation::apply_profile_isolation;
-use crate::terminal_runtime::{attach_tab_to_tmux, AttachParams, TerminalRegistry};
+use crate::terminal_runtime::{
+    attach_tab_to_tmux, AttachParams, TabExitedPayload, TerminalRegistry,
+};
 use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
 
 // ─── shared state ─────────────────────────────────────────────────────────
@@ -623,7 +625,17 @@ fn terminal_attach<R: Runtime>(
     // AttachError::Display emits `worktree-missing: <path>` for the broken-tab
     // case, which the frontend pattern-matches in terminal-runtime.ts. Don't
     // wrap or rephrase — the prefix is the wire contract.
-    let handle = attach_tab_to_tmux(&TmuxCli::default(), params, on_output)
+    let app_for_exit = app.clone();
+    let on_tab_exited = Arc::new(move |payload: TabExitedPayload| {
+        let _ = app_for_exit.emit("sanctel://tab-exited", payload);
+    });
+    let handle = attach_tab_to_tmux(
+        &TmuxCli::default(),
+        params,
+        on_output,
+        label.clone(),
+        on_tab_exited,
+    )
         .map_err(|e| e.to_string())?;
     app.state::<AppState>().terminals.insert(label, Arc::new(handle));
     Ok(())
