@@ -15,6 +15,7 @@
 //   npx tsx .sandcastle/main.mts
 
 import { execFile as execFileCb } from "node:child_process";
+import { access, mkdir } from "node:fs/promises";
 import { promisify } from "node:util";
 
 import * as sandcastle from "@ai-hero/sandcastle";
@@ -22,10 +23,40 @@ import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 
 const execFile = promisify(execFileCb);
 
-const MODEL = "claude-opus-4-7";
+const MODEL = "gpt-5.5";
 const MAX_ITERATIONS = 10;
 const MAX_PARALLEL = 4;
 const IDLE_TIMEOUT_SECONDS = 1800;
+const NPM_CACHE_DIR = "~/.npm";
+const CARGO_REGISTRY_DIR = "~/.cargo/registry";
+const CARGO_GIT_DIR = "~/.cargo/git";
+const CODEX_AUTH_DIR = "~/.codex";
+const CODEX_AUTH_FILE = `${CODEX_AUTH_DIR}/auth.json`;
+const expandHome = (path: string) =>
+  path.replace(/^~/, process.env.HOME ?? "");
+
+await mkdir(expandHome(NPM_CACHE_DIR), { recursive: true });
+await mkdir(expandHome(CARGO_REGISTRY_DIR), { recursive: true });
+await mkdir(expandHome(CARGO_GIT_DIR), { recursive: true });
+try {
+  await access(expandHome(CODEX_AUTH_FILE));
+} catch {
+  throw new Error(
+    `Codex auth not found at ${CODEX_AUTH_FILE}. Run "codex login" on the host before starting Sandcastle.`,
+  );
+}
+
+const dockerSandbox = docker({
+  mounts: [
+    { hostPath: NPM_CACHE_DIR, sandboxPath: NPM_CACHE_DIR },
+    { hostPath: CARGO_REGISTRY_DIR, sandboxPath: CARGO_REGISTRY_DIR },
+    { hostPath: CARGO_GIT_DIR, sandboxPath: CARGO_GIT_DIR },
+    {
+      hostPath: CODEX_AUTH_DIR,
+      sandboxPath: "/home/agent/.codex",
+    },
+  ],
+});
 
 // True if `branch` has commits not yet on `main`. Used to decide whether a
 // branch is worth handing to the merger — covers both "implementer made
@@ -51,9 +82,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
   // Phase 1: Plan
   const plan = await sandcastle.run({
-    sandbox: docker(),
+    sandbox: dockerSandbox,
     name: "Planner",
-    agent: sandcastle.claudeCode(MODEL),
+    agent: sandcastle.codex(MODEL, { effort: "high" }),
     promptFile: "./.sandcastle/plan-prompt.md",
     idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
   });
@@ -102,10 +133,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       await acquire();
       try {
         await using sandbox = await sandcastle.createSandbox({
-          sandbox: docker(),
+          sandbox: dockerSandbox,
           branch: issue.branch,
           copyToWorktree: ["node_modules"],
-          idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
           hooks: {
             sandbox: {
               onSandboxReady: [{ command: "npm install" }],
@@ -115,7 +145,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
         const result = await sandbox.run({
           name: "Implementer #" + issue.number,
-          agent: sandcastle.claudeCode(MODEL),
+          agent: sandcastle.codex(MODEL, { effort: "high" }),
           promptFile: "./.sandcastle/implement-prompt.md",
           idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
           promptArgs: {
@@ -128,7 +158,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         if (result.commits.length > 0) {
           await sandbox.run({
             name: "Reviewer #" + issue.number,
-            agent: sandcastle.claudeCode(MODEL),
+            agent: sandcastle.codex(MODEL, { effort: "high" }),
             promptFile: "./.sandcastle/review-prompt.md",
             idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
             promptArgs: {
@@ -179,10 +209,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
   // Phase 3: Merge
   await sandcastle.run({
-    sandbox: docker(),
+    sandbox: dockerSandbox,
     name: "Merger",
     maxIterations: 10,
-    agent: sandcastle.claudeCode(MODEL),
+    agent: sandcastle.codex(MODEL, { effort: "high" }),
     promptFile: "./.sandcastle/merge-prompt.md",
     idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
     promptArgs: {
