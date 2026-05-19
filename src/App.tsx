@@ -48,13 +48,13 @@ export default function App() {
   // UI asks to remove itself. Route through Core's close lifecycle so state,
   // persistence, and best-effort backend cleanup stay in one path.
   useEffect(() => {
-    return listenForTabLifecycleClose("sanctel://close-tab", "close-tab");
+    return listenForTabLifecycleClose("sanctel://close-tab");
   }, []);
 
   // Rust emits `sanctel://tab-exited` when a terminal-like Tab's backing
   // TmuxSession is confirmed gone. Core still owns Tab removal.
   useEffect(() => {
-    return listenForTabLifecycleClose("sanctel://tab-exited", "tab-exited");
+    return listenForTabLifecycleClose("sanctel://tab-exited");
   }, []);
 
   // While the probe result is still in flight, show nothing — first paint
@@ -74,10 +74,16 @@ export default function App() {
   );
 }
 
+type TabLifecycleCloseEventName =
+  | "sanctel://close-tab"
+  | "sanctel://tab-exited";
+
 export function listenForTabLifecycleClose(
-  eventName: "sanctel://close-tab" | "sanctel://tab-exited",
-  logContext: string,
+  eventName: TabLifecycleCloseEventName,
 ): () => void {
+  const logContext =
+    eventName === "sanctel://close-tab" ? "close-tab" : "tab-exited";
+
   const unlistenP = listen<unknown>(eventName, (e) => {
     const id = closeTabIdFromPayload(e.payload);
     if (!id) return;

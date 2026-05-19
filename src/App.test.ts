@@ -87,10 +87,7 @@ describe("App tab lifecycle events", () => {
     await useTabStore.getState().activateTab(active.id);
 
     invokeMock.mockClear();
-    const stopListening = listenForTabLifecycleClose(
-      "sanctel://tab-exited",
-      "tab-exited",
-    );
+    const stopListening = listenForTabLifecycleClose("sanctel://tab-exited");
 
     const handler = handlers.get("sanctel://tab-exited");
     expect(handler).toBeDefined();
@@ -131,10 +128,7 @@ describe("App tab lifecycle events", () => {
       .newTab("browser", "https://second.example");
 
     invokeMock.mockClear();
-    const stopListening = listenForTabLifecycleClose(
-      "sanctel://tab-exited",
-      "tab-exited",
-    );
+    const stopListening = listenForTabLifecycleClose("sanctel://tab-exited");
     const handler = handlers.get("sanctel://tab-exited");
 
     handler?.({ payload: { id: second.id } });
@@ -164,10 +158,7 @@ describe("App tab lifecycle events", () => {
     const chat = await useTabStore.getState().newChatTab("sanctel-main");
     expect(captureStops).toHaveLength(1);
 
-    const stopListening = listenForTabLifecycleClose(
-      "sanctel://tab-exited",
-      "tab-exited",
-    );
+    const stopListening = listenForTabLifecycleClose("sanctel://tab-exited");
     handlers.get("sanctel://tab-exited")?.({ payload: { id: chat.id } });
     await flushPromises();
 
