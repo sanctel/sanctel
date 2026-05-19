@@ -51,12 +51,7 @@ export function pickFirstSessionAfter(
   entries: readonly AgentSessionFsEntry[],
   startedAt: number,
 ): string | null {
-  let earliest: AgentSessionFsEntry | null = null;
-  for (const e of entries) {
-    if (!JSONL_RE.test(e.name)) continue;
-    if (e.mtime < startedAt) continue;
-    if (!earliest || e.mtime < earliest.mtime) earliest = e;
-  }
+  const earliest = sessionCandidatesAfter(entries, startedAt)[0];
   if (!earliest) return null;
   return earliest.name.replace(JSONL_RE, "");
 }
@@ -68,9 +63,7 @@ export async function discoverCapturedAgentSession(
   try {
     if (!(await opts.fs.exists(dir))) return null;
     const entries = await opts.fs.readDir(dir);
-    const candidates = entries
-      .filter((e) => JSONL_RE.test(e.name) && e.mtime >= opts.startedAt)
-      .sort((a, b) => a.mtime - b.mtime);
+    const candidates = sessionCandidatesAfter(entries, opts.startedAt);
     for (const entry of candidates) {
       const path = `${dir}/${entry.name}`;
       if (await jsonlBelongsToWorktree(opts.fs, path, opts.worktreePath)) {
@@ -90,17 +83,26 @@ async function jsonlBelongsToWorktree(
 ): Promise<boolean> {
   try {
     const firstLine = await fs.readFirstLine(path);
-    const cwd = JSON.parse(firstLine) as { cwd?: unknown };
-    if (typeof cwd.cwd !== "string") return false;
-    return normalizeCwd(cwd.cwd) === normalizeCwd(worktreePath);
+    const firstRecord = JSON.parse(firstLine) as { cwd?: unknown };
+    if (typeof firstRecord.cwd !== "string") return false;
+    return normalizeCwd(firstRecord.cwd) === normalizeCwd(worktreePath);
   } catch {
     return false;
   }
 }
 
+function sessionCandidatesAfter(
+  entries: readonly AgentSessionFsEntry[],
+  startedAt: number,
+): AgentSessionFsEntry[] {
+  return entries
+    .filter((e) => JSONL_RE.test(e.name) && e.mtime >= startedAt)
+    .sort((a, b) => a.mtime - b.mtime);
+}
+
 function normalizeCwd(cwd: string): string {
   const trimmed = cwd.endsWith("/") && cwd.length > 1 ? cwd.slice(0, -1) : cwd;
-  return trimmed.toLocaleLowerCase();
+  return trimmed.toLowerCase();
 }
 
 export function startAgentSessionCapture(

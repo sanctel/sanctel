@@ -99,7 +99,7 @@ describe("discoverCapturedAgentSession", () => {
           text: JSON.stringify({ cwd: "/home/agent/other" }),
         },
         "/home/me/.claude/projects/-home-agent-workspace/chat-tab.jsonl": {
-          text: JSON.stringify({ cwd: "/home/agent/workspace/" }),
+          text: JSON.stringify({ cwd: "/HOME/AGENT/WORKSPACE/" }),
         },
       }),
     });
