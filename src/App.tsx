@@ -48,17 +48,13 @@ export default function App() {
   // UI asks to remove itself. Route through Core's close lifecycle so state,
   // persistence, and best-effort backend cleanup stay in one path.
   useEffect(() => {
-    const unlistenP = listen<unknown>("sanctel://close-tab", (e) => {
-      const id = closeTabIdFromPayload(e.payload);
-      if (!id) return;
+    return listenForTabLifecycleClose("sanctel://close-tab", "close-tab");
+  }, []);
 
-      useTabStore.getState().closeTab(id).catch((err) => {
-        console.error("close-tab closeTab failed", err);
-      });
-    });
-    return () => {
-      unlistenP.then((u) => u()).catch(() => {});
-    };
+  // Rust emits `sanctel://tab-exited` when a terminal-like Tab's backing
+  // TmuxSession is confirmed gone. Core still owns Tab removal.
+  useEffect(() => {
+    return listenForTabLifecycleClose("sanctel://tab-exited", "tab-exited");
   }, []);
 
   // While the probe result is still in flight, show nothing — first paint
@@ -76,6 +72,26 @@ export default function App() {
       <ContentArea />
     </div>
   );
+}
+
+export function listenForTabLifecycleClose(
+  eventName: "sanctel://close-tab" | "sanctel://tab-exited",
+  logContext: string,
+): () => void {
+  const unlistenP = listen<unknown>(eventName, (e) => {
+    const id = closeTabIdFromPayload(e.payload);
+    if (!id) return;
+
+    const state = useTabStore.getState();
+    if (!state.tabs.some((t) => t.id === id)) return;
+
+    state.closeTab(id).catch((err) => {
+      console.error(`${logContext} closeTab failed`, err);
+    });
+  });
+  return () => {
+    unlistenP.then((u) => u()).catch(() => {});
+  };
 }
 
 function closeTabIdFromPayload(payload: unknown): string | null {
