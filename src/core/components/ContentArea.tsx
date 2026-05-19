@@ -29,8 +29,18 @@ export default function ContentArea() {
     const el = ref.current;
     if (!el) return;
 
+    // Don't propagate transient near-zero measurements during React layout
+    // commits. When `activeTab` changes, this effect re-runs and `report()`
+    // can fire mid-paint while the `<main>` element briefly measures as
+    // (almost) zero. Forwarding that to Rust causes show_webview to size
+    // the active webview to 1×1, which collapses xterm to rows=1, which
+    // resizes the tmux pane to 1 row, which TRUNCATES SCROLLBACK
+    // irrecoverably. Anything below MIN_CONTENT_PX in either dimension is
+    // almost certainly a transient and not a real layout intent.
+    const MIN_CONTENT_PX = 32;
     const report = () => {
       const r = el.getBoundingClientRect();
+      if (r.width < MIN_CONTENT_PX || r.height < MIN_CONTENT_PX) return;
       setContentRect({ x: r.x, y: r.y, w: r.width, h: r.height });
     };
     report();

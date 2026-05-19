@@ -62,10 +62,15 @@ export function mount(
 
   term.open(container);
 
-  // WebGL renderer for throughput. Falls back to canvas silently if WebGL
-  // isn't available (e.g., older WebKit).
+  // WebGL renderer for throughput. Falls back to canvas if WebGL is not
+  // available (older WebKit). On context loss (can happen when WKWebView
+  // releases GPU resources on macOS), dispose the addon so xterm falls
+  // back to canvas rendering for the rest of the tab's lifetime.
   try {
     const webgl = new WebglAddon();
+    webgl.onContextLoss(() => {
+      webgl.dispose();
+    });
     term.loadAddon(webgl);
   } catch {
     // No WebGL — xterm will use its canvas renderer.
@@ -103,7 +108,16 @@ export function mount(
   // Forward xterm size changes (driven by fit.fit() below) to tmux via Rust.
   // term.onResize fires whenever the cell grid actually changes — duplicate
   // ResizeObserver callbacks at the same dimensions don't cost an IPC.
+  // Filter degenerate resizes before they reach tmux. Anything with rows < 4
+  // or cols < 20 is almost certainly a transient layout state, not a real
+  // user intent — and forwarding it would call `tmux resize-window` with
+  // tiny dimensions, which truncates scrollback non-recoverably. The
+  // upstream guard in ContentArea blocks the most common cause (near-zero
+  // content rect during React layout commits); this is belt-and-braces.
+  const MIN_COLS = 20;
+  const MIN_ROWS = 4;
   const onResizeDisposable = term.onResize(({ cols, rows }) => {
+    if (cols < MIN_COLS || rows < MIN_ROWS) return;
     invoke("terminal_resize", { cols, rows }).catch((e) =>
       console.error("terminal_resize failed", e),
     );
@@ -112,11 +126,23 @@ export function mount(
   // Reflow on container size changes. fit.fit() re-measures the container,
   // computes cell dimensions, and resizes the terminal (which fires the
   // term.onResize above).
+  //
+  // CRITICAL: filter degenerate container sizes BEFORE fit.fit() runs.
+  // When the webview is moved off-screen (sanctel's hide_webview), WebKit
+  // collapses the body layout, which fires a ResizeObserver tick reporting
+  // a near-zero container. `fit.fit()` would compute rows=1, call
+  // term.resize(127, 1), and xterm would internally truncate the buffer —
+  // the term.onResize callback fires AFTER the resize is committed, so
+  // skipping the IPC there is too late to undo the damage. The guard has
+  // to be here, before fit runs.
+  const MIN_CONTAINER_PX = 40;
   const resizeObserver = new ResizeObserver(() => {
+    const r = container.getBoundingClientRect();
+    if (r.width < MIN_CONTAINER_PX || r.height < MIN_CONTAINER_PX) return;
     try {
       fit.fit();
     } catch {
-      // fit can throw if the container is briefly 0×0 during layout.
+      // fit can throw if xterm's renderer measurements aren't ready yet.
     }
   });
   resizeObserver.observe(container);
