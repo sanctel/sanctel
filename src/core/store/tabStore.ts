@@ -35,7 +35,6 @@ interface CreateTabResp {
 // and return the resolved name." Pinned as a const so React never types
 // the literal twice.
 const AUTO_WINDOW_NAME = "auto";
-const TMUX_SAFE_CHAR = /[^A-Za-z0-9_-]/gu;
 
 interface TabState {
   profiles: Profile[];
@@ -680,27 +679,49 @@ async function reapOrphanTmuxSessions(
   tabs: Tab[],
   spaces: Space[],
 ): Promise<void> {
-  const knownSessionNames = knownTmuxSessionNames(tabs, spaces);
-  await invoke("reap_orphan_tmux_sessions", { knownSessionNames }).catch((e) => {
+  try {
+    const knownSessionNames = await knownTmuxSessionNames(tabs, spaces);
+    await invoke("reap_orphan_tmux_sessions", { knownSessionNames });
+  } catch (e) {
     console.error("reap_orphan_tmux_sessions failed", e);
-  });
+  }
 }
 
-function knownTmuxSessionNames(tabs: Tab[], spaces: Space[]): string[] {
-  return tabs.flatMap((t) => {
+interface TmuxSessionNameSpec {
+  prefix: "sanctel_wt" | "sanctel_detached";
+  unsafeId: string;
+  windowName: string;
+}
+
+async function knownTmuxSessionNames(
+  tabs: Tab[],
+  spaces: Space[],
+): Promise<string[]> {
+  const specs: TmuxSessionNameSpec[] = tabs.flatMap((t) => {
     if (t.kind !== "terminal" && t.kind !== "chat") return [];
     const space = spaces.find((sp) => sp.id === t.spaceId);
     if (!space) return [];
-    const windowName = t.windowName ?? "term-1";
-    const base = t.worktreeId
-      ? `sanctel_wt_${tmuxSafe(t.worktreeId)}`
-      : `sanctel_detached_${tmuxSafe(space.profileId)}`;
-    return [`${base}__${windowName}`];
+    return [
+      {
+        prefix: t.worktreeId ? "sanctel_wt" : "sanctel_detached",
+        unsafeId: t.worktreeId ?? space.profileId,
+        windowName: t.windowName ?? "term-1",
+      },
+    ];
   });
-}
 
-function tmuxSafe(value: string): string {
-  return value.replace(TMUX_SAFE_CHAR, "_");
+  if (specs.length === 0) return [];
+
+  const safeIds = await invoke<string[]>("tmux_safe_many", {
+    inputs: specs.map((s) => s.unsafeId),
+  });
+  if (safeIds.length !== specs.length) {
+    throw new Error(
+      `tmux_safe_many returned ${safeIds.length} ids for ${specs.length} inputs`,
+    );
+  }
+
+  return specs.map((spec, i) => `${spec.prefix}_${safeIds[i]}__${spec.windowName}`);
 }
 
 // Production singleton. App.tsx calls `hydrate(new SqlPersistence())` on

@@ -442,6 +442,11 @@ fn reap_orphan_tmux_sessions(known_session_names: Vec<String>) -> Result<ReapRep
 }
 
 #[tauri::command]
+fn tmux_safe_many(inputs: Vec<String>) -> Vec<String> {
+    inputs.into_iter().map(|input| tmux_safe(&input)).collect()
+}
+
+#[tauri::command]
 fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     // Tauri 2 doesn't expose a stable webview.close() at the time of this
     // sanctel — easiest path is to drop the handle and let GC handle it.
@@ -718,6 +723,7 @@ pub fn run() {
             terminal_write,
             terminal_resize,
             tmux_status,
+            tmux_safe_many,
             reap_orphan_tmux_sessions,
         ])
         .run(tauri::generate_context!())
@@ -810,6 +816,22 @@ mod tests {
         assert!(!session.contains(':'));
         assert!(!session.contains('.'));
         assert_eq!(session, "sanctel_detached_work_profile_1__term-1");
+    }
+
+    #[test]
+    fn tmux_safe_many_matches_canonical_tmux_safe_for_representative_inputs() {
+        let inputs = vec![
+            "main".to_string(),
+            "feature/x".to_string(),
+            "caf\u{00E9}".to_string(),
+            "sanctel-\u{00E9}xperiment".to_string(),
+            "\u{4F60}\u{597D}".to_string(),
+        ];
+
+        assert_eq!(
+            tmux_safe_many(inputs),
+            vec!["main", "feature_x", "caf_", "sanctel-_xperiment", "__"],
+        );
     }
 
     #[test]

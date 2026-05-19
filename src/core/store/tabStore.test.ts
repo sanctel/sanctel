@@ -38,6 +38,14 @@ function markTmuxAvailable() {
 let nextTermN = 1;
 
 function mockCreateTabAutoAllocate(cmd: string, args: unknown): unknown {
+  if (cmd === "tmux_safe_many") {
+    const inputs = (args as { inputs?: string[] }).inputs ?? [];
+    const safeIds: Record<string, string> = {
+      "profile.default": "profile_default",
+      "sanctel-main": "sanctel-main",
+    };
+    return Promise.resolve(inputs.map((input) => safeIds[input] ?? input));
+  }
   if (cmd !== "create_tab") return Promise.resolve(undefined);
   const req = (args as { req?: { kind?: string; windowName?: string | null } })
     .req;
@@ -253,8 +261,15 @@ describe("tabStore hydrate", () => {
       "create_tab",
       "create_tab",
       "create_tab",
+      "tmux_safe_many",
       "reap_orphan_tmux_sessions",
     ]);
+    const safeCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "tmux_safe_many",
+    );
+    expect(safeCall?.[1]).toEqual({
+      inputs: ["profile.default", "sanctel-main", "sanctel-main"],
+    });
     const reapCall = invokeMock.mock.calls.find(
       ([cmd]) => cmd === "reap_orphan_tmux_sessions",
     );
@@ -263,6 +278,76 @@ describe("tabStore hydrate", () => {
         "sanctel_detached_profile_default__term-1",
         "sanctel_wt_sanctel-main__term-2",
         "sanctel_wt_sanctel-main__term-3",
+      ],
+    });
+  });
+
+  it("round-trips tmux session-name inputs through Rust before reaping", async () => {
+    invokeMock.mockImplementation((cmd, args) => {
+      if (cmd === "tmux_safe_many") {
+        expect(args).toEqual({
+          inputs: ["profile.with.dot", "feature/caf\u00e9"],
+        });
+        return Promise.resolve(["profile_from_rust", "feature_from_rust"]);
+      }
+      return mockCreateTabAutoAllocate(cmd, args);
+    });
+
+    const persistence = new InMemoryPersistence();
+    await persistence.saveProfile({
+      id: "profile.with.dot",
+      name: "Default",
+      color: null,
+      isDefault: true,
+    });
+    await persistence.saveSpace({
+      id: "space-default",
+      profileId: "profile.with.dot",
+      name: "Default",
+      color: "#6366f1",
+      sortOrder: 0,
+    });
+    await persistence.saveTab({
+      id: "tab-detached",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "detached",
+      sortOrder: 0,
+      url: "local://terminal",
+      worktreeId: null,
+      windowName: "term-1",
+      initialCommand: null,
+      agentSessionId: null,
+    });
+    await persistence.saveTab({
+      id: "tab-unicode-worktree",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "unicode",
+      sortOrder: 1,
+      url: "local://terminal",
+      worktreeId: "feature/caf\u00e9",
+      windowName: "term-2",
+      initialCommand: null,
+      agentSessionId: null,
+    });
+
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    expect(invokeMock.mock.calls.map(([cmd]) => cmd)).toEqual([
+      "create_tab",
+      "create_tab",
+      "tmux_safe_many",
+      "reap_orphan_tmux_sessions",
+    ]);
+    const reapCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "reap_orphan_tmux_sessions",
+    );
+    expect(reapCall?.[1]).toEqual({
+      knownSessionNames: [
+        "sanctel_detached_profile_from_rust__term-1",
+        "sanctel_wt_feature_from_rust__term-2",
       ],
     });
   });
