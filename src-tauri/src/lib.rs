@@ -827,9 +827,11 @@ mod tests {
             "sanctel-\u{00E9}xperiment".to_string(),
             "\u{4F60}\u{597D}".to_string(),
         ];
+        let expected: Vec<String> = inputs.iter().map(|input| tmux_safe(input)).collect();
 
+        assert_eq!(tmux_safe_many(inputs), expected);
         assert_eq!(
-            tmux_safe_many(inputs),
+            expected,
             vec!["main", "feature_x", "caf_", "sanctel-_xperiment", "__"],
         );
     }
