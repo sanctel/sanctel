@@ -2,7 +2,7 @@
 // agent-session-capture.ts so tests can exercise it without a Tauri host.
 
 import { homeDir } from "@tauri-apps/api/path";
-import { exists, readDir, stat } from "@tauri-apps/plugin-fs";
+import { exists, readDir, readTextFile, stat } from "@tauri-apps/plugin-fs";
 
 import {
   startAgentSessionCapture as startCapture,
@@ -29,6 +29,10 @@ const tauriFs: AgentSessionFs = {
       }
     }
     return out;
+  },
+  async readFirstLine(path) {
+    const text = await readTextFile(path);
+    return text.split(/\r?\n/, 1)[0] ?? "";
   },
 };
 
