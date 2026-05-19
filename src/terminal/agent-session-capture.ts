@@ -12,6 +12,7 @@ export interface AgentSessionFsEntry {
 export interface AgentSessionFs {
   exists(path: string): Promise<boolean>;
   readDir(path: string): Promise<AgentSessionFsEntry[]>;
+  readFirstLine(path: string): Promise<string>;
 }
 
 export interface AgentSessionCaptureOptions {
@@ -22,6 +23,7 @@ export interface AgentSessionCaptureOptions {
   fs: AgentSessionFs;
   onSession: (sessionId: string) => Promise<void> | void;
   intervalMs?: number;
+  maxDurationMs?: number;
 }
 
 export interface AgentSessionCapture {
@@ -38,6 +40,7 @@ type AgentSessionDiscoveryOptions = Pick<
 >;
 
 const JSONL_RE = /\.jsonl$/;
+const DEFAULT_MAX_DURATION_MS = 30 * 60 * 1000;
 
 export function encodeCwd(cwd: string): string {
   const trimmed = cwd.endsWith("/") && cwd.length > 1 ? cwd.slice(0, -1) : cwd;
@@ -48,12 +51,7 @@ export function pickFirstSessionAfter(
   entries: readonly AgentSessionFsEntry[],
   startedAt: number,
 ): string | null {
-  let earliest: AgentSessionFsEntry | null = null;
-  for (const e of entries) {
-    if (!JSONL_RE.test(e.name)) continue;
-    if (e.mtime < startedAt) continue;
-    if (!earliest || e.mtime < earliest.mtime) earliest = e;
-  }
+  const earliest = sessionCandidatesAfter(entries, startedAt)[0];
   if (!earliest) return null;
   return earliest.name.replace(JSONL_RE, "");
 }
@@ -65,41 +63,94 @@ export async function discoverCapturedAgentSession(
   try {
     if (!(await opts.fs.exists(dir))) return null;
     const entries = await opts.fs.readDir(dir);
-    return pickFirstSessionAfter(entries, opts.startedAt);
+    const candidates = sessionCandidatesAfter(entries, opts.startedAt);
+    for (const entry of candidates) {
+      const path = `${dir}/${entry.name}`;
+      if (await jsonlBelongsToWorktree(opts.fs, path, opts.worktreePath)) {
+        return entry.name.replace(JSONL_RE, "");
+      }
+    }
+    return null;
   } catch {
     return null;
   }
+}
+
+async function jsonlBelongsToWorktree(
+  fs: AgentSessionFs,
+  path: string,
+  worktreePath: string,
+): Promise<boolean> {
+  try {
+    const firstLine = await fs.readFirstLine(path);
+    const firstRecord = JSON.parse(firstLine) as { cwd?: unknown };
+    if (typeof firstRecord.cwd !== "string") return false;
+    return normalizeCwd(firstRecord.cwd) === normalizeCwd(worktreePath);
+  } catch {
+    return false;
+  }
+}
+
+function sessionCandidatesAfter(
+  entries: readonly AgentSessionFsEntry[],
+  startedAt: number,
+): AgentSessionFsEntry[] {
+  return entries
+    .filter((e) => JSONL_RE.test(e.name) && e.mtime >= startedAt)
+    .sort((a, b) => a.mtime - b.mtime);
+}
+
+function normalizeCwd(cwd: string): string {
+  const trimmed = cwd.endsWith("/") && cwd.length > 1 ? cwd.slice(0, -1) : cwd;
+  return trimmed.toLowerCase();
 }
 
 export function startAgentSessionCapture(
   opts: AgentSessionCaptureOptions,
 ): AgentSessionCapture {
   const intervalMs = opts.intervalMs ?? 5000;
+  const deadlineAt = Date.now() + (opts.maxDurationMs ?? DEFAULT_MAX_DURATION_MS);
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  const stop = () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+
+  const scheduleNext = () => {
+    if (stopped) return;
+    if (Date.now() >= deadlineAt) {
+      stop();
+      return;
+    }
+    timer = setTimeout(tick, intervalMs);
+  };
+
   const tick = async () => {
+    if (Date.now() >= deadlineAt) {
+      stop();
+      return;
+    }
     const sessionId = await discoverCapturedAgentSession(opts);
     if (stopped) return;
     if (sessionId) {
       try {
         await opts.onSession(sessionId);
-        stopped = true;
+        stop();
         return;
       } catch {
         // Persistence can fail transiently; keep polling so the verified
         // transcript can be recorded on a later pass.
       }
     }
-    timer = setTimeout(tick, intervalMs);
+    scheduleNext();
   };
 
-  timer = setTimeout(tick, intervalMs);
+  scheduleNext();
 
   return {
-    stop() {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-    },
+    stop,
   };
 }
