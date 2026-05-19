@@ -2,7 +2,7 @@
 // agent-session-capture.ts so tests can exercise it without a Tauri host.
 
 import { homeDir } from "@tauri-apps/api/path";
-import { exists, readDir, readTextFile, stat } from "@tauri-apps/plugin-fs";
+import { exists, open, readDir, stat } from "@tauri-apps/plugin-fs";
 
 import {
   startAgentSessionCapture as startCapture,
@@ -30,9 +30,20 @@ const tauriFs: AgentSessionFs = {
     }
     return out;
   },
-  async readFirstLine(path) {
-    const text = await readTextFile(path);
-    return text.split(/\r?\n/, 1)[0] ?? "";
+  async readHeader(path) {
+    // Bounded read: 16 KiB is plenty to cover claude's jsonl header
+    // (permission-mode + file-history-snapshot + first user message,
+    // typically <2 KiB total). Avoids pulling a multi-MB transcript
+    // into memory just to extract one cwd field.
+    const file = await open(path, { read: true });
+    try {
+      const buf = new Uint8Array(16 * 1024);
+      const n = await file.read(buf);
+      const slice = n === null ? new Uint8Array(0) : buf.slice(0, n);
+      return new TextDecoder().decode(slice);
+    } finally {
+      await file.close();
+    }
   },
 };
 

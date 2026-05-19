@@ -12,7 +12,12 @@ export interface AgentSessionFsEntry {
 export interface AgentSessionFs {
   exists(path: string): Promise<boolean>;
   readDir(path: string): Promise<AgentSessionFsEntry[]>;
-  readFirstLine(path: string): Promise<string>;
+  /** Read enough of the file's header to find the first record carrying a
+   * `cwd` field. Claude jsonl files start with `permission-mode` /
+   * `file-history-snapshot` records that DON'T include cwd — the cwd
+   * field first appears on the first user/assistant message record,
+   * typically line 3. Implementations may return up to a few KB. */
+  readHeader(path: string): Promise<string>;
 }
 
 export interface AgentSessionCaptureOptions {
@@ -82,10 +87,24 @@ async function jsonlBelongsToWorktree(
   worktreePath: string,
 ): Promise<boolean> {
   try {
-    const firstLine = await fs.readFirstLine(path);
-    const firstRecord = JSON.parse(firstLine) as { cwd?: unknown };
-    if (typeof firstRecord.cwd !== "string") return false;
-    return normalizeCwd(firstRecord.cwd) === normalizeCwd(worktreePath);
+    const header = await fs.readHeader(path);
+    // Claude jsonl files don't carry `cwd` on line 1 — the first records
+    // are `permission-mode` and `file-history-snapshot` headers. `cwd`
+    // first appears on the first user message record (typically line 3).
+    // Scan multiple lines until we find a record with a string `cwd`, or
+    // give up after the header read returns nothing more.
+    for (const line of header.split(/\r?\n/)) {
+      if (!line) continue;
+      try {
+        const record = JSON.parse(line) as { cwd?: unknown };
+        if (typeof record.cwd === "string") {
+          return normalizeCwd(record.cwd) === normalizeCwd(worktreePath);
+        }
+      } catch {
+        // Truncated final line in a bounded header read — skip and continue.
+      }
+    }
+    return false;
   } catch {
     return false;
   }

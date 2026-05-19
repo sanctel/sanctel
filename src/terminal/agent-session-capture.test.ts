@@ -54,12 +54,26 @@ describe("discoverCapturedAgentSession", () => {
         if (!dir?.entries) throw new Error(`no such dir: ${path}`);
         return dir.entries;
       },
-      async readFirstLine(path) {
+      async readHeader(path) {
         const file = files[path];
         if (!file?.text) throw new Error(`no such file: ${path}`);
-        return file.text.split(/\r?\n/, 1)[0] ?? "";
+        return file.text;
       },
     };
+  }
+
+  // Claude jsonl files don't carry `cwd` on line 1 — the first records
+  // are header-y (permission-mode, file-history-snapshot) and lack cwd.
+  // The cwd field first appears on the first message record (typically
+  // line 3). This helper builds a realistic jsonl header so the tests
+  // exercise the multi-line scan rather than a synthetic single-record
+  // shape that would mask the bug fixed alongside this rewrite.
+  function jsonlHeaderWithCwd(cwd: string, sessionId = "test-session"): string {
+    return [
+      JSON.stringify({ type: "permission-mode", permissionMode: "auto", sessionId }),
+      JSON.stringify({ type: "file-history-snapshot", messageId: "m1" }),
+      JSON.stringify({ type: "user", cwd, sessionId, message: { role: "user", content: "hi" } }),
+    ].join("\n");
   }
 
   it("scans the Claude project dir for a post-start transcript", async () => {
@@ -75,7 +89,7 @@ describe("discoverCapturedAgentSession", () => {
           ],
         },
         "/home/me/.claude/projects/-home-agent-workspace/after.jsonl": {
-          text: JSON.stringify({ cwd: "/home/agent/workspace" }),
+          text: jsonlHeaderWithCwd("/home/agent/workspace"),
         },
       }),
     });
@@ -96,15 +110,37 @@ describe("discoverCapturedAgentSession", () => {
           ],
         },
         "/home/me/.claude/projects/-home-agent-workspace/other-worktree.jsonl": {
-          text: JSON.stringify({ cwd: "/home/agent/other" }),
+          text: jsonlHeaderWithCwd("/home/agent/other"),
         },
         "/home/me/.claude/projects/-home-agent-workspace/chat-tab.jsonl": {
-          text: JSON.stringify({ cwd: "/HOME/AGENT/WORKSPACE/" }),
+          text: jsonlHeaderWithCwd("/HOME/AGENT/WORKSPACE/"),
         },
       }),
     });
 
     expect(id).toBe("chat-tab");
+  });
+
+  // Regression pin: when the first line is a record without `cwd` (which
+  // is claude's actual format), the scan must keep going until it finds a
+  // record that has one. Pre-fix, the discovery rejected every jsonl
+  // because it only checked line 1.
+  it("finds cwd on a later line when the first record lacks it", async () => {
+    const id = await discoverCapturedAgentSession({
+      worktreePath: "/home/agent/workspace",
+      startedAt: 200,
+      home: "/home/me",
+      fs: fixtureFs({
+        "/home/me/.claude/projects/-home-agent-workspace": {
+          entries: [{ name: "real.jsonl", mtime: 300 }],
+        },
+        "/home/me/.claude/projects/-home-agent-workspace/real.jsonl": {
+          text: jsonlHeaderWithCwd("/home/agent/workspace"),
+        },
+      }),
+    });
+
+    expect(id).toBe("real");
   });
 });
 
@@ -121,7 +157,7 @@ describe("startAgentSessionCapture", () => {
         async readDir() {
           return [];
         },
-        async readFirstLine() {
+        async readHeader() {
           return "";
         },
       };
