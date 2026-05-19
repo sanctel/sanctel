@@ -183,14 +183,14 @@ describe("tabStore hydrate", () => {
   it("reports known tmux sessions to the reaper after replaying persisted tabs", async () => {
     const persistence = new InMemoryPersistence();
     await persistence.saveProfile({
-      id: "profile-default",
+      id: "profile.default",
       name: "Default",
       color: null,
       isDefault: true,
     });
     await persistence.saveSpace({
       id: "space-default",
-      profileId: "profile-default",
+      profileId: "profile.default",
       name: "Default",
       color: "#6366f1",
       sortOrder: 0,
@@ -260,7 +260,7 @@ describe("tabStore hydrate", () => {
     );
     expect(reapCall?.[1]).toEqual({
       knownSessionNames: [
-        "sanctel_detached_profile-default__term-1",
+        "sanctel_detached_profile_default__term-1",
         "sanctel_wt_sanctel-main__term-2",
         "sanctel_wt_sanctel-main__term-3",
       ],

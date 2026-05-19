@@ -35,6 +35,7 @@ interface CreateTabResp {
 // and return the resolved name." Pinned as a const so React never types
 // the literal twice.
 const AUTO_WINDOW_NAME = "auto";
+const TMUX_SAFE_CHAR = /[^A-Za-z0-9_-]/gu;
 
 interface TabState {
   profiles: Profile[];
@@ -700,15 +701,7 @@ function knownTmuxSessionNames(tabs: Tab[], spaces: Space[]): string[] {
 }
 
 function tmuxSafe(value: string): string {
-  return Array.from(value)
-    .map((c) => {
-      const code = c.charCodeAt(0);
-      const alpha =
-        (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-      const digit = code >= 48 && code <= 57;
-      return alpha || digit || c === "_" || c === "-" ? c : "_";
-    })
-    .join("");
+  return value.replace(TMUX_SAFE_CHAR, "_");
 }
 
 // Production singleton. App.tsx calls `hydrate(new SqlPersistence())` on
