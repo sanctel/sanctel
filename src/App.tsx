@@ -49,13 +49,7 @@ export default function App() {
   // persistence, and best-effort backend cleanup stay in one path.
   useEffect(() => {
     const unlistenP = listen<unknown>("sanctel://close-tab", (e) => {
-      const id =
-        e.payload &&
-        typeof e.payload === "object" &&
-        "id" in e.payload &&
-        typeof e.payload.id === "string"
-          ? e.payload.id
-          : null;
+      const id = closeTabIdFromPayload(e.payload);
       if (!id) return;
 
       useTabStore.getState().closeTab(id).catch((err) => {
@@ -82,4 +76,14 @@ export default function App() {
       <ContentArea />
     </div>
   );
+}
+
+function closeTabIdFromPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  if (!("id" in payload)) return null;
+
+  const id = payload.id;
+  if (typeof id !== "string" || !id) return null;
+
+  return id;
 }
