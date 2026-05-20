@@ -272,7 +272,7 @@ fn spawn_pty_reader(
 ) {
     std::thread::spawn(move || {
         let tmux = TmuxCli::default();
-        match drive_pty_reader_until_done(
+        if let Err(e) = drive_pty_reader_until_done(
             &mut reader,
             |chunk| on_output.send(chunk).is_ok(),
             &tmux,
@@ -280,8 +280,7 @@ fn spawn_pty_reader(
             &session,
             &on_tab_exited,
         ) {
-            Ok(()) => {}
-            Err(e) => eprintln!("failed to confirm tmux session death for tab {tab_id}: {e}"),
+            eprintln!("failed to confirm tmux session death for tab {tab_id}: {e}");
         }
     });
 }
@@ -383,7 +382,11 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn assert_single_has_session_call(calls: &StdMutex<Vec<Vec<String>>>, socket: &str) {
+    fn assert_single_has_session_call(
+        calls: &StdMutex<Vec<Vec<String>>>,
+        socket: &str,
+        session: &str,
+    ) {
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[vec![
@@ -393,7 +396,7 @@ mod tests {
                 "/dev/null".to_string(),
                 "has-session".to_string(),
                 "-t".to_string(),
-                "=session-1".to_string(),
+                format!("={session}"),
             ]],
         );
     }
@@ -484,7 +487,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(output, vec![b"hello".to_vec()]);
-        assert_single_has_session_call(&calls, "test");
+        assert_single_has_session_call(&calls, "test", "session-1");
         assert_eq!(
             rx.try_recv().unwrap(),
             TabExitedPayload {
@@ -519,7 +522,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_single_has_session_call(&calls, "test");
+        assert_single_has_session_call(&calls, "test", "session-1");
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
