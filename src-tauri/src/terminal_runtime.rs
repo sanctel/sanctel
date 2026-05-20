@@ -271,31 +271,58 @@ fn spawn_pty_reader(
     on_tab_exited: TabExitedEmitter,
 ) {
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        let reached_eof = loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break true,
-                Ok(n) => {
-                    if on_output.send(buf[..n].to_vec()).is_err() {
-                        // Channel closed (webview gone). Stop draining.
-                        break false;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break false,
-            }
-        };
-
-        if !reached_eof {
-            return;
-        }
-
-        match tab_exited_payload_if_session_missing(&TmuxCli::default(), &tab_id, &session) {
-            Ok(Some(payload)) => on_tab_exited(payload),
-            Ok(None) => {}
+        let tmux = TmuxCli::default();
+        match drive_pty_reader_until_done(
+            &mut reader,
+            |chunk| on_output.send(chunk).is_ok(),
+            &tmux,
+            &tab_id,
+            &session,
+            &on_tab_exited,
+        ) {
+            Ok(()) => {}
             Err(e) => eprintln!("failed to confirm tmux session death for tab {tab_id}: {e}"),
         }
     });
+}
+
+fn drive_pty_reader_until_done<R, Reader, OnOutput>(
+    mut reader: Reader,
+    mut on_output: OnOutput,
+    tmux: &TmuxCli<R>,
+    tab_id: &str,
+    session: &str,
+    on_tab_exited: &TabExitedEmitter,
+) -> Result<(), TmuxError>
+where
+    R: CommandRunner,
+    Reader: Read,
+    OnOutput: FnMut(Vec<u8>) -> bool,
+{
+    let mut buf = [0u8; 8192];
+    let reached_eof = loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(n) => {
+                if !on_output(buf[..n].to_vec()) {
+                    // Channel closed (webview gone). Stop draining.
+                    break false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break false,
+        }
+    };
+
+    if !reached_eof {
+        return Ok(());
+    }
+
+    if let Some(payload) = tab_exited_payload_if_session_missing(tmux, tab_id, session)? {
+        on_tab_exited(payload);
+    }
+
+    Ok(())
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────
@@ -305,6 +332,7 @@ mod tests {
     use super::*;
     use crate::tmux_cli::{CommandOutput, CommandRunner};
     use std::process::Command;
+    use std::sync::{mpsc, Mutex as StdMutex};
 
     struct HasSessionRunner {
         exists: bool,
@@ -324,12 +352,50 @@ mod tests {
         }
     }
 
+    struct RecordingHasSessionRunner {
+        exists: bool,
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    impl CommandRunner for RecordingHasSessionRunner {
+        fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|arg| arg.to_string()).collect());
+            Ok(CommandOutput {
+                status: if self.exists { 0 } else { 1 },
+                stdout: vec![],
+                stderr: if self.exists {
+                    vec![]
+                } else {
+                    b"can't find session".to_vec()
+                },
+            })
+        }
+    }
+
     fn tmux_available() -> bool {
         Command::new("tmux")
             .arg("-V")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    fn assert_single_has_session_call(calls: &StdMutex<Vec<Vec<String>>>, socket: &str) {
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[vec![
+                "-L".to_string(),
+                socket.to_string(),
+                "-f".to_string(),
+                "/dev/null".to_string(),
+                "has-session".to_string(),
+                "-t".to_string(),
+                "=session-1".to_string(),
+            ]],
+        );
     }
 
     /// AttachError must format its WorktreeMissing variant with the
@@ -385,6 +451,76 @@ mod tests {
         let payload = tab_exited_payload_if_session_missing(&tmux, "tab-1", "session-1").unwrap();
 
         assert_eq!(payload, None);
+    }
+
+    #[test]
+    fn pty_reader_eof_missing_tmux_session_emits_tab_exited() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let tmux = TmuxCli::new(
+            "test",
+            RecordingHasSessionRunner {
+                exists: false,
+                calls: Arc::clone(&calls),
+            },
+        );
+        let reader = std::io::Cursor::new(b"hello".to_vec());
+        let mut output = Vec::new();
+        let (tx, rx) = mpsc::channel();
+        let on_tab_exited: TabExitedEmitter = Arc::new(move |payload| {
+            tx.send(payload).unwrap();
+        });
+
+        drive_pty_reader_until_done(
+            reader,
+            |chunk| {
+                output.push(chunk);
+                true
+            },
+            &tmux,
+            "tab-1",
+            "session-1",
+            &on_tab_exited,
+        )
+        .unwrap();
+
+        assert_eq!(output, vec![b"hello".to_vec()]);
+        assert_single_has_session_call(&calls, "test");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            TabExitedPayload {
+                id: "tab-1".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn pty_reader_eof_existing_tmux_session_does_not_emit_tab_exited() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let tmux = TmuxCli::new(
+            "test",
+            RecordingHasSessionRunner {
+                exists: true,
+                calls: Arc::clone(&calls),
+            },
+        );
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let (tx, rx) = mpsc::channel();
+        let on_tab_exited: TabExitedEmitter = Arc::new(move |payload| {
+            tx.send(payload).unwrap();
+        });
+
+        drive_pty_reader_until_done(
+            reader,
+            |_| true,
+            &tmux,
+            "tab-1",
+            "session-1",
+            &on_tab_exited,
+        )
+        .unwrap();
+
+        assert_single_has_session_call(&calls, "test");
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     /// `TerminalHandle::write_bytes` on a tmux-variant handle reaches the
