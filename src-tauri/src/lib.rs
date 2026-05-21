@@ -289,6 +289,87 @@ fn apply_tmux_conf_and_restore<R: CommandRunner>(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn install_macos_application_menu<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), String> {
+    let menu = build_macos_application_menu(app).map_err(|e| e.to_string())?;
+    app.app_handle()
+        .set_menu(menu)
+        .map_err(|e| format!("install macOS application menu failed: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_macos_application_menu<R: Runtime, M: Manager<R>>(_app: &M) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_application_menu<R: Runtime, M: Manager<R>>(
+    app: &M,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{AboutMetadata, IsMenuItem, Menu, MenuItemKind, PredefinedMenuItem, Submenu};
+
+    let app_handle = app.app_handle();
+    let pkg_info = app_handle.package_info();
+    let config = app_handle.config();
+    let about_metadata = AboutMetadata {
+        name: Some(pkg_info.name.clone()),
+        version: Some(pkg_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config.bundle.publisher.clone().map(|p| vec![p]),
+        ..Default::default()
+    };
+
+    let items: Vec<MenuItemKind<R>> = macos_application_menu_items()
+        .iter()
+        .map(|item| match item {
+            ApplicationMenuItem::About => {
+                PredefinedMenuItem::about(app, None, Some(about_metadata.clone())).map(|i| i.kind())
+            }
+            ApplicationMenuItem::Separator => PredefinedMenuItem::separator(app).map(|i| i.kind()),
+            ApplicationMenuItem::Hide => PredefinedMenuItem::hide(app, None).map(|i| i.kind()),
+            ApplicationMenuItem::HideOthers => {
+                PredefinedMenuItem::hide_others(app, None).map(|i| i.kind())
+            }
+            ApplicationMenuItem::ShowAll => {
+                PredefinedMenuItem::show_all(app, None).map(|i| i.kind())
+            }
+            ApplicationMenuItem::Quit => PredefinedMenuItem::quit(app, None).map(|i| i.kind()),
+        })
+        .collect::<tauri::Result<_>>()?;
+    let item_refs: Vec<&dyn IsMenuItem<R>> = items
+        .iter()
+        .map(|item| item as &dyn IsMenuItem<R>)
+        .collect();
+    let app_submenu = Submenu::with_items(app, pkg_info.name.clone(), true, &item_refs)?;
+
+    Menu::with_items(app, &[&app_submenu])
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplicationMenuItem {
+    About,
+    Separator,
+    Hide,
+    HideOthers,
+    ShowAll,
+    Quit,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_application_menu_items() -> &'static [ApplicationMenuItem] {
+    &[
+        ApplicationMenuItem::About,
+        ApplicationMenuItem::Separator,
+        ApplicationMenuItem::Hide,
+        ApplicationMenuItem::HideOthers,
+        ApplicationMenuItem::ShowAll,
+        ApplicationMenuItem::Separator,
+        ApplicationMenuItem::Quit,
+    ]
+}
+
 /// Move a webview to overlay the current content rect (visible).
 fn show_webview(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -850,6 +931,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
         .setup(|app| {
+            install_macos_application_menu(app)?;
             let restore_startup_paths = prepare_restore_startup_paths(app)?;
             let tmux = Arc::new(TmuxCli::new(
                 DEFAULT_SOCKET,
@@ -895,13 +977,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // Match BOTH ExitRequested and Exit. ExitRequested is the preferred
-    // hook (preventable, runs before tear-down), but without a macOS menu
-    // wired to NSApplicationDelegate's terminate flow, cmd-Q on sanctel
-    // skips it entirely and goes straight to Exit. Hooking both ensures
-    // save fires whichever event the platform actually delivers. tmux
-    // run-shell is synchronous (~1.5s for a typical save), well under
-    // macOS's terminating-app deadline.
+    // Match BOTH ExitRequested and Exit. The macOS application menu should
+    // route cmd-Q through ExitRequested (preventable, before tear-down);
+    // Exit remains a backup for code paths that bypass the menu-driven
+    // lifecycle. tmux run-shell is synchronous (~1.5s for a typical save).
     app.run(|app_handle, event| {
         if matches!(
             event,
@@ -1218,6 +1297,22 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], StartupEvent::Tmux(_)));
         assert_eq!(events[1], StartupEvent::Restore);
+    }
+
+    #[test]
+    fn macos_application_menu_has_standard_quit_flow_items() {
+        assert_eq!(
+            macos_application_menu_items(),
+            &[
+                ApplicationMenuItem::About,
+                ApplicationMenuItem::Separator,
+                ApplicationMenuItem::Hide,
+                ApplicationMenuItem::HideOthers,
+                ApplicationMenuItem::ShowAll,
+                ApplicationMenuItem::Separator,
+                ApplicationMenuItem::Quit,
+            ]
+        );
     }
 
     struct ExitSaveRuntime {
