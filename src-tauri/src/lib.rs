@@ -884,8 +884,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
+    // Match BOTH ExitRequested and Exit. ExitRequested is the preferred
+    // hook (preventable, runs before tear-down), but without a macOS menu
+    // wired to NSApplicationDelegate's terminate flow, cmd-Q on sanctel
+    // skips it entirely and goes straight to Exit. Hooking both ensures
+    // save fires whichever event the platform actually delivers. tmux
+    // run-shell is synchronous (~1.5s for a typical save), well under
+    // macOS's terminating-app deadline.
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
             let restore_runtime = app_handle
                 .state::<AppState>()
                 .restore_runtime
