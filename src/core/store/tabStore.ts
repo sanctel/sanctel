@@ -34,6 +34,9 @@ interface AgentSessionCaptureEvent {
   ts: number;
 }
 
+const AGENT_SESSION_CAPTURED_EVENT = "agent-session-captured";
+const DRAIN_PENDING_AGENT_CAPTURES_COMMAND = "drain_pending_agent_captures";
+
 // Sentinel passed to `create_tab` in place of an explicit windowName. Rust
 // interprets it as "allocate the next term-N under the per-session mutex
 // and return the resolved name." Pinned as a const so React never types
@@ -606,13 +609,11 @@ async function drainPendingAgentCaptures(
 ): Promise<void> {
   try {
     const captures = await invoke<AgentSessionCaptureEvent[]>(
-      "drain_pending_agent_captures",
+      DRAIN_PENDING_AGENT_CAPTURES_COMMAND,
     );
-    for (const capture of captures) {
-      await applyAgentSessionCapture(capture, get, set, persistence);
-    }
+    await applyAgentSessionCaptures(captures, get, set, persistence);
   } catch (e) {
-    console.error("drain_pending_agent_captures failed", e);
+    console.error(`${DRAIN_PENDING_AGENT_CAPTURES_COMMAND} failed`, e);
   }
 }
 
@@ -621,11 +622,13 @@ function listenForAgentSessionCaptures(
   set: StoreApi<TabState>["setState"],
   persistence: () => Persistence | null,
 ): void {
-  listen<AgentSessionCaptureEvent>("agent-session-captured", (event) => {
+  listen<AgentSessionCaptureEvent>(AGENT_SESSION_CAPTURED_EVENT, (event) => {
     applyAgentSessionCapture(event.payload, get, set, persistence).catch((e) =>
-      console.error("agent-session-captured handler failed", e),
+      console.error(`${AGENT_SESSION_CAPTURED_EVENT} handler failed`, e),
     );
-  }).catch((e) => console.error("listen('agent-session-captured') failed", e));
+  }).catch((e) =>
+    console.error(`listen('${AGENT_SESSION_CAPTURED_EVENT}') failed`, e),
+  );
 }
 
 async function applyAgentSessionCapture(
@@ -634,23 +637,29 @@ async function applyAgentSessionCapture(
   set: StoreApi<TabState>["setState"],
   persistence: () => Persistence | null,
 ): Promise<void> {
-  const match = await findTabForTmuxSessionName(capture.sessionName, get);
-  if (!match || match.agentSessionId === capture.sessionId) return;
-
-  await persistence()?.updateTabAgentSession(match.id, capture.sessionId);
-  set((s) => ({
-    tabs: s.tabs.map((t) =>
-      t.id === match.id ? { ...t, agentSessionId: capture.sessionId } : t,
-    ),
-  }));
+  await applyAgentSessionCaptures([capture], get, set, persistence);
 }
 
-async function findTabForTmuxSessionName(
-  sessionName: string,
+async function applyAgentSessionCaptures(
+  captures: AgentSessionCaptureEvent[],
   get: () => TabState,
-): Promise<Tab | undefined> {
-  const pairs = await tmuxSessionNamePairs(get().tabs, get().spaces);
-  return pairs.find((pair) => pair.sessionName === sessionName)?.tab;
+  set: StoreApi<TabState>["setState"],
+  persistence: () => Persistence | null,
+): Promise<void> {
+  if (captures.length === 0) return;
+
+  const tabBySessionName = await tabByTmuxSessionName(get().tabs, get().spaces);
+  for (const capture of captures) {
+    const match = tabBySessionName.get(capture.sessionName);
+    if (!match || match.agentSessionId === capture.sessionId) continue;
+
+    await persistence()?.updateTabAgentSession(match.id, capture.sessionId);
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === match.id ? { ...t, agentSessionId: capture.sessionId } : t,
+      ),
+    }));
+  }
 }
 
 async function reapOrphanTmuxSessions(
@@ -714,6 +723,18 @@ async function tmuxSessionNamePairs(
     tab: spec.tab,
     sessionName: `${spec.prefix}_${safeIds[i]}__${spec.windowName}`,
   }));
+}
+
+async function tabByTmuxSessionName(
+  tabs: Tab[],
+  spaces: Space[],
+): Promise<Map<string, Tab>> {
+  return new Map(
+    (await tmuxSessionNamePairs(tabs, spaces)).map((pair) => [
+      pair.sessionName,
+      pair.tab,
+    ]),
+  );
 }
 
 // Production singleton. App.tsx calls `hydrate(new SqlPersistence())` on
