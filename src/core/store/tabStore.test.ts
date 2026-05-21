@@ -11,14 +11,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // `vi.mock` is hoisted to the top of the file; the factory can't close
 // over file-scope variables. `vi.hoisted` runs *before* the hoisted mocks
 // so the spy is available inside the factory and to the test body.
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+type EventHandler = (event: { payload: unknown }) => void;
+
+const { invokeMock, listenMock, eventHandlers } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
+  listenMock: vi.fn(),
+  eventHandlers: new Map<string, EventHandler>(),
+}));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 // tmuxStatusStore.hydrate uses listen/invoke too; stub both so importing
 // tabStore (which transitively imports tmuxStatusStore) doesn't try to
 // talk to a non-existent Tauri host.
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(() => Promise.resolve(() => {})),
+  listen: listenMock,
 }));
 
 import { createTabStore } from "./tabStore";
@@ -38,6 +44,9 @@ function markTmuxAvailable() {
 let nextTermN = 1;
 
 function mockCreateTabAutoAllocate(cmd: string, args: unknown): unknown {
+  if (cmd === "drain_pending_agent_captures") {
+    return Promise.resolve([]);
+  }
   if (cmd === "tmux_safe_many") {
     const inputs = (args as { inputs?: string[] }).inputs ?? [];
     const safeIds: Record<string, string> = {
@@ -62,6 +71,12 @@ function mockCreateTabAutoAllocate(cmd: string, args: unknown): unknown {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  listenMock.mockReset();
+  eventHandlers.clear();
+  listenMock.mockImplementation((eventName: string, handler: EventHandler) => {
+    eventHandlers.set(eventName, handler);
+    return Promise.resolve(() => {});
+  });
   nextTermN = 1;
   // Default mock: `create_tab` for an auto-allocated terminal/chat returns
   // a CreateTabResp with the next `term-N`; everything else (non-terminal
@@ -84,6 +99,7 @@ describe("tabStore hydrate", () => {
     expect(snap.spaces[0].id).toBe("space-default");
     expect(snap.tabs).toEqual([]);
     expect(invokeMock.mock.calls).toEqual([
+      ["drain_pending_agent_captures"],
       ["reap_orphan_tmux_sessions", { knownSessionNames: [] }],
     ]);
   });
@@ -261,6 +277,7 @@ describe("tabStore hydrate", () => {
       "create_tab",
       "create_tab",
       "create_tab",
+      "drain_pending_agent_captures",
       "tmux_safe_many",
       "reap_orphan_tmux_sessions",
     ]);
@@ -338,6 +355,7 @@ describe("tabStore hydrate", () => {
     expect(invokeMock.mock.calls.map(([cmd]) => cmd)).toEqual([
       "create_tab",
       "create_tab",
+      "drain_pending_agent_captures",
       "tmux_safe_many",
       "reap_orphan_tmux_sessions",
     ]);
@@ -350,6 +368,95 @@ describe("tabStore hydrate", () => {
         "sanctel_wt_feature_from_rust__term-2",
       ],
     });
+  });
+
+  it("applies pending agent captures to matching tabs during hydrate", async () => {
+    invokeMock.mockImplementation((cmd, args) => {
+      if (cmd === "drain_pending_agent_captures") {
+        return Promise.resolve([
+          {
+            sessionName: "sanctel_wt_sanctel-main__term-2",
+            agent: "claude",
+            sessionId: "captured-session-id",
+            ts: 1_779_311_720,
+          },
+          {
+            sessionName: "sanctel_wt_sanctel-main__term-3",
+            agent: "gemini",
+            sessionId: "second-captured-session-id",
+            ts: 1_779_311_721,
+          },
+        ]);
+      }
+      return mockCreateTabAutoAllocate(cmd, args);
+    });
+
+    const persistence = new InMemoryPersistence();
+    await persistence.saveProfile({
+      id: "profile-default",
+      name: "Default",
+      color: null,
+      isDefault: true,
+    });
+    await persistence.saveSpace({
+      id: "space-default",
+      profileId: "profile-default",
+      name: "Default",
+      color: "#6366f1",
+      sortOrder: 0,
+    });
+    await persistence.saveTab({
+      id: "tab-chat",
+      spaceId: "space-default",
+      kind: "chat",
+      title: "chat",
+      sortOrder: 0,
+      url: "local://chat",
+      worktreeId: "sanctel-main",
+      windowName: "term-2",
+      initialCommand: "claude",
+      agentSessionId: null,
+    });
+    await persistence.saveTab({
+      id: "tab-terminal",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "terminal",
+      sortOrder: 1,
+      url: "local://terminal",
+      worktreeId: "sanctel-main",
+      windowName: "term-3",
+      initialCommand: null,
+      agentSessionId: null,
+    });
+
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    expect(useStore.getState().tabs).toMatchObject([
+      {
+        id: "tab-chat",
+        agentSessionId: "captured-session-id",
+        initialCommand: "claude",
+      },
+      {
+        id: "tab-terminal",
+        agentSessionId: "second-captured-session-id",
+        initialCommand: undefined,
+      },
+    ]);
+    expect((await persistence.loadAll()).tabs).toMatchObject([
+      {
+        id: "tab-chat",
+        agentSessionId: "captured-session-id",
+        initialCommand: "claude",
+      },
+      {
+        id: "tab-terminal",
+        agentSessionId: "second-captured-session-id",
+        initialCommand: null,
+      },
+    ]);
   });
 });
 
@@ -496,45 +603,103 @@ describe("tabStore mutations persist", () => {
     });
   });
 
-  it("persists a chat tab's captured AgentSession for the next launch", async () => {
+  it("applies live agent capture events to matching tabs", async () => {
     const persistence = new InMemoryPersistence();
-    const captures: {
-      tabId: string;
-      onSession: (sessionId: string) => Promise<void> | void;
-    }[] = [];
-    const useStore = createTabStore({
-      startAgentSessionCapture: (opts) => {
-        captures.push({ tabId: opts.tabId, onSession: opts.onSession });
-        return { stop: vi.fn() };
-      },
+    await persistence.saveProfile({
+      id: "profile-default",
+      name: "Default",
+      color: null,
+      isDefault: true,
     });
+    await persistence.saveSpace({
+      id: "space-default",
+      profileId: "profile-default",
+      name: "Default",
+      color: "#6366f1",
+      sortOrder: 0,
+    });
+    await persistence.saveTab({
+      id: "tab-terminal",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "terminal",
+      sortOrder: 0,
+      url: "local://terminal",
+      worktreeId: "sanctel-main",
+      windowName: "term-1",
+      initialCommand: null,
+      agentSessionId: null,
+    });
+
+    const useStore = createTabStore();
     await useStore.getState().hydrate(persistence);
 
-    const tab = await useStore.getState().newChatTab("sanctel-main");
-    expect(captures.map((c) => c.tabId)).toEqual([tab.id]);
-
-    await captures[0].onSession("captured-session-id");
+    eventHandlers.get("agent-session-captured")?.({
+      payload: {
+        sessionName: "sanctel_wt_sanctel-main__term-1",
+        agent: "codex",
+        sessionId: "captured-session-id",
+        ts: 1_779_311_720,
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     const snap = await persistence.loadAll();
     expect(snap.tabs[0]).toMatchObject({
-      id: tab.id,
-      kind: "chat",
-      initialCommand: "claude --resume captured-session-id",
+      id: "tab-terminal",
+      kind: "terminal",
+      initialCommand: null,
       agentSessionId: "captured-session-id",
+    });
+    expect(useStore.getState().tabs[0]).toMatchObject({
+      id: "tab-terminal",
+      agentSessionId: "captured-session-id",
+    });
+  });
+
+  it("ignores agent captures with no matching tab", async () => {
+    const persistence = new InMemoryPersistence();
+    await persistence.saveProfile({
+      id: "profile-default",
+      name: "Default",
+      color: null,
+      isDefault: true,
+    });
+    await persistence.saveSpace({
+      id: "space-default",
+      profileId: "profile-default",
+      name: "Default",
+      color: "#6366f1",
+      sortOrder: 0,
+    });
+    await persistence.saveTab({
+      id: "tab-terminal",
+      spaceId: "space-default",
+      kind: "terminal",
+      title: "terminal",
+      sortOrder: 0,
+      url: "local://terminal",
+      worktreeId: "sanctel-main",
+      windowName: "term-1",
+      initialCommand: null,
+      agentSessionId: null,
     });
 
-    invokeMock.mockClear();
-    const useStoreB = createTabStore();
-    await useStoreB.getState().hydrate(persistence);
-    const createTabCall = invokeMock.mock.calls.find(
-      ([cmd]) => cmd === "create_tab",
-    );
-    expect(createTabCall?.[1].req).toMatchObject({
-      id: tab.id,
-      kind: "chat",
-      initialCommand: "claude --resume captured-session-id",
-      agentSessionId: "captured-session-id",
+    const useStore = createTabStore();
+    await useStore.getState().hydrate(persistence);
+
+    eventHandlers.get("agent-session-captured")?.({
+      payload: {
+        sessionName: "sanctel_wt_sanctel-main__missing",
+        agent: "gemini",
+        sessionId: "ignored-session-id",
+        ts: 1_779_311_720,
+      },
     });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(useStore.getState().tabs[0].agentSessionId).toBeUndefined();
+    expect((await persistence.loadAll()).tabs[0].agentSessionId).toBeNull();
   });
 
   it("newChatTab throws tmux-missing when the probe says tmux is unavailable", async () => {

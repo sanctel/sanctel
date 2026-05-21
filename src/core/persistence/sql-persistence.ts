@@ -147,11 +147,10 @@ export class SqlPersistence implements Persistence {
   async updateTabAgentSession(
     id: string,
     agentSessionId: string,
-    initialCommand: string,
   ): Promise<void> {
     this.db.run(
-      "UPDATE tabs SET agent_session_id = ?, initial_command = ? WHERE id = ?",
-      [agentSessionId, initialCommand, id],
+      "UPDATE tabs SET agent_session_id = ? WHERE id = ?",
+      [agentSessionId, id],
     );
     await this.flush();
   }

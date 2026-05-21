@@ -7,23 +7,9 @@ const { invokeMock, listenMock, handlers } = vi.hoisted(() => ({
   listenMock: vi.fn(),
   handlers: new Map<string, EventHandler>(),
 }));
-const { captureStops, startAgentSessionCaptureMock } = vi.hoisted(() => {
-  const captureStops: ReturnType<typeof vi.fn>[] = [];
-  return {
-    captureStops,
-    startAgentSessionCaptureMock: vi.fn(() => {
-      const stop = vi.fn();
-      captureStops.push(stop);
-      return { stop };
-    }),
-  };
-});
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
-vi.mock("./terminal/agent-session-capture-tauri", () => ({
-  startAgentSessionCapture: startAgentSessionCaptureMock,
-}));
 
 import {
   listenForTabLifecycleClose,
@@ -40,8 +26,6 @@ function flushPromises() {
 
 beforeEach(() => {
   handlers.clear();
-  captureStops.length = 0;
-  startAgentSessionCaptureMock.mockClear();
   listenMock.mockReset();
   listenMock.mockImplementation((eventName: string, handler: EventHandler) => {
     handlers.set(eventName, handler);
@@ -55,6 +39,9 @@ beforeEach(() => {
         (args as { req?: { kind?: string } }).req?.kind === "chat")
     ) {
       return Promise.resolve({ windowName: "term-1" });
+    }
+    if (cmd === "drain_pending_agent_captures") {
+      return Promise.resolve([]);
     }
     return Promise.resolve(undefined);
   });
@@ -152,23 +139,6 @@ describe("App tab lifecycle events", () => {
     expect(useTabStore.getState().tabs).toEqual([]);
     expect(useTabStore.getState().activeTab()).toBeUndefined();
     expect(invokeMock.mock.calls).toContainEqual(["hide_all"]);
-
-    stopListening();
-  });
-
-  it("stops chat AgentSession capture when a chat tab exits", async () => {
-    const persistence = new InMemoryPersistence();
-    await useTabStore.getState().hydrate(persistence);
-    const chat = await useTabStore.getState().newChatTab("sanctel-main");
-    expect(captureStops).toHaveLength(1);
-
-    const stopListening = listenForTabLifecycleClose("sanctel://tab-exited");
-    handlers.get("sanctel://tab-exited")?.({ payload: { id: chat.id } });
-    await flushPromises();
-
-    expect(captureStops[0]).toHaveBeenCalledTimes(1);
-    expect(useTabStore.getState().tabs).toEqual([]);
-    expect((await persistence.loadAll()).tabs).toEqual([]);
 
     stopListening();
   });

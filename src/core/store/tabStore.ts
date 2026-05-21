@@ -1,5 +1,6 @@
 import { create, type StoreApi, type UseBoundStore } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   Tab,
   Space,
@@ -16,10 +17,6 @@ import type {
   PersistedTab,
   Persistence,
 } from "../persistence/persistence";
-import {
-  startAgentSessionCapture as startTauriAgentSessionCapture,
-  type AgentSessionCaptureStarter,
-} from "../../terminal/agent-session-capture-tauri";
 
 // Response shape from Rust's `create_tab`. For terminal/chat tabs created
 // with `windowName: "auto"`, Rust returns the resolved name here so the
@@ -28,6 +25,13 @@ import {
 // §"windowName assignment".
 interface CreateTabResp {
   windowName: string | null;
+}
+
+interface AgentSessionCaptureEvent {
+  sessionName: string;
+  agent: "claude" | "codex" | "gemini";
+  sessionId: string;
+  ts: number;
 }
 
 // Sentinel passed to `create_tab` in place of an explicit windowName. Rust
@@ -177,19 +181,10 @@ function tabToRow(t: Tab, sortOrder: number): PersistedTab {
 
 export type TabStoreHook = UseBoundStore<StoreApi<TabState>>;
 
-interface CreateTabStoreOptions {
-  startAgentSessionCapture?: AgentSessionCaptureStarter;
-}
-
-export function createTabStore(
-  options: CreateTabStoreOptions = {},
-): TabStoreHook {
+export function createTabStore(): TabStoreHook {
   // Persistence ref held outside the Zustand state so it doesn't trigger
   // re-renders and so mutations can dispatch through it synchronously.
   let persistence: Persistence | null = null;
-  const startAgentSessionCapture =
-    options.startAgentSessionCapture ?? startTauriAgentSessionCapture;
-  const agentSessionCaptures = new Map<string, { stop(): void }>();
 
   return create<TabState>((set, get) => ({
     profiles: [DEFAULT_PROFILE],
@@ -419,7 +414,6 @@ export function createTabStore(
       const initialCommand = "claude";
 
       const id = crypto.randomUUID();
-      const captureStartedAt = Date.now();
       const resp = await invoke<CreateTabResp>("create_tab", {
         req: {
           id,
@@ -468,23 +462,10 @@ export function createTabStore(
         ),
       }));
 
-      startCaptureForTab({
-        captures: agentSessionCaptures,
-        startAgentSessionCapture,
-        get,
-        set,
-        persistence: () => persistence,
-        tabId: id,
-        worktreePath: worktree.path,
-        startedAt: captureStartedAt,
-      });
-
       return tab;
     },
 
     closeTab: async (id) => {
-      agentSessionCaptures.get(id)?.stop();
-      agentSessionCaptures.delete(id);
       await invoke("close_tab", { id }).catch(console.error);
       // Backend cleanup is best-effort: Core still removes the Tab pointer
       // from persistence and memory if Rust cleanup fails.
@@ -549,6 +530,8 @@ export function createTabStore(
         // First launch — persist defaults so a clean re-read returns them.
         await p.saveProfile(profileToRow(DEFAULT_PROFILE));
         await p.saveSpace(spaceToRow(DEFAULT_SPACE, 0));
+        listenForAgentSessionCaptures(get, set, () => persistence);
+        await drainPendingAgentCaptures(get, set, () => persistence);
         await reapOrphanTmuxSessions([], []);
         return;
       }
@@ -578,76 +561,17 @@ export function createTabStore(
       for (const t of tabs) {
         const space = spacesWithActive.find((sp) => sp.id === t.spaceId);
         if (!space) continue;
-        const captureStartedAt = Date.now();
         try {
           await invoke("create_tab", { req: buildCreateTabReq(t, space) });
-          if (t.kind === "chat" && !t.agentSessionId && t.worktreeId) {
-            const wt = findWorktree(t.worktreeId);
-            if (wt) {
-              startCaptureForTab({
-                captures: agentSessionCaptures,
-                startAgentSessionCapture,
-                get,
-                set,
-                persistence: () => persistence,
-                tabId: t.id,
-                worktreePath: wt.path,
-                startedAt: captureStartedAt,
-              });
-            }
-          }
         } catch (e) {
           console.error("hydrate: create_tab failed for", t.id, e);
         }
       }
 
+      listenForAgentSessionCaptures(get, set, () => persistence);
+      await drainPendingAgentCaptures(get, set, () => persistence);
       await reapOrphanTmuxSessions(tabs, spacesWithActive);
     },
-  }));
-}
-
-interface StartCaptureForTabArgs {
-  captures: Map<string, { stop(): void }>;
-  startAgentSessionCapture: AgentSessionCaptureStarter;
-  get: () => TabState;
-  set: StoreApi<TabState>["setState"];
-  persistence: () => Persistence | null;
-  tabId: string;
-  worktreePath: string;
-  startedAt: number;
-}
-
-function startCaptureForTab(args: StartCaptureForTabArgs): void {
-  args.captures.get(args.tabId)?.stop();
-  const capture = args.startAgentSessionCapture({
-    tabId: args.tabId,
-    worktreePath: args.worktreePath,
-    startedAt: args.startedAt,
-    onSession: async (agentSessionId) => {
-      await recordCapturedAgentSession(args, agentSessionId);
-      args.captures.delete(args.tabId);
-    },
-  });
-  args.captures.set(args.tabId, capture);
-}
-
-async function recordCapturedAgentSession(
-  args: Pick<StartCaptureForTabArgs, "get" | "set" | "persistence" | "tabId">,
-  agentSessionId: string,
-): Promise<void> {
-  const tab = args.get().tabs.find((t) => t.id === args.tabId);
-  if (!tab || tab.kind !== "chat" || tab.agentSessionId) return;
-
-  const initialCommand = `claude --resume ${agentSessionId}`;
-  await args.persistence()?.updateTabAgentSession(
-    args.tabId,
-    agentSessionId,
-    initialCommand,
-  );
-  args.set((s) => ({
-    tabs: s.tabs.map((t) =>
-      t.id === args.tabId ? { ...t, agentSessionId, initialCommand } : t,
-    ),
   }));
 }
 
@@ -675,6 +599,60 @@ function buildCreateTabReq(t: Tab, space: Space) {
   };
 }
 
+async function drainPendingAgentCaptures(
+  get: () => TabState,
+  set: StoreApi<TabState>["setState"],
+  persistence: () => Persistence | null,
+): Promise<void> {
+  try {
+    const captures = await invoke<AgentSessionCaptureEvent[]>(
+      "drain_pending_agent_captures",
+    );
+    for (const capture of captures) {
+      await applyAgentSessionCapture(capture, get, set, persistence);
+    }
+  } catch (e) {
+    console.error("drain_pending_agent_captures failed", e);
+  }
+}
+
+function listenForAgentSessionCaptures(
+  get: () => TabState,
+  set: StoreApi<TabState>["setState"],
+  persistence: () => Persistence | null,
+): void {
+  listen<AgentSessionCaptureEvent>("agent-session-captured", (event) => {
+    applyAgentSessionCapture(event.payload, get, set, persistence).catch((e) =>
+      console.error("agent-session-captured handler failed", e),
+    );
+  }).catch((e) => console.error("listen('agent-session-captured') failed", e));
+}
+
+async function applyAgentSessionCapture(
+  capture: AgentSessionCaptureEvent,
+  get: () => TabState,
+  set: StoreApi<TabState>["setState"],
+  persistence: () => Persistence | null,
+): Promise<void> {
+  const match = await findTabForTmuxSessionName(capture.sessionName, get);
+  if (!match || match.agentSessionId === capture.sessionId) return;
+
+  await persistence()?.updateTabAgentSession(match.id, capture.sessionId);
+  set((s) => ({
+    tabs: s.tabs.map((t) =>
+      t.id === match.id ? { ...t, agentSessionId: capture.sessionId } : t,
+    ),
+  }));
+}
+
+async function findTabForTmuxSessionName(
+  sessionName: string,
+  get: () => TabState,
+): Promise<Tab | undefined> {
+  const pairs = await tmuxSessionNamePairs(get().tabs, get().spaces);
+  return pairs.find((pair) => pair.sessionName === sessionName)?.tab;
+}
+
 async function reapOrphanTmuxSessions(
   tabs: Tab[],
   spaces: Space[],
@@ -688,6 +666,7 @@ async function reapOrphanTmuxSessions(
 }
 
 interface TmuxSessionNameSpec {
+  tab: Tab;
   prefix: "sanctel_wt" | "sanctel_detached";
   unsafeId: string;
   windowName: string;
@@ -697,12 +676,22 @@ async function knownTmuxSessionNames(
   tabs: Tab[],
   spaces: Space[],
 ): Promise<string[]> {
+  return (await tmuxSessionNamePairs(tabs, spaces)).map(
+    (pair) => pair.sessionName,
+  );
+}
+
+async function tmuxSessionNamePairs(
+  tabs: Tab[],
+  spaces: Space[],
+): Promise<{ tab: Tab; sessionName: string }[]> {
   const specs: TmuxSessionNameSpec[] = tabs.flatMap((t) => {
     if (t.kind !== "terminal" && t.kind !== "chat") return [];
     const space = spaces.find((sp) => sp.id === t.spaceId);
     if (!space) return [];
     return [
       {
+        tab: t,
         prefix: t.worktreeId ? "sanctel_wt" : "sanctel_detached",
         unsafeId: t.worktreeId ?? space.profileId,
         windowName: t.windowName ?? "term-1",
@@ -721,7 +710,10 @@ async function knownTmuxSessionNames(
     );
   }
 
-  return specs.map((spec, i) => `${spec.prefix}_${safeIds[i]}__${spec.windowName}`);
+  return specs.map((spec, i) => ({
+    tab: spec.tab,
+    sessionName: `${spec.prefix}_${safeIds[i]}__${spec.windowName}`,
+  }));
 }
 
 // Production singleton. App.tsx calls `hydrate(new SqlPersistence())` on

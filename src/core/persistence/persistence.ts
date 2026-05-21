@@ -68,7 +68,6 @@ export interface Persistence {
   updateTabAgentSession(
     id: string,
     agentSessionId: string,
-    initialCommand: string,
   ): Promise<void>;
   removeTab(id: string): Promise<void>;
 

@@ -17,6 +17,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 mod agent_cli;
+mod agent_session_watcher;
 mod hook_handler;
 mod hooks_installer;
 mod profile_isolation;
@@ -35,6 +36,7 @@ use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
+use crate::agent_session_watcher::AgentSessionCapture;
 use crate::hooks_installer::HooksStatusReport;
 use crate::profile_isolation::apply_profile_isolation;
 use crate::restore_runtime::{RestorePaths, RestoreRuntime, ResurrectRuntime, SaveTimerHandle};
@@ -80,6 +82,7 @@ struct AppState {
     tmux_conf_path: Mutex<Option<String>>,
     restore_runtime: Mutex<Option<Arc<dyn RestoreRuntime>>>,
     save_timer: Mutex<Option<SaveTimerHandle>>,
+    agent_session_watcher: Mutex<Option<agent_session_watcher::AgentSessionWatcher>>,
 }
 
 /// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
@@ -664,6 +667,11 @@ fn decline_hooks_install() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn drain_pending_agent_captures() -> Result<Vec<AgentSessionCapture>, String> {
+    agent_session_watcher::drain_pending_agent_captures()
+}
+
+#[tauri::command]
 fn tmux_safe_many(inputs: Vec<String>) -> Vec<String> {
     inputs.into_iter().map(|input| tmux_safe(&input)).collect()
 }
@@ -928,6 +936,7 @@ pub fn run() {
         .setup(|app| {
             install_macos_application_menu(app)?;
             hooks_installer::refresh_sanctel_symlink()?;
+            let watcher = agent_session_watcher::start(app.handle().clone())?;
             let restore_startup_paths = prepare_restore_startup_paths(app)?;
             let tmux = Arc::new(TmuxCli::new(
                 DEFAULT_SOCKET,
@@ -939,6 +948,7 @@ pub fn run() {
             // structural "backend ready" signal that the frontend setup-
             // screen gates on (Slice 7).
             let state = app.state::<AppState>();
+            *state.agent_session_watcher.lock() = Some(watcher);
             *state.tmux_conf_path.lock() = Some(restore_startup_paths.tmux_conf_path);
             probe_tmux_into(&state.tmux_status, &tmux);
             let snapshot = state.tmux_status.lock().clone();
@@ -973,6 +983,7 @@ pub fn run() {
             uninstall_hooks,
             hooks_status,
             decline_hooks_install,
+            drain_pending_agent_captures,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

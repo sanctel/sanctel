@@ -51,10 +51,9 @@ export class InMemoryPersistence implements Persistence {
   async updateTabAgentSession(
     id: string,
     agentSessionId: string,
-    initialCommand: string,
   ): Promise<void> {
     const t = this.tabs.get(id);
-    if (t) this.tabs.set(id, { ...t, agentSessionId, initialCommand });
+    if (t) this.tabs.set(id, { ...t, agentSessionId });
   }
 
   async removeTab(id: string): Promise<void> {
