@@ -115,7 +115,7 @@ impl<R: CommandRunner + 'static> ResurrectRuntime<R> {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        match tmux.run_shell(&save_script) {
+                        match run_save_script(&tmux, &save_script) {
                             Ok(()) => eprintln!("periodic tmux save succeeded"),
                             Err(e) => eprintln!("periodic tmux save failed: {e}"),
                         }
@@ -130,6 +130,13 @@ impl<R: CommandRunner + 'static> ResurrectRuntime<R> {
             _task: task,
         }
     }
+}
+
+fn run_save_script<R: CommandRunner>(
+    tmux: &TmuxCli<R>,
+    save_script: &str,
+) -> Result<(), RestoreError> {
+    tmux.run_shell(save_script).map_err(Into::into)
 }
 
 impl<R: CommandRunner> RestoreRuntime for ResurrectRuntime<R> {
@@ -163,7 +170,7 @@ impl<R: CommandRunner> RestoreRuntime for ResurrectRuntime<R> {
 
     fn save_now(&self) -> Result<(), RestoreError> {
         let save_script = self.paths.save_script.to_string_lossy().into_owned();
-        self.tmux.run_shell(&save_script).map_err(Into::into)
+        run_save_script(&self.tmux, &save_script)
     }
 }
 
