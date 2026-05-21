@@ -1,8 +1,9 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::snapshot_rewriter::{self, AgentResume};
 use crate::tmux_cli::{CommandRunner, TmuxCli, TmuxError};
 use tokio::sync::oneshot;
 
@@ -49,6 +50,7 @@ pub struct RestorePaths {
     resurrect_dir: PathBuf,
     restore_script: PathBuf,
     save_script: PathBuf,
+    hooks_dir: Option<PathBuf>,
 }
 
 impl RestorePaths {
@@ -61,7 +63,14 @@ impl RestorePaths {
             resurrect_dir: resurrect_dir.into(),
             restore_script: restore_script.into(),
             save_script: save_script.into(),
+            hooks_dir: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_hooks_dir(mut self, hooks_dir: impl Into<PathBuf>) -> Self {
+        self.hooks_dir = Some(hooks_dir.into());
+        self
     }
 }
 
@@ -108,7 +117,7 @@ impl<R: CommandRunner> ResurrectRuntime<R> {
 impl<R: CommandRunner + 'static> ResurrectRuntime<R> {
     pub fn start_periodic_save(&self, interval: Duration) -> SaveTimerHandle {
         let tmux = Arc::clone(&self.tmux);
-        let save_script = self.paths.save_script.to_string_lossy().into_owned();
+        let paths = self.paths.clone();
         let (cancel, mut cancelled) = oneshot::channel::<()>();
 
         // Use tauri::async_runtime::spawn (not tokio::spawn) so this works
@@ -119,7 +128,7 @@ impl<R: CommandRunner + 'static> ResurrectRuntime<R> {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        match run_save_script(&tmux, &save_script) {
+                        match save_with_snapshot_rewrite(&tmux, &paths) {
                             Ok(()) => eprintln!("periodic tmux save succeeded"),
                             Err(e) => eprintln!("periodic tmux save failed: {e}"),
                         }
@@ -141,6 +150,79 @@ fn run_save_script<R: CommandRunner>(
     save_script: &str,
 ) -> Result<(), RestoreError> {
     tmux.run_shell(save_script).map_err(Into::into)
+}
+
+fn save_with_snapshot_rewrite<R: CommandRunner>(
+    tmux: &TmuxCli<R>,
+    paths: &RestorePaths,
+) -> Result<(), RestoreError> {
+    let save_script = paths.save_script.to_string_lossy().into_owned();
+    run_save_script(tmux, &save_script)?;
+    rewrite_latest_snapshot(paths)
+}
+
+fn rewrite_latest_snapshot(paths: &RestorePaths) -> Result<(), RestoreError> {
+    let Some(snapshot_path) = latest_snapshot_path(&paths.resurrect_dir)? else {
+        return Ok(());
+    };
+    let hooks_dir = match &paths.hooks_dir {
+        Some(path) => path.clone(),
+        None => crate::hook_handler::default_hooks_dir().map_err(RestoreError::Io)?,
+    };
+    rewrite_snapshot_file(&snapshot_path, &hooks_dir)
+}
+
+fn latest_snapshot_path(resurrect_dir: &Path) -> Result<Option<PathBuf>, RestoreError> {
+    let last_path = resurrect_dir.join("last");
+    if !last_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(std::fs::canonicalize(&last_path).unwrap_or(last_path)))
+}
+
+fn rewrite_snapshot_file(snapshot_path: &Path, hooks_dir: &Path) -> Result<(), RestoreError> {
+    let captures = crate::agent_session_watcher::read_agent_session_captures(hooks_dir)
+        .map_err(RestoreError::Io)?;
+    let capture_map = snapshot_rewriter::capture_map(
+        captures
+            .into_iter()
+            .map(|capture| {
+                (
+                    capture.session_name,
+                    AgentResume {
+                        agent: capture.agent,
+                        session_id: capture.session_id,
+                    },
+                    capture.ts,
+                )
+            })
+            .collect(),
+    );
+    if capture_map.is_empty() {
+        return Ok(());
+    }
+
+    let snapshot = std::fs::read_to_string(snapshot_path)
+        .map_err(|e| RestoreError::Io(format!("read snapshot failed: {e}")))?;
+    let rewritten = snapshot_rewriter::rewrite_snapshot(&snapshot, &capture_map);
+    if rewritten == snapshot {
+        return Ok(());
+    }
+
+    let tmp_path = tmp_path_for(snapshot_path)?;
+    std::fs::write(&tmp_path, rewritten)
+        .map_err(|e| RestoreError::Io(format!("write snapshot tmp failed: {e}")))?;
+    std::fs::rename(&tmp_path, snapshot_path)
+        .map_err(|e| RestoreError::Io(format!("rename snapshot tmp failed: {e}")))
+}
+
+fn tmp_path_for(path: &Path) -> Result<PathBuf, RestoreError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        RestoreError::Io(format!("snapshot path has no filename: {}", path.display()))
+    })?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    Ok(path.with_file_name(tmp_name))
 }
 
 impl<R: CommandRunner> RestoreRuntime for ResurrectRuntime<R> {
@@ -173,8 +255,7 @@ impl<R: CommandRunner> RestoreRuntime for ResurrectRuntime<R> {
     }
 
     fn save_now(&self) -> Result<(), RestoreError> {
-        let save_script = self.paths.save_script.to_string_lossy().into_owned();
-        run_save_script(&self.tmux, &save_script)
+        save_with_snapshot_rewrite(&self.tmux, &self.paths)
     }
 }
 
@@ -350,6 +431,26 @@ mod tests {
         }
     }
 
+    async fn wait_for_file_contains(path: &Path, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if std::fs::read_to_string(path)
+                .map(|body| body.contains(needle))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "expected {} to contain {needle:?}, got {:?}",
+                    path.display(),
+                    std::fs::read_to_string(path),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[test]
     fn restore_on_launch_runs_anchor_restore_cleanup_and_counts_sessions() {
         let dir = temp_restore_dir("restored");
@@ -428,6 +529,77 @@ mod tests {
         assert_eq!(subcommands(&calls.lock()), vec!["run-shell"]);
     }
 
+    #[test]
+    fn save_now_rewrites_latest_snapshot_after_save_script() {
+        let dir = temp_restore_dir("save-rewrite");
+        let hooks_dir = dir.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("sanctel_wt_sanctel-main__term-1.json"),
+            r#"{"agent":"claude","session_id":"claude-session-1","ts":1779311720}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("tmux_resurrect_20260521T120000.txt");
+        std::fs::write(
+            &snapshot,
+            "pane\tsanctel_wt_sanctel-main__term-1\t0\t1\t:*\t0\tclaude\t:/repo\t1\tclaude\t:claude\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("tmux_resurrect_20260521T120000.txt", dir.join("last")).unwrap();
+        let runner = RecordingRunner::new();
+        let calls = Arc::clone(&runner.calls);
+        let tmux = Arc::new(TmuxCli::new("test", DEFAULT_CONF_PATH, runner));
+        let paths = RestorePaths::new(
+            &dir,
+            "/bundle/resurrect/scripts/restore.sh",
+            "/bundle/resurrect/scripts/save.sh",
+        )
+        .with_hooks_dir(&hooks_dir);
+        let runtime = ResurrectRuntime::new(tmux, paths);
+
+        runtime.save_now().unwrap();
+
+        assert_eq!(subcommands(&calls.lock()), vec!["run-shell"]);
+        assert_eq!(
+            std::fs::read_to_string(&snapshot).unwrap(),
+            "pane\tsanctel_wt_sanctel-main__term-1\t0\t1\t:*\t0\tclaude\t:/repo\t1\tclaude\t:claude --resume claude-session-1\n",
+        );
+        assert!(!dir.join("tmux_resurrect_20260521T120000.txt.tmp").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn capture_map_prefers_freshest_capture_for_a_session() {
+        let map = crate::snapshot_rewriter::capture_map(vec![
+            (
+                "sanctel_wt_sanctel-main__term-1".to_string(),
+                crate::snapshot_rewriter::AgentResume {
+                    agent: "claude".to_string(),
+                    session_id: "old-session".to_string(),
+                },
+                1,
+            ),
+            (
+                "sanctel_wt_sanctel-main__term-1".to_string(),
+                crate::snapshot_rewriter::AgentResume {
+                    agent: "codex".to_string(),
+                    session_id: "new-session".to_string(),
+                },
+                2,
+            ),
+        ]);
+
+        assert_eq!(
+            map.get("sanctel_wt_sanctel-main__term-1"),
+            Some(&crate::snapshot_rewriter::AgentResume {
+                agent: "codex".to_string(),
+                session_id: "new-session".to_string(),
+            }),
+        );
+    }
+
     #[tokio::test]
     async fn periodic_save_invokes_save_at_interval() {
         let dir = temp_restore_dir("periodic-save");
@@ -456,5 +628,40 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(75)).await;
 
         assert_eq!(save_call_count(&calls), calls_after_drop);
+    }
+
+    #[tokio::test]
+    async fn periodic_save_rewrites_latest_snapshot() {
+        let dir = temp_restore_dir("periodic-save-rewrite");
+        let hooks_dir = dir.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("sanctel_wt_sanctel-main__term-1.json"),
+            r#"{"agent":"codex","session_id":"codex-session-1","ts":1779311720}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("last");
+        std::fs::write(
+            &snapshot,
+            "pane\tsanctel_wt_sanctel-main__term-1\t0\t1\t:*\t0\tcodex\t:/repo\t1\tcodex\t:codex\n",
+        )
+        .unwrap();
+        let runner = RecordingRunner::new();
+        let calls = Arc::clone(&runner.calls);
+        let tmux = Arc::new(TmuxCli::new("test", DEFAULT_CONF_PATH, runner));
+        let paths = RestorePaths::new(
+            &dir,
+            "/bundle/resurrect/scripts/restore.sh",
+            "/bundle/resurrect/scripts/save.sh",
+        )
+        .with_hooks_dir(&hooks_dir);
+        let runtime = ResurrectRuntime::new(tmux, paths);
+
+        let _handle = runtime.start_periodic_save(Duration::from_millis(20));
+        wait_for_save_calls(&calls, 1).await;
+        wait_for_file_contains(&snapshot, ":codex resume codex-session-1").await;
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

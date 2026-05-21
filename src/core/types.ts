@@ -88,11 +88,11 @@ export interface Tab {
   worktreeId?: Worktree["id"];
   // Server-held identity for terminal/chat tabs. Persisted across launches
   // so the broken-tab/recreate flow can replay create_tab with the same
-  // tmux window. Chat tabs start plain `claude`, then persist agentSessionId
-  // once Sanctel sees that tab's own transcript appear on disk.
+  // tmux window. Any terminal-like tab can later persist agentSessionId
+  // once Sanctel observes an agent CLI session in that tmux session.
   windowName?: string;          // tmux window inside the Worktree's session
   initialCommand?: string;      // first-shell command for chat tabs
-  agentSessionId?: string;      // known claude --resume target for chat tabs
+  agentSessionId?: string;      // known agent resume target for restore
   loading: boolean;
   favicon?: string;
 }

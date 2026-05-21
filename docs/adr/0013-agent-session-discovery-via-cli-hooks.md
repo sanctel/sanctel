@@ -5,12 +5,11 @@
 **Decision:** Sanctel discovers which agent CLI session is running in
 each pane by **installing a hook into the user's per-CLI settings
 files** (`~/.claude/settings.json`, `~/.codex/hooks.json`,
-`~/.gemini/settings.json`) and **tagging each pane with a
-`SANCTEL_TAB_ID` env var** at tmux session creation. The hook,
-invoked by the CLI itself on every session lifecycle event, reads
-`SANCTEL_TAB_ID` from its inherited environment and writes a sidecar
-`~/.sanctel/hooks/<tab-id>.json` containing the agent's session id.
-Sanctel's fsnotify watcher reads the sidecar and updates
+`~/.gemini/settings.json`). The hook, invoked by the CLI itself on
+every session lifecycle event, resolves the current tmux session name
+from `$TMUX_PANE` and writes a sidecar
+`~/.sanctel/hooks/<tmux-session-name>.json` containing the agent's
+session id. Sanctel's fsnotify watcher reads the sidecar and updates
 `Tab.agentSessionId` in SQLite.
 
 Agent identity is therefore **observed**, not **declared at tab
@@ -39,10 +38,11 @@ The two structural facts that make hook-based discovery work:
 >    Makefile rules all load the same settings file. The hook fires
 >    regardless of how the binary was launched.
 >
-> 2. **`tmux new-session -e VAR=val` propagates the variable to the
->    pane's shell and through to any subprocess.** Sanctel can mark
->    a pane "this is sanctel pane <uuid>" durably via env, without
->    modifying anything the user could bypass with an alias.
+> 2. **tmux already exposes the pane's session name to commands
+>    running inside the pane.** The hook handler reads `$TMUX_PANE`
+>    and asks the sanctel tmux server for `#S`, giving it the same
+>    durable per-Tab handle used by ADR-0012. No extra env var or
+>    mapping file is required.
 
 (Verified in the spike at `docs/design/spikes/restore-feasibility.md`.)
 
@@ -91,13 +91,12 @@ The two structural facts that make hook-based discovery work:
   premise. Rejected for sanctel; flagged for a separate strategic
   ADR if the tradeoff is ever revisited.
 
-- **agent-deck's hooks-in-settings + `SANCTEL_TAB_ID` env** (chosen).
+- **agent-deck's hooks-in-settings + tmux session name** (chosen).
   Uniform across the three CLIs. Deterministic for every invocation
-  path except deliberate `env -u` strips. Mutates the user's CLI
-  settings files (the cost), but multi-tenant: existing hook
-  entries are preserved (verified on the author's host, which
-  already runs superset hooks on claude/codex and TUICommander
-  hooks on gemini).
+  path that runs inside a sanctel tmux pane. Mutates the user's CLI
+  settings files (the cost), but multi-tenant: existing hook entries
+  are preserved (verified on the author's host, which already runs
+  superset hooks on claude/codex and TUICommander hooks on gemini).
 
 ## Consequences
 
@@ -108,11 +107,11 @@ The two structural facts that make hook-based discovery work:
 
 - **Sanctel mutates the user's `~/.claude/settings.json` /
   `~/.codex/hooks.json` / `~/.gemini/settings.json`.** Mutation is
-  additive: sanctel appends a tagged entry to each event's hook
+  additive: sanctel appends its command entry to each event's hook
   array. Removal (during uninstall or `sanctel uninstall-hooks`)
-  removes only tagged entries. Pre-existing entries from other
-  tools (superset, TUICommander, the user's own configs) are
-  preserved.
+  removes only entries whose command contains `sanctel hook-handler`.
+  Pre-existing entries from other tools (superset, TUICommander, the
+  user's own configs) are preserved.
 
 - **Install is explicit and reversible.** First-launch flow asks
   for consent: "Sanctel needs to install hooks in your
@@ -122,11 +121,13 @@ The two structural facts that make hook-based discovery work:
   only for gemini/codex, lossy for user-typed in non-sanctel-aware
   panes) and surfaces that limitation in the UI.
 
-- **`SANCTEL_TAB_ID` is set at session-create time**, not via
-  `set-environment` after the fact. `tmux new-session -e
-  SANCTEL_TAB_ID=<uuid> -s <name> …`. Verified in spike that
-  post-creation `set-environment` does not affect the pane's
-  existing shell.
+- **The tmux session name is the identifier.** The hook handler uses
+  `$TMUX_PANE` plus `tmux display-message -t "$TMUX_PANE" -p '#S'`
+  on the sanctel tmux server to resolve the per-Tab session name
+  (`sanctel_wt_<worktreeId>__<windowName>` or
+  `sanctel_detached_<profileId>__<windowName>`). That session name is
+  the sidecar filename and the key used during resurrect snapshot
+  rewriting.
 
 - **The hook handler is a `sanctel hook-handler` subcommand on the
   sanctel binary**, not a separate script. Settings entry is
@@ -141,10 +142,10 @@ The two structural facts that make hook-based discovery work:
   SessionEnd`. Mapping table modelled on agent-deck's
   `cmd/agent-deck/hook_handler.go:53-79`.
 
-- **Multi-agent-per-cwd is structurally precise.** Each pane has
-  a distinct `SANCTEL_TAB_ID`. Each hook write keys on that.
-  N concurrent agents in the same cwd in N panes produce N
-  distinct sidecars. No race window.
+- **Multi-agent-per-cwd is structurally precise.** Each sanctel Tab
+  has a distinct tmux session name. Each hook write keys on that.
+  N concurrent agents in the same cwd in N panes produce N distinct
+  sidecars. No race window.
 
 - **`Tab.agentSessionId` retains its existing role** as the
   durable handle for `--resume`. The change is in how it gets
@@ -160,8 +161,8 @@ The two structural facts that make hook-based discovery work:
 - **Honest residual asymmetries.** Documented:
   - `claude --bare` skips hooks. Falls back to the passive
     `~/.claude/sessions/<pid>.json` read (amux's mechanism).
-  - `env -u SANCTEL_TAB_ID claude` deliberately strips. No
-    binding. User chose this.
+  - `env -u TMUX_PANE claude` deliberately strips the tmux pane
+    pointer. No binding. User chose this.
   - Running an agent in a non-sanctel-aware tmux pane that
     happened to share the sanctel socket: no env, no binding.
     Out of scope.
@@ -183,28 +184,28 @@ The two structural facts that make hook-based discovery work:
 - Hook entry shape (claude example, all three are isomorphic):
   ```
   {
-    "hooks": [
-      {
-        "type": "command",
-        "command": "/Applications/Sanctel.app/.../sanctel hook-handler"
-      }
-    ]
+    "hooks": {
+      "SessionStart": [
+        {
+          "type": "command",
+          "command": "$HOME/.sanctel/bin/sanctel hook-handler claude"
+        }
+      ]
+    }
   }
   ```
-  Sanctel tags its entries with a stable marker (e.g.
-  `"_sanctel": "v1"`) on the inner object so uninstall is a clean
-  filter. agent-deck does this pattern.
+  Uninstall filters entries whose command contains
+  `sanctel hook-handler`, preserving other tools' hook entries.
 
 - The sidecar JSON shape:
   ```
   {
     "agent": "claude" | "codex" | "gemini",
     "session_id": "<uuid>",
-    "cwd": "...",
-    "event": "SessionStart" | …,
     "ts": 1779311720
   }
   ```
+  The sidecar filename is the tmux session name.
 
 - The fsnotify watcher debounces (100ms, as in agent-deck) to
   coalesce rapid events.
@@ -227,6 +228,10 @@ The two structural facts that make hook-based discovery work:
   tabs survive a laptop restart; the chat-tab restore requirement
   surfaced the creation-time-intent gap and led to the observation
   model. Spike memo: `docs/design/spikes/restore-feasibility.md`.
+- **2026-05-21:** Amended during Slice 3c to use the tmux session
+  name as the hook sidecar identifier instead of a `SANCTEL_TAB_ID`
+  env var. This aligns agent discovery with ADR-0012's per-Tab tmux
+  session naming and removes the extra identifier channel.
 
 ## See also
 

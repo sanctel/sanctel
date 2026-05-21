@@ -22,6 +22,7 @@ mod hook_handler;
 mod hooks_installer;
 mod profile_isolation;
 mod restore_runtime;
+mod snapshot_rewriter;
 mod terminal_runtime;
 mod tmux_cli;
 
@@ -143,8 +144,9 @@ struct TabRecord {
     worktree_path: Option<String>,
     window_name: Option<String>,
     initial_command: Option<String>,
-    /// Verified AgentSession id for chat tabs. The frontend also sends the
-    /// matching `initial_command`, which is what the attach path consumes.
+    /// Verified AgentSession id for terminal-like tabs. Snapshot rewriting
+    /// is driven by hook sidecars keyed by tmux session name; this field is
+    /// retained with the Tab record for frontend restore state.
     #[allow(dead_code)]
     agent_session_id: Option<String>,
 }
@@ -404,8 +406,8 @@ struct CreateTabReq {
     worktree_path: Option<String>,
     window_name: Option<String>,
     initial_command: Option<String>,
-    /// Verified AgentSession id for chat tabs. The matching `initialCommand`
-    /// carries the actual `claude --resume` startup command.
+    /// Verified AgentSession id for terminal-like tabs. `kind: "chat"` is
+    /// a UI affordance; restore identity is not derived from TabKind.
     agent_session_id: Option<String>,
 }
 

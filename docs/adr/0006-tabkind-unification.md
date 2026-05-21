@@ -34,3 +34,7 @@ all kinds; no per-kind subclasses.
 - Plugins can register new TabKinds dynamically without modifying core.
 - Each kind's "backend" lives in its specialized context (terminal, file
   editor, agent runtime, etc.); Core only owns the Tab record itself.
+- `kind: "chat"` is a UI affordance only: it selects chat chrome, icon, and
+  default `initialCommand` at creation time. Agent restore identity is keyed
+  by `Tab.agentSessionId`, populated by CLI hooks for any terminal-like Tab
+  regardless of whether its `kind` is `chat` or `terminal`.

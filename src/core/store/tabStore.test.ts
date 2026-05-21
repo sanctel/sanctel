@@ -129,7 +129,7 @@ describe("tabStore hydrate", () => {
       worktreeId: "sanctel-main",
       windowName: "term-2",
       initialCommand: null,
-      agentSessionId: null,
+      agentSessionId: "terminal-agent-session",
     });
     await persistence.saveTab({
       id: "tab-1",
@@ -168,6 +168,7 @@ describe("tabStore hydrate", () => {
       profileId: "profile-default",
       worktreeId: "sanctel-main",
       windowName: "term-2",
+      agentSessionId: "terminal-agent-session",
     });
   });
 
