@@ -290,7 +290,7 @@ fn apply_tmux_conf_and_restore<R: CommandRunner>(
 }
 
 #[cfg(target_os = "macos")]
-fn install_macos_application_menu<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), String> {
+fn install_macos_application_menu<R: Runtime>(app: &tauri::App<R>) -> Result<(), String> {
     let menu = build_macos_application_menu(app).map_err(|e| e.to_string())?;
     app.app_handle()
         .set_menu(menu)
@@ -299,15 +299,15 @@ fn install_macos_application_menu<R: Runtime, M: Manager<R>>(app: &M) -> Result<
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_macos_application_menu<R: Runtime, M: Manager<R>>(_app: &M) -> Result<(), String> {
+fn install_macos_application_menu<R: Runtime>(_app: &tauri::App<R>) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn build_macos_application_menu<R: Runtime, M: Manager<R>>(
-    app: &M,
+fn build_macos_application_menu<R: Runtime>(
+    app: &tauri::App<R>,
 ) -> tauri::Result<tauri::menu::Menu<R>> {
-    use tauri::menu::{AboutMetadata, IsMenuItem, Menu, MenuItemKind, PredefinedMenuItem, Submenu};
+    use tauri::menu::{AboutMetadata, IsMenuItem, Menu, PredefinedMenuItem, Submenu};
 
     let app_handle = app.app_handle();
     let pkg_info = app_handle.package_info();
@@ -320,54 +320,25 @@ fn build_macos_application_menu<R: Runtime, M: Manager<R>>(
         ..Default::default()
     };
 
-    let items: Vec<MenuItemKind<R>> = macos_application_menu_items()
-        .iter()
-        .map(|item| match item {
-            ApplicationMenuItem::About => {
-                PredefinedMenuItem::about(app, None, Some(about_metadata.clone())).map(|i| i.kind())
-            }
-            ApplicationMenuItem::Separator => PredefinedMenuItem::separator(app).map(|i| i.kind()),
-            ApplicationMenuItem::Hide => PredefinedMenuItem::hide(app, None).map(|i| i.kind()),
-            ApplicationMenuItem::HideOthers => {
-                PredefinedMenuItem::hide_others(app, None).map(|i| i.kind())
-            }
-            ApplicationMenuItem::ShowAll => {
-                PredefinedMenuItem::show_all(app, None).map(|i| i.kind())
-            }
-            ApplicationMenuItem::Quit => PredefinedMenuItem::quit(app, None).map(|i| i.kind()),
-        })
-        .collect::<tauri::Result<_>>()?;
-    let item_refs: Vec<&dyn IsMenuItem<R>> = items
-        .iter()
-        .map(|item| item as &dyn IsMenuItem<R>)
-        .collect();
+    let about = PredefinedMenuItem::about(app, None, Some(about_metadata))?;
+    let separator_before_hide = PredefinedMenuItem::separator(app)?;
+    let hide = PredefinedMenuItem::hide(app, None)?;
+    let hide_others = PredefinedMenuItem::hide_others(app, None)?;
+    let show_all = PredefinedMenuItem::show_all(app, None)?;
+    let separator_before_quit = PredefinedMenuItem::separator(app)?;
+    let quit = PredefinedMenuItem::quit(app, None)?;
+    let item_refs: [&dyn IsMenuItem<R>; 7] = [
+        &about,
+        &separator_before_hide,
+        &hide,
+        &hide_others,
+        &show_all,
+        &separator_before_quit,
+        &quit,
+    ];
     let app_submenu = Submenu::with_items(app, pkg_info.name.clone(), true, &item_refs)?;
 
     Menu::with_items(app, &[&app_submenu])
-}
-
-#[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ApplicationMenuItem {
-    About,
-    Separator,
-    Hide,
-    HideOthers,
-    ShowAll,
-    Quit,
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_application_menu_items() -> &'static [ApplicationMenuItem] {
-    &[
-        ApplicationMenuItem::About,
-        ApplicationMenuItem::Separator,
-        ApplicationMenuItem::Hide,
-        ApplicationMenuItem::HideOthers,
-        ApplicationMenuItem::ShowAll,
-        ApplicationMenuItem::Separator,
-        ApplicationMenuItem::Quit,
-    ]
 }
 
 /// Move a webview to overlay the current content rect (visible).
@@ -1297,22 +1268,6 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], StartupEvent::Tmux(_)));
         assert_eq!(events[1], StartupEvent::Restore);
-    }
-
-    #[test]
-    fn macos_application_menu_has_standard_quit_flow_items() {
-        assert_eq!(
-            macos_application_menu_items(),
-            &[
-                ApplicationMenuItem::About,
-                ApplicationMenuItem::Separator,
-                ApplicationMenuItem::Hide,
-                ApplicationMenuItem::HideOthers,
-                ApplicationMenuItem::ShowAll,
-                ApplicationMenuItem::Separator,
-                ApplicationMenuItem::Quit,
-            ]
-        );
     }
 
     struct ExitSaveRuntime {
