@@ -27,6 +27,9 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": false,
+    "resources": {
+      "../app-bundle": "app-bundle"
+    }
   }
 }

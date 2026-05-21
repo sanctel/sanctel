@@ -1,5 +1,5 @@
 // ───────────────────────────────────────────────────────────────────────────
-// tmux_cli — small typed wrapper over `tmux -L sanctel -f /dev/null`.
+// tmux_cli — small typed wrapper over `tmux -L sanctel -f <conf>`.
 //
 // Every tmux interaction in sanctel goes through this module. It is the
 // only place tmux CLI quirks are allowed (parsing list-windows output,
@@ -9,8 +9,9 @@
 //   - `CommandRunner` is a trait so unit tests can inject a mock without
 //     spawning real processes. Production uses `RealCommandRunner` which
 //     shells out via std::process::Command.
-//   - `TmuxCli::new(socket)` builds a wrapper bound to a specific socket
-//     name (default: "sanctel"). Tests use a temp socket to stay isolated.
+//   - `TmuxCli::new(socket, conf_path, runner)` builds a wrapper bound to a
+//     specific socket name (default: "sanctel") and tmux config path. Tests
+//     use a temp socket to stay isolated and `/dev/null` for config.
 //   - All public methods return Result<T, TmuxError>; race conditions on
 //     new-session are handled internally with a single retry.
 // ───────────────────────────────────────────────────────────────────────────
@@ -20,6 +21,7 @@ use std::process::Output;
 
 /// The default socket name used by the production sanctel app.
 pub const DEFAULT_SOCKET: &str = "sanctel";
+pub const DEFAULT_CONF_PATH: &str = "/dev/null";
 
 /// Sanitize a string for safe inclusion in a tmux session/window name.
 ///
@@ -168,30 +170,40 @@ impl CommandRunner for RealCommandRunner {
 pub struct TmuxCli<R: CommandRunner = RealCommandRunner> {
     runner: R,
     socket: String,
+    conf_path: String,
 }
 
 impl Default for TmuxCli<RealCommandRunner> {
     fn default() -> Self {
-        TmuxCli::new(DEFAULT_SOCKET, RealCommandRunner)
+        TmuxCli::new(DEFAULT_SOCKET, DEFAULT_CONF_PATH, RealCommandRunner)
     }
 }
 
 impl<R: CommandRunner> TmuxCli<R> {
-    pub fn new(socket: impl Into<String>, runner: R) -> Self {
+    pub fn new(socket: impl Into<String>, conf_path: impl Into<String>, runner: R) -> Self {
         TmuxCli {
             runner,
             socket: socket.into(),
+            conf_path: conf_path.into(),
         }
     }
 
+    pub fn socket(&self) -> &str {
+        &self.socket
+    }
+
+    pub fn conf_path(&self) -> &str {
+        &self.conf_path
+    }
+
     /// The argv prefix every tmux call uses. `-L <socket>` puts sanctel on a
-    /// dedicated socket; `-f /dev/null` ignores the user's `~/.tmux.conf`.
+    /// dedicated socket; `-f <conf>` ignores the user's `~/.tmux.conf`.
     fn base_args<'a>(&'a self, rest: &'a [&'a str]) -> Vec<&'a str> {
         let mut v = Vec::with_capacity(rest.len() + 4);
         v.push("-L");
         v.push(self.socket.as_str());
         v.push("-f");
-        v.push("/dev/null");
+        v.push(self.conf_path.as_str());
         v.extend_from_slice(rest);
         v
     }
@@ -246,7 +258,14 @@ impl<R: CommandRunner> TmuxCli<R> {
         initial_command: Option<&str>,
     ) -> Result<(), TmuxError> {
         let mut args: Vec<&str> = vec![
-            "new-session", "-d", "-s", session, "-n", window_name, "-c", cwd,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-n",
+            window_name,
+            "-c",
+            cwd,
         ];
         if let Some(cmd) = initial_command {
             args.push(cmd);
@@ -262,6 +281,35 @@ impl<R: CommandRunner> TmuxCli<R> {
         Err(TmuxError::Command {
             command: format!("new-session -s {session} -n {window_name}"),
             stderr: stderr.into_owned(),
+        })
+    }
+
+    /// `tmux new-session -d -s <session> -c <cwd>`.
+    ///
+    /// This is intentionally narrower than `ensure_session_window`: the only
+    /// production use is the short-lived restore anchor from Slice 1a. Tab
+    /// sessions must continue to go through `ensure_session_window`.
+    pub fn new_anchor_session(&self, session: &str, cwd: &str) -> Result<(), TmuxError> {
+        let out = self.run(&["new-session", "-d", "-s", session, "-c", cwd])?;
+        if out.status == 0 {
+            return Ok(());
+        }
+        Err(TmuxError::Command {
+            command: format!("new-session -s {session}"),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    /// `tmux run-shell <script>`. Used for synchronous resurrect script
+    /// invocations.
+    pub fn run_shell(&self, script: &str) -> Result<(), TmuxError> {
+        let out = self.run(&["run-shell", script])?;
+        if out.status == 0 {
+            return Ok(());
+        }
+        Err(TmuxError::Command {
+            command: format!("run-shell {script}"),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
 
@@ -334,13 +382,7 @@ impl<R: CommandRunner> TmuxCli<R> {
     /// `tmux list-windows -t <session> -F '#{window_name}'`.
     pub fn list_windows(&self, session: &str) -> Result<Vec<String>, TmuxError> {
         let target = format!("={session}");
-        let out = self.run(&[
-            "list-windows",
-            "-t",
-            &target,
-            "-F",
-            "#{window_name}",
-        ])?;
+        let out = self.run(&["list-windows", "-t", &target, "-F", "#{window_name}"])?;
         if out.status != 0 {
             return Err(TmuxError::Command {
                 command: format!("list-windows -t {session}"),
@@ -595,21 +637,21 @@ mod tests {
     }
 
     #[test]
-    fn base_args_prefixes_socket_and_no_config() {
+    fn base_args_prefixes_socket_and_config_path() {
         let mock = MockRunner::new(vec![MockCall {
             expect_args_contain: None,
             result: ok("tmux 3.4\n"),
         }]);
-        let cli = TmuxCli::new("test-sock", mock);
+        let cli = TmuxCli::new("test-sock", "/tmp/sanctel.tmux.conf", mock);
         cli.version().unwrap();
         let seen = cli.runner.seen_args();
-        // Every call must start with `-L test-sock -f /dev/null …`.
+        // Every call must start with `-L test-sock -f <configured path> …`.
         assert_eq!(seen.len(), 1);
         let args = &seen[0];
         assert_eq!(args[0], "-L");
         assert_eq!(args[1], "test-sock");
         assert_eq!(args[2], "-f");
-        assert_eq!(args[3], "/dev/null");
+        assert_eq!(args[3], "/tmp/sanctel.tmux.conf");
     }
 
     #[test]
@@ -618,7 +660,7 @@ mod tests {
             expect_args_contain: Some(vec!["-V"]),
             result: ok("tmux 3.4\n"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         assert_eq!(cli.version().unwrap(), "tmux 3.4");
     }
 
@@ -633,7 +675,7 @@ mod tests {
                 ))
             }
         }
-        let cli = TmuxCli::new("s", FailingRunner);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, FailingRunner);
         match cli.version() {
             Err(TmuxError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -646,7 +688,7 @@ mod tests {
             expect_args_contain: Some(vec!["has-session", "=foo"]),
             result: ok(""),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         assert!(cli.has_session("foo").unwrap());
     }
 
@@ -656,7 +698,7 @@ mod tests {
             expect_args_contain: Some(vec!["has-session"]),
             result: err("can't find session"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         assert!(!cli.has_session("foo").unwrap());
     }
 
@@ -666,7 +708,7 @@ mod tests {
             expect_args_contain: Some(vec!["list-windows", "#{window_name}"]),
             result: ok("term-1\nterm-2\nterm-3\n"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         let names = cli.list_windows("sess").unwrap();
         assert_eq!(names, vec!["term-1", "term-2", "term-3"]);
     }
@@ -677,7 +719,7 @@ mod tests {
             expect_args_contain: Some(vec!["list-windows"]),
             result: ok("term-1\n\nterm-2\n\n"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         assert_eq!(cli.list_windows("sess").unwrap(), vec!["term-1", "term-2"]);
     }
 
@@ -696,18 +738,30 @@ mod tests {
                 // Verify `-n term-1` is in the new-session call. This is the
                 // assertion that prevents the phantom-window regression.
                 expect_args_contain: Some(vec![
-                    "new-session", "-d", "-s", "foo", "-n", "term-1", "-c", "/tmp",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "foo",
+                    "-n",
+                    "term-1",
+                    "-c",
+                    "/tmp",
                 ]),
                 result: ok(""),
             },
         ]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session_window("foo", "term-1", "/tmp", None).unwrap();
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
+        cli.ensure_session_window("foo", "term-1", "/tmp", None)
+            .unwrap();
         let seen = cli.runner.seen_args();
         // Exactly two tmux invocations: has-session + new-session. No
         // trailing new-window. The phantom-window bug was created precisely
         // by an extra new-window call after a bare `new-session`.
-        assert_eq!(seen.len(), 2, "expected has-session + new-session only, got: {seen:?}");
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected has-session + new-session only, got: {seen:?}"
+        );
         assert!(
             !seen[1].iter().any(|a| a == "new-window"),
             "must not invoke new-window when session is created with -n",
@@ -725,12 +779,15 @@ mod tests {
             },
             MockCall {
                 expect_args_contain: Some(vec![
-                    "new-session", "-n", "term-1", "claude --resume abc",
+                    "new-session",
+                    "-n",
+                    "term-1",
+                    "claude --resume abc",
                 ]),
                 result: ok(""),
             },
         ]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         cli.ensure_session_window("foo", "term-1", "/tmp", Some("claude --resume abc"))
             .unwrap();
     }
@@ -753,8 +810,9 @@ mod tests {
                 result: ok(""),
             },
         ]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session_window("foo", "term-2", "/tmp", None).unwrap();
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
+        cli.ensure_session_window("foo", "term-2", "/tmp", None)
+            .unwrap();
         assert_eq!(cli.runner.seen_args().len(), 3);
     }
 
@@ -772,11 +830,14 @@ mod tests {
                 result: ok("term-1\nterm-2\n"),
             },
         ]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session_window("foo", "term-1", "/tmp", None).unwrap();
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
+        cli.ensure_session_window("foo", "term-1", "/tmp", None)
+            .unwrap();
         let seen = cli.runner.seen_args();
         assert_eq!(seen.len(), 2, "no new-window expected; got: {seen:?}");
-        assert!(!seen.iter().any(|args| args.iter().any(|a| a == "new-window")));
+        assert!(!seen
+            .iter()
+            .any(|args| args.iter().any(|a| a == "new-window")));
     }
 
     /// Race: `has-session` says no, `new-session` loses to a concurrent
@@ -806,8 +867,9 @@ mod tests {
                 result: ok(""),
             },
         ]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session_window("foo", "term-2", "/tmp", None).unwrap();
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
+        cli.ensure_session_window("foo", "term-2", "/tmp", None)
+            .unwrap();
         assert_eq!(cli.runner.seen_args().len(), 5);
     }
 
@@ -835,11 +897,14 @@ mod tests {
                 result: ok("term-1\n"),
             },
         ]);
-        let cli = TmuxCli::new("s", mock);
-        cli.ensure_session_window("foo", "term-1", "/tmp", None).unwrap();
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
+        cli.ensure_session_window("foo", "term-1", "/tmp", None)
+            .unwrap();
         let seen = cli.runner.seen_args();
         assert_eq!(seen.len(), 4);
-        assert!(!seen.iter().any(|args| args.iter().any(|a| a == "new-window")));
+        assert!(!seen
+            .iter()
+            .any(|args| args.iter().any(|a| a == "new-window")));
     }
 
     /// kill_session targets the session with the `=` exact-match prefix so
@@ -853,7 +918,7 @@ mod tests {
             expect_args_contain: Some(vec!["kill-session", "=sanctel_wt_x__term-1"]),
             result: ok(""),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         cli.kill_session("sanctel_wt_x__term-1").unwrap();
     }
 
@@ -863,7 +928,7 @@ mod tests {
             expect_args_contain: Some(vec!["kill-session"]),
             result: err("can't find session: nope"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         // Must succeed — close_tab cleanups call this without a
         // has-session probe.
         cli.kill_session("nope").unwrap();
@@ -881,7 +946,7 @@ mod tests {
             expect_args_contain: Some(vec!["kill-session"]),
             result: err("no server running on /tmp/tmux-1000/sanctel"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         cli.kill_session("any").unwrap();
     }
 
@@ -891,7 +956,7 @@ mod tests {
             expect_args_contain: Some(vec!["kill-session"]),
             result: err("some other tmux failure"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         assert!(matches!(
             cli.kill_session("x"),
             Err(TmuxError::Command { .. })
@@ -904,7 +969,7 @@ mod tests {
             expect_args_contain: Some(vec!["list-sessions", "#{session_name}"]),
             result: ok("sanctel_wt_a__term-1\nsanctel_wt_a__term-2\nsanctel_wt_b__term-1\n"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         let names = cli.list_sessions().unwrap();
         assert_eq!(
             names,
@@ -927,7 +992,7 @@ mod tests {
             expect_args_contain: Some(vec!["list-sessions"]),
             result: err("no server running on /tmp/tmux-1000/sanctel"),
         }]);
-        let cli = TmuxCli::new("s", mock);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
         assert_eq!(cli.list_sessions().unwrap(), Vec::<String>::new());
     }
 
@@ -956,12 +1021,20 @@ mod tests {
             }
         }
         fn windows_for(&self, session: &str) -> Vec<String> {
-            self.windows.lock().unwrap().get(session).cloned().unwrap_or_default()
+            self.windows
+                .lock()
+                .unwrap()
+                .get(session)
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
     fn arg_after<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
-        args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1)).copied()
+        args.iter()
+            .position(|a| *a == flag)
+            .and_then(|i| args.get(i + 1))
+            .copied()
     }
 
     impl CommandRunner for StateRunner {
@@ -971,10 +1044,7 @@ mod tests {
                 .find(|a| {
                     matches!(
                         **a,
-                        "has-session"
-                            | "new-session"
-                            | "list-windows"
-                            | "new-window"
+                        "has-session" | "new-session" | "list-windows" | "new-window"
                     )
                 })
                 .copied()
@@ -989,7 +1059,11 @@ mod tests {
                     Ok(CommandOutput {
                         status: if exists { 0 } else { 1 },
                         stdout: vec![],
-                        stderr: if exists { vec![] } else { b"can't find session".to_vec() },
+                        stderr: if exists {
+                            vec![]
+                        } else {
+                            b"can't find session".to_vec()
+                        },
                     })
                 }
                 "new-session" => {
@@ -1008,7 +1082,11 @@ mod tests {
                         e.insert(initial);
                         self.new_session_wins
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(CommandOutput { status: 0, stdout: vec![], stderr: vec![] })
+                        Ok(CommandOutput {
+                            status: 0,
+                            stdout: vec![],
+                            stderr: vec![],
+                        })
                     } else {
                         Ok(CommandOutput {
                             status: 1,
@@ -1043,9 +1121,17 @@ mod tests {
                     let mut map = self.windows.lock().unwrap();
                     let windows = map.entry(target).or_default();
                     windows.push(name);
-                    Ok(CommandOutput { status: 0, stdout: vec![], stderr: vec![] })
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
                 }
-                _ => Ok(CommandOutput { status: 0, stdout: vec![], stderr: vec![] }),
+                _ => Ok(CommandOutput {
+                    status: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                }),
             }
         }
     }
@@ -1069,18 +1155,22 @@ mod tests {
                 let window = window.to_string();
                 let cwd = cwd.to_string();
                 std::thread::spawn(move || {
-                    let cli = TmuxCli::new("s", runner);
+                    let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, runner);
                     cli.ensure_session_window(&session, &window, &cwd, None)
                 })
             })
             .collect();
 
         for h in handles {
-            h.join().unwrap().expect("ensure_session_window must succeed");
+            h.join()
+                .unwrap()
+                .expect("ensure_session_window must succeed");
         }
 
         assert_eq!(
-            shared.new_session_wins.load(std::sync::atomic::Ordering::SeqCst),
+            shared
+                .new_session_wins
+                .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "exactly one thread should win new-session"
         );

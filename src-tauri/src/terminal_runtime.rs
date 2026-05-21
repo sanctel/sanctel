@@ -200,7 +200,7 @@ pub fn attach_tab_to_tmux(
     )?;
 
     // 2. Spawn the portable-pty client. The PTY runs:
-    //      tmux -L <socket> -f /dev/null attach-session -t <session>
+    //      tmux -L <socket> -f <conf> attach-session -t <session>
     //    No `select-window` clause: the session has exactly one window
     //    (created with `new-session -n`) and tmux's session-scoped `curw`
     //    pointer is therefore unique to this tab — two tabs in the same
@@ -219,9 +219,9 @@ pub fn attach_tab_to_tmux(
     let mut cmd = CommandBuilder::new("tmux");
     cmd.args([
         "-L",
-        crate::tmux_cli::DEFAULT_SOCKET,
+        tmux.socket(),
         "-f",
-        "/dev/null",
+        tmux.conf_path(),
         "attach-session",
         "-t",
         &format!("={}", params.session),
@@ -253,6 +253,8 @@ pub fn attach_tab_to_tmux(
         on_output,
         tab_id,
         params.session.clone(),
+        tmux.socket().to_string(),
+        tmux.conf_path().to_string(),
         on_tab_exited,
     );
 
@@ -268,10 +270,12 @@ fn spawn_pty_reader(
     on_output: Channel<Vec<u8>>,
     tab_id: String,
     session: String,
+    socket: String,
+    conf_path: String,
     on_tab_exited: TabExitedEmitter,
 ) {
     std::thread::spawn(move || {
-        let tmux = TmuxCli::default();
+        let tmux = TmuxCli::new(socket, conf_path, crate::tmux_cli::RealCommandRunner);
         if let Err(e) = drive_pty_reader_until_done(
             &mut reader,
             |chunk| on_output.send(chunk).is_ok(),
@@ -407,10 +411,7 @@ mod tests {
     #[test]
     fn attach_error_worktree_missing_serializes_with_prefix() {
         let e = AttachError::WorktreeMissing("/gone".into());
-        assert!(
-            e.to_string().starts_with("worktree-missing:"),
-            "got: {e}"
-        );
+        assert!(e.to_string().starts_with("worktree-missing:"), "got: {e}");
     }
 
     /// The worktree preflight (used by attach_tab_to_tmux's first step) must
@@ -435,7 +436,11 @@ mod tests {
 
     #[test]
     fn pty_eof_missing_tmux_session_produces_tab_exited_payload() {
-        let tmux = TmuxCli::new("test", HasSessionRunner { exists: false });
+        let tmux = TmuxCli::new(
+            "test",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            HasSessionRunner { exists: false },
+        );
 
         let payload = tab_exited_payload_if_session_missing(&tmux, "tab-1", "session-1").unwrap();
 
@@ -449,7 +454,11 @@ mod tests {
 
     #[test]
     fn pty_eof_existing_tmux_session_does_not_produce_tab_exited_payload() {
-        let tmux = TmuxCli::new("test", HasSessionRunner { exists: true });
+        let tmux = TmuxCli::new(
+            "test",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            HasSessionRunner { exists: true },
+        );
 
         let payload = tab_exited_payload_if_session_missing(&tmux, "tab-1", "session-1").unwrap();
 
@@ -461,6 +470,7 @@ mod tests {
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let tmux = TmuxCli::new(
             "test",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
             RecordingHasSessionRunner {
                 exists: false,
                 calls: Arc::clone(&calls),
@@ -501,6 +511,7 @@ mod tests {
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let tmux = TmuxCli::new(
             "test",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
             RecordingHasSessionRunner {
                 exists: true,
                 calls: Arc::clone(&calls),
@@ -583,7 +594,11 @@ mod tests {
         // its own tmux server so concurrent kill_session calls don't pull
         // the carpet out from under the other test.
         let socket = format!("sanctel-test-{}-idem", std::process::id());
-        let tmux = TmuxCli::new(socket.clone(), crate::tmux_cli::RealCommandRunner);
+        let tmux = TmuxCli::new(
+            socket.clone(),
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            crate::tmux_cli::RealCommandRunner,
+        );
 
         // Belt-and-braces cleanup if a prior run leaked.
         let _ = Command::new("tmux")
@@ -597,7 +612,8 @@ mod tests {
         let window = "term-1";
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
 
-        tmux.ensure_session_window(session, window, &cwd, None).unwrap();
+        tmux.ensure_session_window(session, window, &cwd, None)
+            .unwrap();
         assert!(tmux.has_session(session).unwrap());
         assert_eq!(
             tmux.list_windows(session).unwrap(),
@@ -607,7 +623,8 @@ mod tests {
 
         // 2. Reattach (second ensure_session_window) is a no-op — no
         //    duplicate window, no extra anything.
-        tmux.ensure_session_window(session, window, &cwd, None).unwrap();
+        tmux.ensure_session_window(session, window, &cwd, None)
+            .unwrap();
         assert_eq!(
             tmux.list_windows(session).unwrap(),
             vec![window.to_string()],
@@ -627,7 +644,8 @@ mod tests {
 
         // 4. Re-creating after kill puts us back to exactly one window
         //    (no resurrected stale state).
-        tmux.ensure_session_window(session, window, &cwd, None).unwrap();
+        tmux.ensure_session_window(session, window, &cwd, None)
+            .unwrap();
         assert_eq!(
             tmux.list_windows(session).unwrap(),
             vec![window.to_string()],
@@ -664,7 +682,11 @@ mod tests {
         // server in parallel with `idempotent_attach_against_real_tmux`
         // (see that test for the full rationale).
         let socket = format!("sanctel-test-{}-indep", std::process::id());
-        let tmux = TmuxCli::new(socket.clone(), crate::tmux_cli::RealCommandRunner);
+        let tmux = TmuxCli::new(
+            socket.clone(),
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            crate::tmux_cli::RealCommandRunner,
+        );
         let _ = Command::new("tmux")
             .args(["-L", &socket, "kill-server"])
             .output();
@@ -675,8 +697,10 @@ mod tests {
         // windowName suffixes — exactly the post-fix naming convention.
         let session_a = "sanctel_wt_test-wt__term-1";
         let session_b = "sanctel_wt_test-wt__term-2";
-        tmux.ensure_session_window(session_a, "term-1", &cwd, None).unwrap();
-        tmux.ensure_session_window(session_b, "term-2", &cwd, None).unwrap();
+        tmux.ensure_session_window(session_a, "term-1", &cwd, None)
+            .unwrap();
+        tmux.ensure_session_window(session_b, "term-2", &cwd, None)
+            .unwrap();
 
         // Both sessions exist and contain exactly one window each — the
         // load-bearing structural invariant from the fix.
@@ -750,10 +774,22 @@ mod tests {
         // The post-fix invariant: each session sees only its own marker.
         // A failing assertion here means the sessions are sharing state —
         // i.e., the bug is back.
-        assert!(cap_a.contains(marker_a), "tab A must see A's marker: {cap_a}");
-        assert!(!cap_a.contains(marker_b), "tab A must NOT see B's marker: {cap_a}");
-        assert!(cap_b.contains(marker_b), "tab B must see B's marker: {cap_b}");
-        assert!(!cap_b.contains(marker_a), "tab B must NOT see A's marker: {cap_b}");
+        assert!(
+            cap_a.contains(marker_a),
+            "tab A must see A's marker: {cap_a}"
+        );
+        assert!(
+            !cap_a.contains(marker_b),
+            "tab A must NOT see B's marker: {cap_a}"
+        );
+        assert!(
+            cap_b.contains(marker_b),
+            "tab B must see B's marker: {cap_b}"
+        );
+        assert!(
+            !cap_b.contains(marker_a),
+            "tab B must NOT see A's marker: {cap_b}"
+        );
 
         // close_tab path (one `kill_session` per tab). Each kill must
         // affect only its own tab; the sibling stays up.

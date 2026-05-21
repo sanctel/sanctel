@@ -17,10 +17,12 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 mod profile_isolation;
+mod restore_runtime;
 mod terminal_runtime;
 mod tmux_cli;
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -30,10 +32,14 @@ use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
 use crate::profile_isolation::apply_profile_isolation;
+use crate::restore_runtime::{RestorePaths, RestoreRuntime, ResurrectRuntime};
 use crate::terminal_runtime::{
     attach_tab_to_tmux, AttachParams, TabExitedPayload, TerminalRegistry,
 };
-use crate::tmux_cli::{allocate_window_name, tmux_safe, CommandRunner, TmuxCli, TmuxError};
+use crate::tmux_cli::{
+    allocate_window_name, tmux_safe, CommandRunner, RealCommandRunner, TmuxCli, TmuxError,
+    DEFAULT_CONF_PATH, DEFAULT_SOCKET,
+};
 
 // ─── shared state ─────────────────────────────────────────────────────────
 
@@ -66,6 +72,7 @@ struct AppState {
     // tab is its own session — the lock now serializes the allocator
     // across the *group* of sessions sharing a Worktree base.
     allocation_locks: AllocationLocks,
+    tmux_conf_path: Mutex<Option<String>>,
 }
 
 /// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
@@ -142,8 +149,90 @@ struct Rect {
 }
 
 const OFFSCREEN: f64 = -9999.0;
+const BUNDLED_TMUX_CONF: &str = "app-bundle/sanctel.tmux.conf";
+const BUNDLED_RESURRECT_RESTORE: &str = "app-bundle/tmux-plugins/resurrect/scripts/restore.sh";
+const BUNDLED_RESURRECT_PLUGIN: &str = "app-bundle/tmux-plugins/resurrect/resurrect.tmux";
+const RESURRECT_DIR_PLACEHOLDER: &str = "__SANCTEL_RESURRECT_DIR__";
+const RESURRECT_PLUGIN_PLACEHOLDER: &str = "__SANCTEL_RESURRECT_PLUGIN__";
 
 // ─── helpers ──────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct RestoreStartupPaths {
+    tmux_conf_path: String,
+    restore_paths: RestorePaths,
+}
+
+fn tmux_for_app<R: Runtime>(app: &tauri::AppHandle<R>) -> TmuxCli {
+    let conf_path = app
+        .state::<AppState>()
+        .tmux_conf_path
+        .lock()
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONF_PATH.to_string());
+    TmuxCli::new(DEFAULT_SOCKET, conf_path, RealCommandRunner)
+}
+
+fn resolve_bundled_path<R: Runtime, M: Manager<R>>(
+    app: &M,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    let mut dev_root = std::env::current_dir().map_err(|e| e.to_string())?;
+    loop {
+        let dev_path = dev_root.join(relative_path);
+        if dev_path.exists() {
+            return Ok(dev_path);
+        }
+        if !dev_root.pop() {
+            break;
+        }
+    }
+
+    let resource_path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir resolution failed: {e}"))?
+        .join(relative_path);
+    if resource_path.exists() {
+        return Ok(resource_path);
+    }
+
+    Err(format!("bundled resource not found: {relative_path}"))
+}
+
+fn tmux_quote(value: &Path) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn prepare_restore_startup_paths<R: Runtime, M: Manager<R>>(
+    app: &M,
+) -> Result<RestoreStartupPaths, String> {
+    let app_data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("app_local_data_dir resolution failed: {e}"))?;
+    std::fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
+
+    let resurrect_dir = app_data_dir.join("resurrect");
+    std::fs::create_dir_all(&resurrect_dir).map_err(|e| e.to_string())?;
+
+    let bundled_conf = resolve_bundled_path(app, BUNDLED_TMUX_CONF)?;
+    let resurrect_plugin = resolve_bundled_path(app, BUNDLED_RESURRECT_PLUGIN)?;
+    let restore_script = resolve_bundled_path(app, BUNDLED_RESURRECT_RESTORE)?;
+
+    let rendered_conf = std::fs::read_to_string(&bundled_conf)
+        .map_err(|e| format!("read bundled tmux conf failed: {e}"))?
+        .replace(RESURRECT_DIR_PLACEHOLDER, &tmux_quote(&resurrect_dir))
+        .replace(RESURRECT_PLUGIN_PLACEHOLDER, &tmux_quote(&resurrect_plugin));
+    let tmux_conf_path = app_data_dir.join("sanctel.tmux.conf");
+    std::fs::write(&tmux_conf_path, rendered_conf)
+        .map_err(|e| format!("write runtime tmux conf failed: {e}"))?;
+
+    Ok(RestoreStartupPaths {
+        tmux_conf_path: tmux_conf_path.to_string_lossy().into_owned(),
+        restore_paths: RestorePaths::new(resurrect_dir, restore_script),
+    })
+}
 
 /// Move a webview to overlay the current content rect (visible).
 fn show_webview(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
@@ -182,8 +271,8 @@ fn hide_webview(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct CreateTabReq {
     id: String,
-    kind: String,   // "browser" | "terminal" | "chat"
-    url: String,    // external URL for "browser"; "local://terminal" etc. for the others
+    kind: String, // "browser" | "terminal" | "chat"
+    url: String,  // external URL for "browser"; "local://terminal" etc. for the others
     /// Drives Profile cookie / localStorage isolation per ADR-0003. Threaded
     /// through `profile_isolation::apply_profile_isolation`, which picks the
     /// right Tauri 2.11 API per platform (data_directory on Windows/Linux,
@@ -248,22 +337,16 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
     // per-Worktree mutex when the request asked for "auto" allocation. Doing
     // it before we build the webview means a failure here surfaces to React
     // before any client-visible state is created.
-    let asked_for_auto = is_terminal_like
-        && matches!(req.window_name.as_deref(), None | Some(AUTO_WINDOW_NAME));
+    let asked_for_auto =
+        is_terminal_like && matches!(req.window_name.as_deref(), None | Some(AUTO_WINDOW_NAME));
     let allocated_window_name: Option<String> = if asked_for_auto {
-        let cwd =
-            resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
+        let cwd = resolve_worktree_cwd(req.worktree_id.as_deref(), req.worktree_path.as_deref())?;
         let base = tmux_session_base(req.worktree_id.as_deref(), &req.profile_id);
         let locks = &app.state::<AppState>().allocation_locks;
-        let tmux = TmuxCli::default();
-        let allocated = allocate_session_for_tab(
-            locks,
-            &tmux,
-            &base,
-            &cwd,
-            req.initial_command.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
+        let tmux = tmux_for_app(&app);
+        let allocated =
+            allocate_session_for_tab(locks, &tmux, &base, &cwd, req.initial_command.as_deref())
+                .map_err(|e| e.to_string())?;
         Some(allocated)
     } else {
         None
@@ -287,7 +370,10 @@ fn create_tab(app: tauri::AppHandle, req: CreateTabReq) -> Result<CreateTabResp,
     // - chat:     same idea, /chat.html (a React chat UI bundled with the app).
     let webview_url = match req.kind.as_str() {
         "browser" => {
-            let parsed = req.url.parse().map_err(|e: url::ParseError| e.to_string())?;
+            let parsed = req
+                .url
+                .parse()
+                .map_err(|e: url::ParseError| e.to_string())?;
             WebviewUrl::External(parsed)
         }
         "terminal" => WebviewUrl::App("terminal.html".into()),
@@ -357,9 +443,9 @@ fn resolve_worktree_cwd(
     match (worktree_id, worktree_path) {
         (Some(_), Some(path)) => Ok(path.to_string()),
         (None, _) => std::env::var("HOME").map_err(|_| "HOME not set".to_string()),
-        (Some(_), None) => Err(
-            "worktreeId set without worktreePath — create_tab must carry both".to_string(),
-        ),
+        (Some(_), None) => {
+            Err("worktreeId set without worktreePath — create_tab must carry both".to_string())
+        }
     }
 }
 
@@ -438,9 +524,12 @@ fn reap_orphan_sessions<R: CommandRunner>(
 }
 
 #[tauri::command]
-fn reap_orphan_tmux_sessions(known_session_names: Vec<String>) -> Result<ReapReport, String> {
+fn reap_orphan_tmux_sessions(
+    app: tauri::AppHandle,
+    known_session_names: Vec<String>,
+) -> Result<ReapReport, String> {
     let known_session_names: HashSet<String> = known_session_names.into_iter().collect();
-    reap_orphan_sessions(&TmuxCli::default(), &known_session_names).map_err(|e| e.to_string())
+    reap_orphan_sessions(&tmux_for_app(&app), &known_session_names).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -466,7 +555,7 @@ fn close_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
     if let Some(rec) = record {
         if rec.kind == "terminal" || rec.kind == "chat" {
             if let Some(handle) = state.terminals.remove(&id) {
-                let _ = TmuxCli::default().kill_session(&handle.session);
+                let _ = tmux_for_app(&app).kill_session(&handle.session);
             }
         }
     }
@@ -493,7 +582,13 @@ fn show_tab(app: tauri::AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_all(app: tauri::AppHandle) -> Result<(), String> {
-    let ids: Vec<String> = app.state::<AppState>().tabs.lock().keys().cloned().collect();
+    let ids: Vec<String> = app
+        .state::<AppState>()
+        .tabs
+        .lock()
+        .keys()
+        .cloned()
+        .collect();
     for id in ids {
         let _ = hide_webview(&app, &id);
     }
@@ -548,11 +643,7 @@ fn tmux_session_base(worktree_id: Option<&str>, profile_id: &str) -> String {
 /// `__` is the suffix separator: every sanctel-built id flows through
 /// `tmux_safe`, which only ever produces single-`_` runs, so `__`
 /// unambiguously marks where the base ends and the window name begins.
-fn tmux_session_name(
-    worktree_id: Option<&str>,
-    profile_id: &str,
-    window_name: &str,
-) -> String {
+fn tmux_session_name(worktree_id: Option<&str>, profile_id: &str, window_name: &str) -> String {
     format!(
         "{}__{}",
         tmux_session_base(worktree_id, profile_id),
@@ -568,11 +659,7 @@ fn tmux_session_name(
 /// suffix, allocated server-side at create_tab time under the per-Worktree
 /// mutex and stored on the TabRecord. Falls back to `term-1` only when the
 /// frontend omitted it (legacy demo path).
-fn resolve_attach_params(
-    record: &TabRecord,
-    cols: u16,
-    rows: u16,
-) -> Result<AttachParams, String> {
+fn resolve_attach_params(record: &TabRecord, cols: u16, rows: u16) -> Result<AttachParams, String> {
     let window_name = record
         .window_name
         .clone()
@@ -629,15 +716,18 @@ fn terminal_attach<R: Runtime>(
     let on_tab_exited = Arc::new(move |payload: TabExitedPayload| {
         let _ = app_for_exit.emit("sanctel://tab-exited", payload);
     });
+    let tmux = tmux_for_app(app);
     let handle = attach_tab_to_tmux(
-        &TmuxCli::default(),
+        &tmux,
         params,
         on_output,
         label.clone(),
         on_tab_exited,
     )
-        .map_err(|e| e.to_string())?;
-    app.state::<AppState>().terminals.insert(label, Arc::new(handle));
+    .map_err(|e| e.to_string())?;
+    app.state::<AppState>()
+        .terminals
+        .insert(label, Arc::new(handle));
     Ok(())
 }
 
@@ -658,11 +748,7 @@ fn terminal_write<R: Runtime>(webview: Webview<R>, bytes: Vec<u8>) -> Result<(),
 }
 
 #[tauri::command]
-fn terminal_resize<R: Runtime>(
-    webview: Webview<R>,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
+fn terminal_resize<R: Runtime>(webview: Webview<R>, cols: u16, rows: u16) -> Result<(), String> {
     let app = webview.app_handle();
     let handle = app
         .state::<AppState>()
@@ -671,7 +757,6 @@ fn terminal_resize<R: Runtime>(
         .ok_or_else(|| "terminal not attached".to_string())?;
     handle.resize(cols, rows)
 }
-
 
 // ─── backend probe (Slice 7 + spike slice 1) ──────────────────────────────
 
@@ -716,11 +801,27 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState::default())
         .setup(|app| {
+            let restore_startup_paths = prepare_restore_startup_paths(app)?;
+            let tmux = Arc::new(TmuxCli::new(
+                DEFAULT_SOCKET,
+                restore_startup_paths.tmux_conf_path.clone(),
+                RealCommandRunner,
+            ));
+
             // One-time tmux startup probe. The `tmux_status` field is the
             // structural "backend ready" signal that the frontend setup-
             // screen gates on (Slice 7).
             let state = app.state::<AppState>();
-            probe_tmux_into(&state.tmux_status, &TmuxCli::default());
+            *state.tmux_conf_path.lock() = Some(restore_startup_paths.tmux_conf_path);
+            probe_tmux_into(&state.tmux_status, &tmux);
+            let snapshot = state.tmux_status.lock().clone();
+            if snapshot.available {
+                let restore_runtime =
+                    ResurrectRuntime::new(Arc::clone(&tmux), restore_startup_paths.restore_paths);
+                if let Err(e) = restore_runtime.restore_on_launch() {
+                    eprintln!("tmux restore on launch failed: {e}");
+                }
+            }
             let snapshot = state.tmux_status.lock().clone();
             let _ = app.emit("tmux-status", snapshot);
             Ok(())
@@ -766,7 +867,11 @@ mod tests {
 
     #[test]
     fn worktree_keyed_record_yields_sanctel_wt_session_and_cwd() {
-        let rec = record(Some("sanctel-main"), Some("/home/me/code/sanctel"), Some("term-2"));
+        let rec = record(
+            Some("sanctel-main"),
+            Some("/home/me/code/sanctel"),
+            Some("term-2"),
+        );
         let p = resolve_attach_params(&rec, 80, 24).unwrap();
         // Per-tab session model (issue #15): the session name carries the
         // window-name suffix. One tab → one session → one window.
@@ -812,8 +917,7 @@ mod tests {
     /// rename in issue #15.
     #[test]
     fn session_name_sanitizes_unsafe_characters_in_worktree_id() {
-        let session =
-            tmux_session_name(Some("feature/foo:bar.baz"), "profile-default", "term-1");
+        let session = tmux_session_name(Some("feature/foo:bar.baz"), "profile-default", "term-1");
         assert!(!session.contains(':'), "session must not contain ':'");
         assert!(!session.contains('.'), "session must not contain '.'");
         assert!(!session.contains('/'), "session must not contain '/'");
@@ -884,7 +988,7 @@ mod tests {
     #[test]
     fn probe_marks_unavailable_when_tmux_missing() {
         let status = Mutex::new(TmuxStatus::default());
-        let tmux = TmuxCli::new("test", FailingRunner);
+        let tmux = TmuxCli::new("test", crate::tmux_cli::DEFAULT_CONF_PATH, FailingRunner);
         probe_tmux_into(&status, &tmux);
         let result = status.lock().clone();
         assert!(!result.available);
@@ -895,7 +999,7 @@ mod tests {
     #[test]
     fn probe_marks_available_when_tmux_present() {
         let status = Mutex::new(TmuxStatus::default());
-        let tmux = TmuxCli::new("test", OkRunner);
+        let tmux = TmuxCli::new("test", crate::tmux_cli::DEFAULT_CONF_PATH, OkRunner);
         probe_tmux_into(&status, &tmux);
         let result = status.lock().clone();
         assert!(result.available);
@@ -911,11 +1015,17 @@ mod tests {
     #[test]
     fn tmux_probe_names_backend_in_status() {
         let status = Mutex::new(TmuxStatus::default());
-        probe_tmux_into(&status, &TmuxCli::new("test", OkRunner));
+        probe_tmux_into(
+            &status,
+            &TmuxCli::new("test", crate::tmux_cli::DEFAULT_CONF_PATH, OkRunner),
+        );
         assert_eq!(status.lock().backend, "tmux");
 
         let status = Mutex::new(TmuxStatus::default());
-        probe_tmux_into(&status, &TmuxCli::new("test", FailingRunner));
+        probe_tmux_into(
+            &status,
+            &TmuxCli::new("test", crate::tmux_cli::DEFAULT_CONF_PATH, FailingRunner),
+        );
         assert_eq!(status.lock().backend, "tmux");
     }
 
@@ -1006,7 +1116,7 @@ mod tests {
             "manual_session",
         ]);
         let killed = Arc::clone(&runner.killed);
-        let tmux = TmuxCli::new("test", runner);
+        let tmux = TmuxCli::new("test", crate::tmux_cli::DEFAULT_CONF_PATH, runner);
         let known = ["sanctel_wt_main__term-2".to_string()]
             .into_iter()
             .collect();
@@ -1032,7 +1142,7 @@ mod tests {
             vec!["sanctel_wt_main__term-1"],
         );
         let killed = Arc::clone(&runner.killed);
-        let tmux = TmuxCli::new("test", runner);
+        let tmux = TmuxCli::new("test", crate::tmux_cli::DEFAULT_CONF_PATH, runner);
         let known = HashSet::new();
 
         let report = reap_orphan_sessions(&tmux, &known).unwrap();
@@ -1079,7 +1189,10 @@ mod tests {
     }
 
     fn arg_after<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
-        args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1)).copied()
+        args.iter()
+            .position(|a| *a == flag)
+            .and_then(|i| args.get(i + 1))
+            .copied()
     }
 
     impl CommandRunner for TmuxStateRunner {
@@ -1143,8 +1256,7 @@ mod tests {
                     }
                 }
                 "list-sessions" => {
-                    let mut names: Vec<String> =
-                        self.windows.lock().keys().cloned().collect();
+                    let mut names: Vec<String> = self.windows.lock().keys().cloned().collect();
                     names.sort();
                     Ok(CommandOutput {
                         status: 0,
@@ -1217,7 +1329,11 @@ mod tests {
                 let base = base.to_string();
                 let cwd = cwd.to_string();
                 std::thread::spawn(move || {
-                    let tmux = TmuxCli::new("test-sock", runner_clone);
+                    let tmux = TmuxCli::new(
+                        "test-sock",
+                        crate::tmux_cli::DEFAULT_CONF_PATH,
+                        runner_clone,
+                    );
                     allocate_session_for_tab(&locks, &tmux, &base, &cwd, None)
                 })
             })
@@ -1250,9 +1366,7 @@ mod tests {
         // creates N sessions with one window each.
         let mut sessions = runner.session_names();
         sort_by_term_index(&mut sessions);
-        let expected_sessions: Vec<String> = (1..=N)
-            .map(|i| format!("{base}__term-{i}"))
-            .collect();
+        let expected_sessions: Vec<String> = (1..=N).map(|i| format!("{base}__term-{i}")).collect();
         assert_eq!(sessions, expected_sessions);
     }
 
@@ -1264,13 +1378,19 @@ mod tests {
     fn allocate_session_for_tab_does_not_serialize_distinct_worktrees() {
         let locks = AllocationLocks::default();
         let runner = TmuxStateRunner::new();
-        let tmux_a = TmuxCli::new("t", runner.clone_shared());
-        let tmux_b = TmuxCli::new("t", runner.clone_shared());
+        let tmux_a = TmuxCli::new(
+            "t",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            runner.clone_shared(),
+        );
+        let tmux_b = TmuxCli::new(
+            "t",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            runner.clone_shared(),
+        );
 
-        let a =
-            allocate_session_for_tab(&locks, &tmux_a, "sanctel_wt_a", "/tmp", None).unwrap();
-        let b =
-            allocate_session_for_tab(&locks, &tmux_b, "sanctel_wt_b", "/tmp", None).unwrap();
+        let a = allocate_session_for_tab(&locks, &tmux_a, "sanctel_wt_a", "/tmp", None).unwrap();
+        let b = allocate_session_for_tab(&locks, &tmux_b, "sanctel_wt_b", "/tmp", None).unwrap();
         assert_eq!(a, "term-1");
         assert_eq!(b, "term-1");
     }
@@ -1294,10 +1414,13 @@ mod tests {
             map.insert("sanctel_wt_other__term-1".into(), vec!["term-1".into()]);
         }
 
-        let tmux = TmuxCli::new("t", runner.clone_shared());
+        let tmux = TmuxCli::new(
+            "t",
+            crate::tmux_cli::DEFAULT_CONF_PATH,
+            runner.clone_shared(),
+        );
         let next =
-            allocate_session_for_tab(&locks, &tmux, "sanctel_wt_target", "/tmp", None)
-                .unwrap();
+            allocate_session_for_tab(&locks, &tmux, "sanctel_wt_target", "/tmp", None).unwrap();
         // Max term-N on the target base is 3 → next is term-4. The
         // unrelated `sanctel_wt_other__term-1` must NOT push us to 5.
         assert_eq!(next, "term-4");
@@ -1308,5 +1431,4 @@ mod tests {
         assert!(sessions.contains(&"sanctel_wt_target__term-4".to_string()));
         assert!(sessions.contains(&"sanctel_wt_other__term-1".to_string()));
     }
-
 }
