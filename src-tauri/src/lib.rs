@@ -157,7 +157,6 @@ const RESURRECT_PLUGIN_PLACEHOLDER: &str = "__SANCTEL_RESURRECT_PLUGIN__";
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
 struct RestoreStartupPaths {
     tmux_conf_path: String,
     restore_paths: RestorePaths,
@@ -177,17 +176,33 @@ fn resolve_bundled_path<R: Runtime, M: Manager<R>>(
     app: &M,
     relative_path: &str,
 ) -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    if let Some(dev_path) = resolve_dev_bundled_path(relative_path)? {
+        return Ok(dev_path);
+    }
+
+    resolve_resource_path(app, relative_path)
+}
+
+#[cfg(debug_assertions)]
+fn resolve_dev_bundled_path(relative_path: &str) -> Result<Option<PathBuf>, String> {
     let mut dev_root = std::env::current_dir().map_err(|e| e.to_string())?;
     loop {
         let dev_path = dev_root.join(relative_path);
         if dev_path.exists() {
-            return Ok(dev_path);
+            return Ok(Some(dev_path));
         }
         if !dev_root.pop() {
             break;
         }
     }
+    Ok(None)
+}
 
+fn resolve_resource_path<R: Runtime, M: Manager<R>>(
+    app: &M,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
     let resource_path = app
         .path()
         .resource_dir()
@@ -198,6 +213,10 @@ fn resolve_bundled_path<R: Runtime, M: Manager<R>>(
     }
 
     Err(format!("bundled resource not found: {relative_path}"))
+}
+
+fn ensure_startup_dir(path: &Path, label: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("create {label} failed: {e}"))
 }
 
 fn tmux_quote(value: &Path) -> String {
@@ -211,10 +230,10 @@ fn prepare_restore_startup_paths<R: Runtime, M: Manager<R>>(
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("app_local_data_dir resolution failed: {e}"))?;
-    std::fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
+    ensure_startup_dir(&app_data_dir, "app local data dir")?;
 
     let resurrect_dir = app_data_dir.join("resurrect");
-    std::fs::create_dir_all(&resurrect_dir).map_err(|e| e.to_string())?;
+    ensure_startup_dir(&resurrect_dir, "resurrect dir")?;
 
     let bundled_conf = resolve_bundled_path(app, BUNDLED_TMUX_CONF)?;
     let resurrect_plugin = resolve_bundled_path(app, BUNDLED_RESURRECT_PLUGIN)?;
@@ -717,14 +736,8 @@ fn terminal_attach<R: Runtime>(
         let _ = app_for_exit.emit("sanctel://tab-exited", payload);
     });
     let tmux = tmux_for_app(app);
-    let handle = attach_tab_to_tmux(
-        &tmux,
-        params,
-        on_output,
-        label.clone(),
-        on_tab_exited,
-    )
-    .map_err(|e| e.to_string())?;
+    let handle = attach_tab_to_tmux(&tmux, params, on_output, label.clone(), on_tab_exited)
+        .map_err(|e| e.to_string())?;
     app.state::<AppState>()
         .terminals
         .insert(label, Arc::new(handle));
