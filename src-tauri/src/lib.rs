@@ -73,6 +73,7 @@ struct AppState {
     // across the *group* of sessions sharing a Worktree base.
     allocation_locks: AllocationLocks,
     tmux_conf_path: Mutex<Option<String>>,
+    restore_runtime: Mutex<Option<Arc<dyn RestoreRuntime>>>,
 }
 
 /// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
@@ -151,6 +152,7 @@ struct Rect {
 const OFFSCREEN: f64 = -9999.0;
 const BUNDLED_TMUX_CONF: &str = "app-bundle/sanctel.tmux.conf";
 const BUNDLED_RESURRECT_RESTORE: &str = "app-bundle/tmux-plugins/resurrect/scripts/restore.sh";
+const BUNDLED_RESURRECT_SAVE: &str = "app-bundle/tmux-plugins/resurrect/scripts/save.sh";
 const BUNDLED_RESURRECT_PLUGIN: &str = "app-bundle/tmux-plugins/resurrect/resurrect.tmux";
 const RESURRECT_DIR_PLACEHOLDER: &str = "__SANCTEL_RESURRECT_DIR__";
 const RESURRECT_PLUGIN_PLACEHOLDER: &str = "__SANCTEL_RESURRECT_PLUGIN__";
@@ -238,6 +240,7 @@ fn prepare_restore_startup_paths<R: Runtime, M: Manager<R>>(
     let bundled_conf = resolve_bundled_path(app, BUNDLED_TMUX_CONF)?;
     let resurrect_plugin = resolve_bundled_path(app, BUNDLED_RESURRECT_PLUGIN)?;
     let restore_script = resolve_bundled_path(app, BUNDLED_RESURRECT_RESTORE)?;
+    let save_script = resolve_bundled_path(app, BUNDLED_RESURRECT_SAVE)?;
 
     let rendered_conf = std::fs::read_to_string(&bundled_conf)
         .map_err(|e| format!("read bundled tmux conf failed: {e}"))?
@@ -249,8 +252,16 @@ fn prepare_restore_startup_paths<R: Runtime, M: Manager<R>>(
 
     Ok(RestoreStartupPaths {
         tmux_conf_path: tmux_conf_path.to_string_lossy().into_owned(),
-        restore_paths: RestorePaths::new(resurrect_dir, restore_script),
+        restore_paths: RestorePaths::new(resurrect_dir, restore_script, save_script),
     })
+}
+
+fn save_on_exit(restore_runtime: Option<&dyn RestoreRuntime>) {
+    if let Some(restore_runtime) = restore_runtime {
+        if let Err(e) = restore_runtime.save_now() {
+            eprintln!("tmux save on exit failed: {e}");
+        }
+    }
 }
 
 /// Move a webview to overlay the current content rect (visible).
@@ -805,7 +816,7 @@ fn probe_tmux_into<R: crate::tmux_cli::CommandRunner>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         // Issue #6 / Slice 5: SQLite persistence lives entirely in the
         // frontend (sql.js + this fs plugin reading/writing the .db file).
@@ -829,11 +840,14 @@ pub fn run() {
             probe_tmux_into(&state.tmux_status, &tmux);
             let snapshot = state.tmux_status.lock().clone();
             if snapshot.available {
-                let restore_runtime =
-                    ResurrectRuntime::new(Arc::clone(&tmux), restore_startup_paths.restore_paths);
+                let restore_runtime: Arc<dyn RestoreRuntime> = Arc::new(ResurrectRuntime::new(
+                    Arc::clone(&tmux),
+                    restore_startup_paths.restore_paths,
+                ));
                 if let Err(e) = restore_runtime.restore_on_launch() {
                     eprintln!("tmux restore on launch failed: {e}");
                 }
+                *state.restore_runtime.lock() = Some(restore_runtime);
             }
             let snapshot = state.tmux_status.lock().clone();
             let _ = app.emit("tmux-status", snapshot);
@@ -852,8 +866,19 @@ pub fn run() {
             tmux_safe_many,
             reap_orphan_tmux_sessions,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            let restore_runtime = app_handle
+                .state::<AppState>()
+                .restore_runtime
+                .lock()
+                .clone();
+            save_on_exit(restore_runtime.as_deref());
+        }
+    });
 }
 // ─── tests ────────────────────────────────────────────────────────────────
 
@@ -1049,6 +1074,56 @@ mod tests {
     #[test]
     fn default_status_names_tmux_backend() {
         assert_eq!(TmuxStatus::default().backend, "tmux");
+    }
+
+    struct ExitSaveRuntime {
+        calls: Arc<Mutex<usize>>,
+        fail: bool,
+    }
+
+    impl RestoreRuntime for ExitSaveRuntime {
+        fn restore_on_launch(
+            &self,
+        ) -> Result<crate::restore_runtime::RestoreOutcome, crate::restore_runtime::RestoreError>
+        {
+            Ok(crate::restore_runtime::RestoreOutcome::NoSnapshot)
+        }
+
+        fn save_now(&self) -> Result<(), crate::restore_runtime::RestoreError> {
+            *self.calls.lock() += 1;
+            if self.fail {
+                return Err(crate::restore_runtime::RestoreError::Io(
+                    "save failed".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exit_requested_saves_once_before_returning() {
+        let calls = Arc::new(Mutex::new(0));
+        let runtime = ExitSaveRuntime {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+
+        save_on_exit(Some(&runtime));
+
+        assert_eq!(*calls.lock(), 1);
+    }
+
+    #[test]
+    fn exit_requested_does_not_block_exit_when_save_fails() {
+        let calls = Arc::new(Mutex::new(0));
+        let runtime = ExitSaveRuntime {
+            calls: Arc::clone(&calls),
+            fail: true,
+        };
+
+        save_on_exit(Some(&runtime));
+
+        assert_eq!(*calls.lock(), 1);
     }
 
     struct ReapRunner {

@@ -37,21 +37,28 @@ impl From<TmuxError> for RestoreError {
     }
 }
 
-pub trait RestoreRuntime {
+pub trait RestoreRuntime: Send + Sync {
     fn restore_on_launch(&self) -> Result<RestoreOutcome, RestoreError>;
+    fn save_now(&self) -> Result<(), RestoreError>;
 }
 
 #[derive(Clone, Debug)]
 pub struct RestorePaths {
     resurrect_dir: PathBuf,
     restore_script: PathBuf,
+    save_script: PathBuf,
 }
 
 impl RestorePaths {
-    pub fn new(resurrect_dir: impl Into<PathBuf>, restore_script: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        resurrect_dir: impl Into<PathBuf>,
+        restore_script: impl Into<PathBuf>,
+        save_script: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             resurrect_dir: resurrect_dir.into(),
             restore_script: restore_script.into(),
+            save_script: save_script.into(),
         }
     }
 }
@@ -113,6 +120,11 @@ impl<R: CommandRunner> RestoreRuntime for ResurrectRuntime<R> {
             .count();
         Ok(RestoreOutcome::Restored { sessions })
     }
+
+    fn save_now(&self) -> Result<(), RestoreError> {
+        let save_script = self.paths.save_script.to_string_lossy().into_owned();
+        self.tmux.run_shell(&save_script).map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +142,8 @@ mod tests {
         calls: RecordedCalls,
         restore_status: i32,
         restore_stderr: Vec<u8>,
+        save_status: i32,
+        save_stderr: Vec<u8>,
         list_sessions_stdout: Vec<u8>,
     }
 
@@ -139,6 +153,8 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 restore_status: 0,
                 restore_stderr: Vec::new(),
+                save_status: 0,
+                save_stderr: Vec::new(),
                 list_sessions_stdout: Vec::new(),
             }
         }
@@ -147,6 +163,14 @@ mod tests {
             Self {
                 restore_status: 1,
                 restore_stderr: b"restore failed".to_vec(),
+                ..Self::new()
+            }
+        }
+
+        fn failing_save() -> Self {
+            Self {
+                save_status: 1,
+                save_stderr: b"save failed".to_vec(),
                 ..Self::new()
             }
         }
@@ -176,11 +200,22 @@ mod tests {
                 .unwrap_or("");
 
             let output = match subcommand {
-                "run-shell" => CommandOutput {
-                    status: self.restore_status,
-                    stdout: Vec::new(),
-                    stderr: self.restore_stderr.clone(),
-                },
+                "run-shell" => {
+                    let script = args.last().copied().unwrap_or_default();
+                    if script.ends_with("/save.sh") {
+                        CommandOutput {
+                            status: self.save_status,
+                            stdout: Vec::new(),
+                            stderr: self.save_stderr.clone(),
+                        }
+                    } else {
+                        CommandOutput {
+                            status: self.restore_status,
+                            stdout: Vec::new(),
+                            stderr: self.restore_stderr.clone(),
+                        }
+                    }
+                }
                 "list-sessions" => CommandOutput {
                     status: 0,
                     stdout: self.list_sessions_stdout.clone(),
@@ -213,7 +248,11 @@ mod tests {
     ) -> (ResurrectRuntime<RecordingRunner>, RecordedCalls) {
         let calls = Arc::clone(&runner.calls);
         let tmux = Arc::new(TmuxCli::new("test", DEFAULT_CONF_PATH, runner));
-        let paths = RestorePaths::new(resurrect_dir, "/bundle/resurrect/scripts/restore.sh");
+        let paths = RestorePaths::new(
+            resurrect_dir,
+            "/bundle/resurrect/scripts/restore.sh",
+            "/bundle/resurrect/scripts/save.sh",
+        );
         (ResurrectRuntime::new(tmux, paths), calls)
     }
 
@@ -284,5 +323,30 @@ mod tests {
             subcommands(&calls.lock()),
             vec!["new-session", "run-shell", "kill-session"],
         );
+    }
+
+    #[test]
+    fn save_now_runs_bundled_save_script_once() {
+        let dir = temp_restore_dir("save");
+        let (runtime, calls) = runtime(RecordingRunner::new(), &dir);
+
+        runtime.save_now().unwrap();
+
+        let calls = calls.lock().clone();
+        assert_eq!(subcommands(&calls), vec!["run-shell"]);
+        assert!(calls[0]
+            .iter()
+            .any(|arg| arg == "/bundle/resurrect/scripts/save.sh"));
+    }
+
+    #[test]
+    fn save_now_returns_restore_error_when_save_script_fails() {
+        let dir = temp_restore_dir("save-failure");
+        let (runtime, calls) = runtime(RecordingRunner::failing_save(), &dir);
+
+        let result = runtime.save_now();
+
+        assert!(matches!(result, Err(RestoreError::Tmux(_))));
+        assert_eq!(subcommands(&calls.lock()), vec!["run-shell"]);
     }
 }
