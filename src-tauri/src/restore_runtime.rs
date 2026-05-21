@@ -72,7 +72,7 @@ pub struct ResurrectRuntime<R: CommandRunner = crate::tmux_cli::RealCommandRunne
 
 pub struct SaveTimerHandle {
     cancel: Option<oneshot::Sender<()>>,
-    _task: tokio::task::JoinHandle<()>,
+    _task: tauri::async_runtime::JoinHandle<()>,
 }
 
 impl Drop for SaveTimerHandle {
@@ -111,7 +111,11 @@ impl<R: CommandRunner + 'static> ResurrectRuntime<R> {
         let save_script = self.paths.save_script.to_string_lossy().into_owned();
         let (cancel, mut cancelled) = oneshot::channel::<()>();
 
-        let task = tokio::spawn(async move {
+        // Use tauri::async_runtime::spawn (not tokio::spawn) so this works
+        // when called from `.setup` — there is no ambient tokio runtime at
+        // that point, but Tauri's runtime is available. tests pass either way
+        // because tauri::async_runtime uses tokio under the hood.
+        let task = tauri::async_runtime::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
