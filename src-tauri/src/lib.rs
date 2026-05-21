@@ -24,6 +24,7 @@ mod tmux_cli;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
 use crate::profile_isolation::apply_profile_isolation;
-use crate::restore_runtime::{RestorePaths, RestoreRuntime, ResurrectRuntime};
+use crate::restore_runtime::{RestorePaths, RestoreRuntime, ResurrectRuntime, SaveTimerHandle};
 use crate::terminal_runtime::{
     attach_tab_to_tmux, AttachParams, TabExitedPayload, TerminalRegistry,
 };
@@ -74,6 +75,7 @@ struct AppState {
     allocation_locks: AllocationLocks,
     tmux_conf_path: Mutex<Option<String>>,
     restore_runtime: Mutex<Option<Arc<dyn RestoreRuntime>>>,
+    save_timer: Mutex<Option<SaveTimerHandle>>,
 }
 
 /// Per-Worktree-base mutex map. The outer mutex protects the HashMap; the
@@ -840,14 +842,17 @@ pub fn run() {
             probe_tmux_into(&state.tmux_status, &tmux);
             let snapshot = state.tmux_status.lock().clone();
             if snapshot.available {
-                let restore_runtime: Arc<dyn RestoreRuntime> = Arc::new(ResurrectRuntime::new(
+                let restore_runtime = Arc::new(ResurrectRuntime::new(
                     Arc::clone(&tmux),
                     restore_startup_paths.restore_paths,
                 ));
                 if let Err(e) = restore_runtime.restore_on_launch() {
                     eprintln!("tmux restore on launch failed: {e}");
                 }
+                let save_timer = restore_runtime.start_periodic_save(Duration::from_secs(300));
+                let restore_runtime: Arc<dyn RestoreRuntime> = restore_runtime;
                 *state.restore_runtime.lock() = Some(restore_runtime);
+                *state.save_timer.lock() = Some(save_timer);
             }
             let snapshot = state.tmux_status.lock().clone();
             let _ = app.emit("tmux-status", snapshot);

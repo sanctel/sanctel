@@ -1,8 +1,10 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::tmux_cli::{CommandRunner, TmuxCli, TmuxError};
+use tokio::sync::oneshot;
 
 const ANCHOR_SESSION: &str = "_sanctel_anchor";
 
@@ -68,6 +70,17 @@ pub struct ResurrectRuntime<R: CommandRunner = crate::tmux_cli::RealCommandRunne
     paths: RestorePaths,
 }
 
+pub struct SaveTimerHandle {
+    cancel: Option<oneshot::Sender<()>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SaveTimerHandle {
+    fn drop(&mut self) {
+        drop(self.cancel.take());
+    }
+}
+
 impl<R: CommandRunner> ResurrectRuntime<R> {
     pub fn new(tmux: Arc<TmuxCli<R>>, paths: RestorePaths) -> Self {
         Self { tmux, paths }
@@ -89,6 +102,33 @@ impl<R: CommandRunner> ResurrectRuntime<R> {
             }
         }
         Ok(false)
+    }
+}
+
+impl<R: CommandRunner + 'static> ResurrectRuntime<R> {
+    pub fn start_periodic_save(&self, interval: Duration) -> SaveTimerHandle {
+        let tmux = Arc::clone(&self.tmux);
+        let save_script = self.paths.save_script.to_string_lossy().into_owned();
+        let (cancel, mut cancelled) = oneshot::channel::<()>();
+
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        match tmux.run_shell(&save_script) {
+                            Ok(()) => eprintln!("periodic tmux save succeeded"),
+                            Err(e) => eprintln!("periodic tmux save failed: {e}"),
+                        }
+                    }
+                    _ = &mut cancelled => break,
+                }
+            }
+        });
+
+        SaveTimerHandle {
+            cancel: Some(cancel),
+            _task: task,
+        }
     }
 }
 
@@ -133,7 +173,7 @@ mod tests {
     use crate::tmux_cli::{CommandOutput, DEFAULT_CONF_PATH};
     use parking_lot::Mutex;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     type RecordedCalls = Arc<Mutex<Vec<Vec<String>>>>;
 
@@ -272,6 +312,33 @@ mod tests {
             .collect()
     }
 
+    fn save_call_count(calls: &RecordedCalls) -> usize {
+        calls
+            .lock()
+            .iter()
+            .filter(|call| {
+                call.iter()
+                    .any(|arg| arg == "/bundle/resurrect/scripts/save.sh")
+            })
+            .count()
+    }
+
+    async fn wait_for_save_calls(calls: &RecordedCalls, min: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if save_call_count(calls) >= min {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "expected at least {min} save calls, got {}",
+                    save_call_count(calls)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[test]
     fn restore_on_launch_runs_anchor_restore_cleanup_and_counts_sessions() {
         let dir = temp_restore_dir("restored");
@@ -348,5 +415,35 @@ mod tests {
 
         assert!(matches!(result, Err(RestoreError::Tmux(_))));
         assert_eq!(subcommands(&calls.lock()), vec!["run-shell"]);
+    }
+
+    #[tokio::test]
+    async fn periodic_save_invokes_save_at_interval() {
+        let dir = temp_restore_dir("periodic-save");
+        let (runtime, calls) = runtime(RecordingRunner::new(), &dir);
+
+        let _handle = runtime.start_periodic_save(Duration::from_millis(20));
+        wait_for_save_calls(&calls, 2).await;
+
+        let save_calls = save_call_count(&calls);
+        assert!(
+            save_calls >= 2,
+            "expected at least two periodic saves, got {save_calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_periodic_save_handle_stops_timer() {
+        let dir = temp_restore_dir("periodic-save-cancel");
+        let (runtime, calls) = runtime(RecordingRunner::new(), &dir);
+
+        let handle = runtime.start_periodic_save(Duration::from_millis(20));
+        wait_for_save_calls(&calls, 1).await;
+        drop(handle);
+        let calls_after_drop = save_call_count(&calls);
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        assert_eq!(save_call_count(&calls), calls_after_drop);
     }
 }
