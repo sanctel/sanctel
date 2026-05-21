@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import Sidebar from "./core/components/Sidebar";
@@ -13,10 +14,25 @@ export default function App() {
   const hydrate = useTmuxStatus((s) => s.hydrate);
   const loaded = useTmuxStatus((s) => s.loaded);
   const tmuxAvailable = useTmuxStatus((s) => s.status.available);
+  const [showHooksPrompt, setShowHooksPrompt] = useState(false);
 
   useEffect(() => {
     hydrate();
   }, [hydrate]);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<HooksStatusReport>("hooks_status")
+      .then((status) => {
+        if (!cancelled && shouldShowHooksInstallPrompt(status)) {
+          setShowHooksPrompt(true);
+        }
+      })
+      .catch((e) => console.error("hooks_status failed", e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Hydrate the tab store from SQLite on launch. The store reads the
   // persisted profiles/spaces/tabs, paints the sidebar, then replays
@@ -66,10 +82,83 @@ export default function App() {
     return <TmuxSetupScreen />;
   }
 
-  return (
+  const app = (
     <div className="app">
       <Sidebar />
       <ContentArea />
+    </div>
+  );
+  if (!showHooksPrompt) return app;
+
+  return (
+    <>
+      {app}
+      <HooksInstallPrompt onDone={() => setShowHooksPrompt(false)} />
+    </>
+  );
+}
+
+interface HookFileStatus {
+  agent: string;
+  path: string;
+  installed: boolean;
+  error: string | null;
+}
+
+export interface HooksStatusReport {
+  agents: HookFileStatus[];
+  anyInstalled: boolean;
+  allInstalled: boolean;
+  promptDeclined: boolean;
+  promptSkipped: boolean;
+}
+
+export function shouldShowHooksInstallPrompt(status: HooksStatusReport): boolean {
+  return !status.promptSkipped && !status.promptDeclined && !status.anyInstalled;
+}
+
+function HooksInstallPrompt({ onDone }: { onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+
+  const install = async () => {
+    setBusy(true);
+    try {
+      await invoke("install_hooks");
+      onDone();
+    } catch (e) {
+      console.error("install_hooks failed", e);
+      setBusy(false);
+    }
+  };
+
+  const decline = async () => {
+    setBusy(true);
+    try {
+      await invoke("decline_hooks_install");
+    } catch (e) {
+      console.error("decline_hooks_install failed", e);
+    } finally {
+      onDone();
+    }
+  };
+
+  return (
+    <div className="hooks-consent-backdrop" role="dialog" aria-modal="true">
+      <div className="hooks-consent">
+        <h2>Install agent hooks?</h2>
+        <p>
+          Sanctel can add SessionStart hooks for Claude, Codex, and Gemini so
+          agent sessions can be captured for restore.
+        </p>
+        <div className="hooks-consent-actions">
+          <button type="button" onClick={decline} disabled={busy}>
+            Not now
+          </button>
+          <button type="button" onClick={install} disabled={busy}>
+            Install
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

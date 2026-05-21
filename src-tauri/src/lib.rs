@@ -16,6 +16,9 @@
 //     `profile_id`s are fully isolated.
 // ───────────────────────────────────────────────────────────────────────────
 
+mod agent_cli;
+mod hook_handler;
+mod hooks_installer;
 mod profile_isolation;
 mod restore_runtime;
 mod terminal_runtime;
@@ -32,6 +35,7 @@ use tauri::ipc::Channel;
 use tauri::webview::WebviewBuilder;
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Webview, WebviewUrl};
 
+use crate::hooks_installer::HooksStatusReport;
 use crate::profile_isolation::apply_profile_isolation;
 use crate::restore_runtime::{RestorePaths, RestoreRuntime, ResurrectRuntime, SaveTimerHandle};
 use crate::terminal_runtime::{
@@ -640,6 +644,26 @@ fn reap_orphan_tmux_sessions(
 }
 
 #[tauri::command]
+fn install_hooks() -> Result<HooksStatusReport, String> {
+    hooks_installer::install_all_hooks()
+}
+
+#[tauri::command]
+fn uninstall_hooks() -> Result<HooksStatusReport, String> {
+    hooks_installer::uninstall_all_hooks()
+}
+
+#[tauri::command]
+fn hooks_status() -> Result<HooksStatusReport, String> {
+    hooks_installer::hooks_status()
+}
+
+#[tauri::command]
+fn decline_hooks_install() -> Result<(), String> {
+    hooks_installer::remember_hook_install_declined()
+}
+
+#[tauri::command]
 fn tmux_safe_many(inputs: Vec<String>) -> Vec<String> {
     inputs.into_iter().map(|input| tmux_safe(&input)).collect()
 }
@@ -903,6 +927,7 @@ pub fn run() {
         .manage(AppState::default())
         .setup(|app| {
             install_macos_application_menu(app)?;
+            hooks_installer::refresh_sanctel_symlink()?;
             let restore_startup_paths = prepare_restore_startup_paths(app)?;
             let tmux = Arc::new(TmuxCli::new(
                 DEFAULT_SOCKET,
@@ -944,6 +969,10 @@ pub fn run() {
             tmux_status,
             tmux_safe_many,
             reap_orphan_tmux_sessions,
+            install_hooks,
+            uninstall_hooks,
+            hooks_status,
+            decline_hooks_install,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -965,6 +994,76 @@ pub fn run() {
             save_on_exit(restore_runtime.as_deref());
         }
     });
+}
+
+pub fn run_cli_subcommand_if_requested() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    let command = args.next()?;
+    match command.as_str() {
+        "hook-handler" => {
+            let Some(agent_name) = args.next() else {
+                eprintln!("usage: sanctel hook-handler <claude|codex|gemini>");
+                return Some(2);
+            };
+            let Some(agent) = agent_cli::AgentCli::parse(&agent_name) else {
+                eprintln!("unknown agent: {agent_name}");
+                return Some(2);
+            };
+            match hook_handler::run_hook_handler(agent) {
+                Ok(_) => Some(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(1)
+                }
+            }
+        }
+        "install-hooks" => match hooks_installer::install_all_hooks() {
+            Ok(status) => {
+                print_hooks_status(&status);
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                Some(1)
+            }
+        },
+        "uninstall-hooks" => match hooks_installer::uninstall_all_hooks() {
+            Ok(status) => {
+                print_hooks_status(&status);
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                Some(1)
+            }
+        },
+        "hooks-status" => match hooks_installer::hooks_status() {
+            Ok(status) => {
+                print_hooks_status(&status);
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                Some(1)
+            }
+        },
+        _ => None,
+    }
+}
+
+fn print_hooks_status(status: &HooksStatusReport) {
+    for agent in &status.agents {
+        let state = if agent.installed {
+            "installed"
+        } else {
+            "not installed"
+        };
+        if let Some(error) = &agent.error {
+            println!("{}: {} ({error})", agent.agent, state);
+        } else {
+            println!("{}: {}", agent.agent, state);
+        }
+    }
 }
 // ─── tests ────────────────────────────────────────────────────────────────
 

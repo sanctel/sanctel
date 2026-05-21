@@ -326,6 +326,20 @@ impl<R: CommandRunner> TmuxCli<R> {
         })
     }
 
+    /// Resolve the tmux session name for a concrete pane id such as
+    /// `%12`. Hook invocations use this to key sidecars by Sanctel's
+    /// per-Tab TmuxSession name.
+    pub fn session_name_for_pane(&self, pane: &str) -> Result<String, TmuxError> {
+        let out = self.run(&["display-message", "-t", pane, "-p", "#S"])?;
+        if out.status != 0 {
+            return Err(TmuxError::Command {
+                command: format!("display-message -t {pane} -p #S"),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     /// Atomic "session contains this named window, nothing else implicit"
     /// primitive. This is the only method `create_tab` / `attach_tab_to_tmux`
     /// use to bring a (session, window) into existence.

@@ -25,7 +25,11 @@ vi.mock("./terminal/agent-session-capture-tauri", () => ({
   startAgentSessionCapture: startAgentSessionCaptureMock,
 }));
 
-import { listenForTabLifecycleClose } from "./App";
+import {
+  listenForTabLifecycleClose,
+  shouldShowHooksInstallPrompt,
+  type HooksStatusReport,
+} from "./App";
 import { InMemoryPersistence } from "./core/persistence/in-memory";
 import { useTabStore } from "./core/store/tabStore";
 import { useTmuxStatus } from "./core/store/tmuxStatusStore";
@@ -167,5 +171,28 @@ describe("App tab lifecycle events", () => {
     expect((await persistence.loadAll()).tabs).toEqual([]);
 
     stopListening();
+  });
+});
+
+describe("hook install prompt decision", () => {
+  const baseStatus: HooksStatusReport = {
+    agents: [],
+    anyInstalled: false,
+    allInstalled: false,
+    promptDeclined: false,
+    promptSkipped: false,
+  };
+
+  it("shows only when no hook exists and the prompt was not skipped or declined", () => {
+    expect(shouldShowHooksInstallPrompt(baseStatus)).toBe(true);
+    expect(
+      shouldShowHooksInstallPrompt({ ...baseStatus, anyInstalled: true }),
+    ).toBe(false);
+    expect(
+      shouldShowHooksInstallPrompt({ ...baseStatus, promptDeclined: true }),
+    ).toBe(false);
+    expect(
+      shouldShowHooksInstallPrompt({ ...baseStatus, promptSkipped: true }),
+    ).toBe(false);
   });
 });
