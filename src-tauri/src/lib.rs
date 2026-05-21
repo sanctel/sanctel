@@ -223,6 +223,17 @@ fn ensure_startup_dir(path: &Path, label: &str) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|e| format!("create {label} failed: {e}"))
 }
 
+fn resurrect_snapshot_dir_for_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".sanctel").join("resurrect")
+}
+
+fn resolve_resurrect_snapshot_dir() -> Result<PathBuf, String> {
+    let home_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME resolution failed: HOME not set".to_string())?;
+    Ok(resurrect_snapshot_dir_for_home(&home_dir))
+}
+
 fn tmux_quote(value: &Path) -> String {
     format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
 }
@@ -236,7 +247,7 @@ fn prepare_restore_startup_paths<R: Runtime, M: Manager<R>>(
         .map_err(|e| format!("app_local_data_dir resolution failed: {e}"))?;
     ensure_startup_dir(&app_data_dir, "app local data dir")?;
 
-    let resurrect_dir = app_data_dir.join("resurrect");
+    let resurrect_dir = resolve_resurrect_snapshot_dir()?;
     ensure_startup_dir(&resurrect_dir, "resurrect dir")?;
 
     let bundled_conf = resolve_bundled_path(app, BUNDLED_TMUX_CONF)?;
@@ -1143,6 +1154,13 @@ mod tests {
             self.events.lock().push(StartupEvent::Save);
             Ok(())
         }
+    }
+
+    #[test]
+    fn resurrect_snapshot_dir_lives_under_sanctel_home_dotdir() {
+        let dir = resurrect_snapshot_dir_for_home(Path::new("/Users/alice"));
+
+        assert_eq!(dir, Path::new("/Users/alice").join(".sanctel/resurrect"));
     }
 
     #[test]
