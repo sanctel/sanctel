@@ -173,32 +173,32 @@ fn hooks_status_for_home(home: &Path) -> HooksStatusReport {
 
 fn hook_file_status(target: HookTarget) -> HookFileStatus {
     let path = target.path;
+    let agent = target.agent.as_str().to_string();
     let path_display = path.display().to_string();
-    if !path.exists() {
-        return HookFileStatus {
-            agent: target.agent.as_str().to_string(),
-            path: path_display,
-            installed: false,
-            error: None,
-        };
-    }
-    match std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {} failed: {e}", path.display()))
-        .and_then(|body| has_sanctel_hook(&body))
-    {
+
+    match hook_installed_at(&path) {
         Ok(installed) => HookFileStatus {
-            agent: target.agent.as_str().to_string(),
+            agent,
             path: path_display,
             installed,
             error: None,
         },
         Err(error) => HookFileStatus {
-            agent: target.agent.as_str().to_string(),
+            agent,
             path: path_display,
             installed: false,
             error: Some(error),
         },
     }
+}
+
+fn hook_installed_at(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("read {} failed: {e}", path.display()))
+        .and_then(|body| has_sanctel_hook(&body))
 }
 
 fn read_settings_or_empty(path: &Path) -> Result<String, String> {

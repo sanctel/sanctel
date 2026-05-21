@@ -1017,37 +1017,25 @@ pub fn run_cli_subcommand_if_requested() -> Option<i32> {
                 }
             }
         }
-        "install-hooks" => match hooks_installer::install_all_hooks() {
-            Ok(status) => {
-                print_hooks_status(&status);
-                Some(0)
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                Some(1)
-            }
-        },
-        "uninstall-hooks" => match hooks_installer::uninstall_all_hooks() {
-            Ok(status) => {
-                print_hooks_status(&status);
-                Some(0)
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                Some(1)
-            }
-        },
-        "hooks-status" => match hooks_installer::hooks_status() {
-            Ok(status) => {
-                print_hooks_status(&status);
-                Some(0)
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                Some(1)
-            }
-        },
+        "install-hooks" => Some(run_hooks_status_command(hooks_installer::install_all_hooks)),
+        "uninstall-hooks" => Some(run_hooks_status_command(
+            hooks_installer::uninstall_all_hooks,
+        )),
+        "hooks-status" => Some(run_hooks_status_command(hooks_installer::hooks_status)),
         _ => None,
+    }
+}
+
+fn run_hooks_status_command(command: fn() -> Result<HooksStatusReport, String>) -> i32 {
+    match command() {
+        Ok(status) => {
+            print_hooks_status(&status);
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
 }
 
