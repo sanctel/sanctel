@@ -266,6 +266,18 @@ fn save_on_exit(restore_runtime: Option<&dyn RestoreRuntime>) {
     }
 }
 
+fn apply_tmux_conf_and_restore<R: CommandRunner>(
+    tmux: &TmuxCli<R>,
+    restore_runtime: &dyn RestoreRuntime,
+) {
+    if let Err(e) = tmux.source_file(tmux.conf_path()) {
+        eprintln!("tmux source bundled config failed: {e}");
+    }
+    if let Err(e) = restore_runtime.restore_on_launch() {
+        eprintln!("tmux restore on launch failed: {e}");
+    }
+}
+
 /// Move a webview to overlay the current content rect (visible).
 fn show_webview(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -846,9 +858,7 @@ pub fn run() {
                     Arc::clone(&tmux),
                     restore_startup_paths.restore_paths,
                 ));
-                if let Err(e) = restore_runtime.restore_on_launch() {
-                    eprintln!("tmux restore on launch failed: {e}");
-                }
+                apply_tmux_conf_and_restore(tmux.as_ref(), restore_runtime.as_ref());
                 let save_timer = restore_runtime.start_periodic_save(Duration::from_secs(300));
                 let restore_runtime: Arc<dyn RestoreRuntime> = restore_runtime;
                 *state.restore_runtime.lock() = Some(restore_runtime);
@@ -1079,6 +1089,107 @@ mod tests {
     #[test]
     fn default_status_names_tmux_backend() {
         assert_eq!(TmuxStatus::default().backend, "tmux");
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum StartupEvent {
+        Tmux(Vec<String>),
+        Restore,
+        Save,
+    }
+
+    struct StartupRunner {
+        events: Arc<Mutex<Vec<StartupEvent>>>,
+        source_status: i32,
+    }
+
+    impl CommandRunner for StartupRunner {
+        fn run(&self, _: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            self.events.lock().push(StartupEvent::Tmux(
+                args.iter().map(|arg| arg.to_string()).collect(),
+            ));
+            Ok(CommandOutput {
+                status: self.source_status,
+                stdout: Vec::new(),
+                stderr: b"source failed".to_vec(),
+            })
+        }
+    }
+
+    struct StartupRestoreRuntime {
+        events: Arc<Mutex<Vec<StartupEvent>>>,
+    }
+
+    impl RestoreRuntime for StartupRestoreRuntime {
+        fn restore_on_launch(
+            &self,
+        ) -> Result<crate::restore_runtime::RestoreOutcome, crate::restore_runtime::RestoreError>
+        {
+            self.events.lock().push(StartupEvent::Restore);
+            Ok(crate::restore_runtime::RestoreOutcome::NoSnapshot)
+        }
+
+        fn save_now(&self) -> Result<(), crate::restore_runtime::RestoreError> {
+            self.events.lock().push(StartupEvent::Save);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn startup_sources_tmux_conf_before_restore() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let tmux = TmuxCli::new(
+            "test",
+            "/tmp/sanctel.tmux.conf",
+            StartupRunner {
+                events: Arc::clone(&events),
+                source_status: 0,
+            },
+        );
+        let restore_runtime = StartupRestoreRuntime {
+            events: Arc::clone(&events),
+        };
+
+        apply_tmux_conf_and_restore(&tmux, &restore_runtime);
+
+        let events = events.lock().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            StartupEvent::Tmux(vec![
+                "-L".into(),
+                "test".into(),
+                "-f".into(),
+                "/tmp/sanctel.tmux.conf".into(),
+                "source-file".into(),
+                "-q".into(),
+                "/tmp/sanctel.tmux.conf".into(),
+            ])
+        );
+        assert_eq!(events[1], StartupEvent::Restore);
+    }
+
+    #[test]
+    fn startup_restore_continues_when_tmux_conf_source_fails() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let tmux = TmuxCli::new(
+            "test",
+            "/tmp/sanctel.tmux.conf",
+            StartupRunner {
+                events: Arc::clone(&events),
+                source_status: 1,
+            },
+        );
+        let restore_runtime = StartupRestoreRuntime {
+            events: Arc::clone(&events),
+        };
+
+        apply_tmux_conf_and_restore(&tmux, &restore_runtime);
+
+        let events = events.lock().clone();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StartupEvent::Tmux(_)));
+        assert_eq!(events[1], StartupEvent::Restore);
     }
 
     struct ExitSaveRuntime {

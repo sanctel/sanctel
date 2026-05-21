@@ -313,6 +313,19 @@ impl<R: CommandRunner> TmuxCli<R> {
         })
     }
 
+    /// `tmux source-file -q <path>`. Applies the rendered bundled config to
+    /// an already-running server; `-f <conf>` only affects server startup.
+    pub fn source_file(&self, path: &str) -> Result<(), TmuxError> {
+        let out = self.run(&["source-file", "-q", path])?;
+        if out.status == 0 {
+            return Ok(());
+        }
+        Err(TmuxError::Command {
+            command: format!("source-file -q {path}"),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
     /// Atomic "session contains this named window, nothing else implicit"
     /// primitive. This is the only method `create_tab` / `attach_tab_to_tmux`
     /// use to bring a (session, window) into existence.
@@ -652,6 +665,32 @@ mod tests {
         assert_eq!(args[1], "test-sock");
         assert_eq!(args[2], "-f");
         assert_eq!(args[3], "/tmp/sanctel.tmux.conf");
+    }
+
+    #[test]
+    fn source_file_sources_config_quietly() {
+        let mock = MockRunner::new(vec![MockCall {
+            expect_args_contain: Some(vec!["source-file", "-q", "/tmp/sanctel.tmux.conf"]),
+            result: ok(""),
+        }]);
+        let cli = TmuxCli::new("s", DEFAULT_CONF_PATH, mock);
+
+        cli.source_file("/tmp/sanctel.tmux.conf").unwrap();
+
+        let seen = cli.runner.seen_args();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0],
+            vec![
+                "-L",
+                "s",
+                "-f",
+                DEFAULT_CONF_PATH,
+                "source-file",
+                "-q",
+                "/tmp/sanctel.tmux.conf",
+            ]
+        );
     }
 
     #[test]
