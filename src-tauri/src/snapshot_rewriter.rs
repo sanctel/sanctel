@@ -2,6 +2,11 @@ use std::collections::HashMap;
 
 use crate::agent_cli::AgentCli;
 
+const RECORD_TYPE_COLUMN: usize = 0;
+const SESSION_NAME_COLUMN: usize = 1;
+const COMMAND_COLUMN: usize = 10;
+const MIN_PANE_COLUMNS: usize = COMMAND_COLUMN + 1;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentResume {
     pub agent: String,
@@ -9,26 +14,16 @@ pub struct AgentResume {
 }
 
 pub fn rewrite_snapshot(snapshot: &str, captures: &HashMap<String, AgentResume>) -> String {
-    if snapshot.is_empty() {
-        return String::new();
-    }
-
     let mut rewritten = String::with_capacity(snapshot.len());
-    let mut remaining = snapshot;
-    while !remaining.is_empty() {
-        if let Some(line_end) = remaining.find('\n') {
-            let (line, rest) = remaining.split_at(line_end + 1);
-            rewritten.push_str(&rewrite_line(line, captures));
-            remaining = rest;
-        } else {
-            rewritten.push_str(&rewrite_line(remaining, captures));
-            break;
-        }
+    for line in snapshot.split_inclusive('\n') {
+        rewritten.push_str(&rewrite_line(line, captures));
     }
     rewritten
 }
 
-pub fn capture_map(captures: Vec<(String, AgentResume, u64)>) -> HashMap<String, AgentResume> {
+pub fn capture_map(
+    captures: impl IntoIterator<Item = (String, AgentResume, u64)>,
+) -> HashMap<String, AgentResume> {
     let mut freshest: HashMap<String, (AgentResume, u64)> = HashMap::new();
     for (session_name, resume, ts) in captures {
         match freshest.get(&session_name) {
@@ -50,18 +45,18 @@ fn rewrite_line(line: &str, captures: &HashMap<String, AgentResume>) -> String {
         .map(|body| (body, "\n"))
         .unwrap_or((line, ""));
     let mut columns = body.split('\t').collect::<Vec<_>>();
-    if columns.len() < 11 || columns[0] != "pane" {
+    if columns.len() < MIN_PANE_COLUMNS || columns[RECORD_TYPE_COLUMN] != "pane" {
         return line.to_string();
     }
 
-    let Some(resume) = captures.get(columns[1]) else {
+    let Some(resume) = captures.get(columns[SESSION_NAME_COLUMN]) else {
         return line.to_string();
     };
     let Some(command) = resume_command(resume) else {
         return line.to_string();
     };
 
-    columns[10] = &command;
+    columns[COMMAND_COLUMN] = &command;
     format!("{}{}", columns.join("\t"), newline)
 }
 

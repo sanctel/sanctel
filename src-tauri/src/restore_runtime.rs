@@ -183,21 +183,16 @@ fn latest_snapshot_path(resurrect_dir: &Path) -> Result<Option<PathBuf>, Restore
 fn rewrite_snapshot_file(snapshot_path: &Path, hooks_dir: &Path) -> Result<(), RestoreError> {
     let captures = crate::agent_session_watcher::read_agent_session_captures(hooks_dir)
         .map_err(RestoreError::Io)?;
-    let capture_map = snapshot_rewriter::capture_map(
-        captures
-            .into_iter()
-            .map(|capture| {
-                (
-                    capture.session_name,
-                    AgentResume {
-                        agent: capture.agent,
-                        session_id: capture.session_id,
-                    },
-                    capture.ts,
-                )
-            })
-            .collect(),
-    );
+    let capture_map = snapshot_rewriter::capture_map(captures.into_iter().map(|capture| {
+        (
+            capture.session_name,
+            AgentResume {
+                agent: capture.agent,
+                session_id: capture.session_id,
+            },
+            capture.ts,
+        )
+    }));
     if capture_map.is_empty() {
         return Ok(());
     }
