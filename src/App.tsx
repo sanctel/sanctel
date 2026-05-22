@@ -119,12 +119,10 @@ export function shouldShowHooksInstallPrompt(status: HooksStatusReport): boolean
 
 function HooksInstallPrompt({ onDone }: { onDone: () => void }) {
   const [busy, setBusy] = useState(false);
-  const [capturedTabId] = useState(
-    () => useTabStore.getState().activeTab()?.id ?? null,
-  );
   const activeTabId = useTabStore(
     (state) => state.activeSpace()?.activeTabId ?? null,
   );
+  const [capturedTabId] = useState(activeTabId);
 
   useEffect(() => {
     hideTabWebviewsForHooksPrompt().catch((e) =>
