@@ -177,9 +177,22 @@ export function mount(
     });
   });
 
+  // Forward window focus to xterm. Tauri's webview.set_focus() makes
+  // this webview the active one at the native (WKWebView) layer, but
+  // xterm.js has its own focus state — keystrokes only reach it once
+  // its textarea is focused. Without this, clicking a sidebar tab
+  // brings the terminal into view but typing goes nowhere until the
+  // user clicks inside the terminal.
+  const onWindowFocus = () => term.focus();
+  window.addEventListener("focus", onWindowFocus);
+  // First mount: take focus immediately so typing works without an
+  // extra click on the initial active tab.
+  term.focus();
+
   return {
     term,
     dispose: () => {
+      window.removeEventListener("focus", onWindowFocus);
       resizeObserver.disconnect();
       onResizeDisposable.dispose();
       onDataDisposable.dispose();
