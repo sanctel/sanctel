@@ -64,12 +64,42 @@ fn rewrite_line(line: &str, captures: &HashMap<String, AgentResume>) -> String {
     let Some(agent) = AgentCli::parse(&resume.agent) else {
         return line.to_string();
     };
+    // The sidecar records "an agent session was active in this pane at
+    // some point" — it persists across the agent exiting. If the pane
+    // has moved on (user typed /exit and is at a shell prompt, or
+    // crashed back to zsh), don't inject the resume command: respect
+    // that the user has left. We detect this by comparing the
+    // snapshot's column 9 (pane_current_command) against the set of
+    // names each agent is known to surface as in tmux.
+    if !pane_is_running_agent(columns[PROGRAM_COLUMN], agent) {
+        return line.to_string();
+    }
     let program = agent.as_str();
     let command = resume_command(agent, &resume.session_id);
 
     columns[PROGRAM_COLUMN] = program;
     columns[COMMAND_COLUMN] = &command;
     format!("{}{}", columns.join("\t"), newline)
+}
+
+fn pane_is_running_agent(snapshot_program: &str, agent: AgentCli) -> bool {
+    match agent {
+        AgentCli::Claude => snapshot_program == "claude",
+        // macOS truncates `comm` to ~15 chars, so the arm64 codex
+        // binary shows up as `codex-aarch64-a`. Match either form.
+        AgentCli::Codex => {
+            snapshot_program == "codex" || snapshot_program.starts_with("codex-")
+        }
+        // Gemini is shipped as a node script, so tmux's pane_current_command
+        // is `node` (or `gemini` if the user has a wrapper). Both are
+        // accepted. Edge case: a user running unrelated `node` in a pane
+        // that ever had a gemini sidecar will get a stale resume on
+        // restore. Acceptable for now; if it bites, the SessionEnd hook
+        // (not yet registered) is the cleaner fix.
+        AgentCli::Gemini => {
+            snapshot_program == "gemini" || snapshot_program == "node"
+        }
+    }
 }
 
 fn resume_command(agent: AgentCli, session_id: &str) -> String {
@@ -189,6 +219,52 @@ mod tests {
             rewritten,
             "pane\tsanctel_wt_sanctel-scratch__term-1\t0\t1\t:*\t0\tReady\t:/home\t1\tgemini\t:gemini --resume gemini-session-1\n",
         );
+    }
+
+    #[test]
+    fn claude_pane_back_at_shell_is_not_rewritten() {
+        // User ran claude, exited it, sat at the shell prompt, then
+        // quit sanctel. The sidecar still records claude's session_id,
+        // but the snapshot's column 9 is `zsh`. Respect the user's
+        // exit — don't resurrect the conversation.
+        let snapshot = "pane\tsanctel_wt_sanctel-main__term-1\t0\t1\t:*\t0\tshell\t:/repo\t1\tzsh\t:zsh\n";
+        let mut captures = HashMap::new();
+        captures.insert(
+            "sanctel_wt_sanctel-main__term-1".to_string(),
+            capture("claude", "stale-session-id"),
+        );
+
+        let rewritten = rewrite_snapshot(snapshot, &captures);
+
+        assert_eq!(rewritten, snapshot);
+    }
+
+    #[test]
+    fn codex_pane_back_at_shell_is_not_rewritten() {
+        let snapshot = "pane\tsanctel_wt_sanctel-main__term-2\t0\t1\t:*\t0\tshell\t:/repo\t1\tbash\t:bash\n";
+        let mut captures = HashMap::new();
+        captures.insert(
+            "sanctel_wt_sanctel-main__term-2".to_string(),
+            capture("codex", "stale-session-id"),
+        );
+
+        let rewritten = rewrite_snapshot(snapshot, &captures);
+
+        assert_eq!(rewritten, snapshot);
+    }
+
+    #[test]
+    fn gemini_pane_back_at_shell_is_not_rewritten() {
+        let snapshot = "pane\tsanctel_wt_sanctel-scratch__term-1\t0\t1\t:*\t0\tshell\t:/home\t1\tfish\t:fish\n";
+        let mut captures = HashMap::new();
+        captures.insert(
+            "sanctel_wt_sanctel-scratch__term-1".to_string(),
+            capture("gemini", "stale-session-id"),
+        );
+
+        let rewritten = rewrite_snapshot(snapshot, &captures);
+
+        assert_eq!(rewritten, snapshot);
     }
 
     #[test]
