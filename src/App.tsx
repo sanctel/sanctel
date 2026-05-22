@@ -15,6 +15,12 @@ export default function App() {
   const loaded = useTmuxStatus((s) => s.loaded);
   const tmuxAvailable = useTmuxStatus((s) => s.status.available);
   const [showHooksPrompt, setShowHooksPrompt] = useState(false);
+  // Tab hydration must not race with the hooks-install modal. Each
+  // create_tab call in the hydrate loop unconditionally calls
+  // show_webview on the Rust side, which would pop the native webview
+  // back on top of the modal. Gate tab hydrate on the modal decision
+  // being settled and (if shown) dismissed.
+  const [hooksStatusResolved, setHooksStatusResolved] = useState(false);
 
   useEffect(() => {
     hydrate();
@@ -24,11 +30,16 @@ export default function App() {
     let cancelled = false;
     invoke<HooksStatusReport>("hooks_status")
       .then((status) => {
-        if (!cancelled && shouldShowHooksInstallPrompt(status)) {
+        if (cancelled) return;
+        if (shouldShowHooksInstallPrompt(status)) {
           setShowHooksPrompt(true);
         }
+        setHooksStatusResolved(true);
       })
-      .catch((e) => console.error("hooks_status failed", e));
+      .catch((e) => {
+        console.error("hooks_status failed", e);
+        if (!cancelled) setHooksStatusResolved(true);
+      });
     return () => {
       cancelled = true;
     };
@@ -37,13 +48,17 @@ export default function App() {
   // Hydrate the tab store from SQLite on launch. The store reads the
   // persisted profiles/spaces/tabs, paints the sidebar, then replays
   // `create_tab` per row so each Tauri webview reattaches to its
-  // server-held identity (tmux window / agent session).
+  // server-held identity (tmux window / agent session). Deferred until
+  // the modal decision is resolved AND the modal is closed — otherwise
+  // create_tab's show_webview calls would overlay the modal.
   useEffect(() => {
+    if (!hooksStatusResolved) return;
+    if (showHooksPrompt) return;
     const persistence = new SqlPersistence();
     useTabStore.getState().hydrate(persistence).catch((e) => {
       console.error("tabStore hydrate failed", e);
     });
-  }, []);
+  }, [hooksStatusResolved, showHooksPrompt]);
 
   // Terminal/chat webviews emit `sanctel://open-url` when a user clicks a URL
   // detected by xterm's web-links addon. Route it through the same `newTab`
