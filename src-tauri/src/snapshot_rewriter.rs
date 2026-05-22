@@ -4,6 +4,15 @@ use crate::agent_cli::AgentCli;
 
 const RECORD_TYPE_COLUMN: usize = 0;
 const SESSION_NAME_COLUMN: usize = 1;
+// Column 9 in resurrect's pane record is `pane_current_command` — the
+// short program name (truncated by the kernel: macOS reports `codex` as
+// `codex-aarch64-a`, gemini as `node` since it's a node script).
+// Resurrect's restore matches this column against `@resurrect-processes`;
+// if there's no match, the pane comes back as an empty shell regardless
+// of what we wrote in column 10. So when we have a capture, we normalize
+// column 9 to the canonical agent name (`claude` / `codex` / `gemini`)
+// so the conf's allowlist hits and the rewritten command actually runs.
+const PROGRAM_COLUMN: usize = 9;
 const COMMAND_COLUMN: usize = 10;
 const MIN_PANE_COLUMNS: usize = COMMAND_COLUMN + 1;
 
@@ -52,19 +61,22 @@ fn rewrite_line(line: &str, captures: &HashMap<String, AgentResume>) -> String {
     let Some(resume) = captures.get(columns[SESSION_NAME_COLUMN]) else {
         return line.to_string();
     };
-    let Some(command) = resume_command(resume) else {
+    let Some(agent) = AgentCli::parse(&resume.agent) else {
         return line.to_string();
     };
+    let program = agent.as_str();
+    let command = resume_command(agent, &resume.session_id);
 
+    columns[PROGRAM_COLUMN] = program;
     columns[COMMAND_COLUMN] = &command;
     format!("{}{}", columns.join("\t"), newline)
 }
 
-fn resume_command(resume: &AgentResume) -> Option<String> {
-    match AgentCli::parse(&resume.agent)? {
-        AgentCli::Claude => Some(format!(":claude --resume {}", resume.session_id)),
-        AgentCli::Codex => Some(format!(":codex resume {}", resume.session_id)),
-        AgentCli::Gemini => Some(format!(":gemini --session-id {}", resume.session_id)),
+fn resume_command(agent: AgentCli, session_id: &str) -> String {
+    match agent {
+        AgentCli::Claude => format!(":claude --resume {}", session_id),
+        AgentCli::Codex => format!(":codex resume {}", session_id),
+        AgentCli::Gemini => format!(":gemini --session-id {}", session_id),
     }
 }
 
@@ -130,6 +142,47 @@ mod tests {
         assert_eq!(
             rewritten,
             "pane\tsanctel_wt_sanctel-main__term-3\t0\t1\t:*\t0\tgemini\t:/repo\t1\tgemini\t:gemini --session-id gemini-session-1\n",
+        );
+    }
+
+    #[test]
+    fn codex_pane_normalizes_truncated_program_name() {
+        // macOS truncates `comm` to ~15 chars, so `codex` (a native arm64
+        // binary) shows up as `codex-aarch64-a` in column 9. Resurrect's
+        // @resurrect-processes match runs against column 9 — if we don't
+        // normalize, the allowlist lookup misses and the pane comes back
+        // empty even though column 10 has the resume command.
+        let snapshot = "pane\tsanctel_wt_sanctel-main__term-2\t0\t1\t:*\t0\tsanctel\t:/repo\t1\tcodex-aarch64-a\t:codex\n";
+        let mut captures = HashMap::new();
+        captures.insert(
+            "sanctel_wt_sanctel-main__term-2".to_string(),
+            capture("codex", "codex-session-1"),
+        );
+
+        let rewritten = rewrite_snapshot(snapshot, &captures);
+
+        assert_eq!(
+            rewritten,
+            "pane\tsanctel_wt_sanctel-main__term-2\t0\t1\t:*\t0\tsanctel\t:/repo\t1\tcodex\t:codex resume codex-session-1\n",
+        );
+    }
+
+    #[test]
+    fn gemini_pane_normalizes_node_wrapper_program_name() {
+        // gemini is shipped as a node script, so column 9 is `node`, not
+        // `gemini`. Same normalization requirement as codex.
+        let snapshot = "pane\tsanctel_wt_sanctel-scratch__term-1\t0\t1\t:*\t0\tReady\t:/home\t1\tnode\t:/opt/homebrew/opt/node/bin/node /opt/homebrew/bin/gemini\n";
+        let mut captures = HashMap::new();
+        captures.insert(
+            "sanctel_wt_sanctel-scratch__term-1".to_string(),
+            capture("gemini", "gemini-session-1"),
+        );
+
+        let rewritten = rewrite_snapshot(snapshot, &captures);
+
+        assert_eq!(
+            rewritten,
+            "pane\tsanctel_wt_sanctel-scratch__term-1\t0\t1\t:*\t0\tReady\t:/home\t1\tgemini\t:gemini --session-id gemini-session-1\n",
         );
     }
 
