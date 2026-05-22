@@ -365,6 +365,11 @@ fn show_webview(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     webview
         .set_size(LogicalSize::new(rect.w.max(1.0), rect.h.max(1.0)))
         .map_err(|e| e.to_string())?;
+    // Transfer keyboard focus to the tab webview. Without this, clicking
+    // a sidebar tab moves the webview into view but focus stays on the
+    // main React webview — the user has to click inside the terminal
+    // before typing reaches xterm.js or the agent CLI's TUI.
+    webview.set_focus().map_err(|e| e.to_string())?;
 
     *state.active_tab.lock() = Some(id.to_string());
     Ok(())
