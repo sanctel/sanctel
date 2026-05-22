@@ -106,6 +106,24 @@ export function mount(
     );
   });
 
+  // macOS keybindings that xterm.js doesn't surface natively, mapped to
+  // the standard readline / shell control sequences. Returning `false`
+  // from the handler tells xterm to skip its own (no-op) processing.
+  //
+  // cmd+backspace → ^U (NAK, 0x15) — kill the current input line back
+  //   to its start. Matches iTerm2 / Terminal.app conventions; users
+  //   coming from those apps reach for this combo by muscle memory.
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type !== "keydown") return true;
+    if (ev.metaKey && !ev.ctrlKey && !ev.altKey && ev.key === "Backspace") {
+      invoke("terminal_write", { bytes: [0x15] }).catch((e) =>
+        console.error("terminal_write failed", e),
+      );
+      return false;
+    }
+    return true;
+  });
+
   // Forward xterm size changes (driven by fit.fit() below) to tmux via Rust.
   // term.onResize fires whenever the cell grid actually changes — duplicate
   // ResizeObserver callbacks at the same dimensions don't cost an IPC.
