@@ -85,12 +85,12 @@ describe("lookupMacTerminalKeybinding", () => {
     ).toEqual([0x15]);
   });
 
-  it("maps alt+backspace to ^W", () => {
+  it("maps alt+backspace to ESC DEL (iTerm2 Natural Text Editing)", () => {
     expect(
       lookupMacTerminalKeybinding(
         evt({ key: "Backspace", altKey: true }) as KeyboardEvent,
       ),
-    ).toEqual([0x17]);
+    ).toEqual([0x1b, 0x7f]);
   });
 
   it("maps cmd+left to ^A and cmd+right to ^E", () => {

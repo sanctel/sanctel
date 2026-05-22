@@ -6,12 +6,14 @@
 // useful keystrokes either, so without this layer typing those chords does
 // nothing.
 //
-// The table is lifted from VS Code's workbench-terminal keybinding
-// contribution:
-//   src/vs/workbench/contrib/terminalContrib/sendSequence/browser/
-//     terminal.sendSequence.contribution.ts
-// (lines 185–253 at commit 1fdf66f8). VS Code routes through its
-// keybinding service; we just consult a static lookup.
+// The table is the iTerm2 "Natural Text Editing" preset, cross-checked
+// against VS Code's workbench-terminal keybinding contribution. Both
+// agree on every binding except alt+backspace; we follow iTerm2 there.
+//
+//   - iTerm2: plists/PresetKeyMappings.plist key "Natural Text Editing"
+//   - VS Code: src/vs/workbench/contrib/terminalContrib/sendSequence/
+//              browser/terminal.sendSequence.contribution.ts
+//              (lines 185–253 at commit 1fdf66f8)
 
 export interface MacTerminalKeybinding {
   /** KeyboardEvent.key value (e.g. "Backspace", "ArrowLeft", "Delete"). */
@@ -27,8 +29,8 @@ export interface MacTerminalKeybinding {
 const CTRL_A = 0x01;
 const CTRL_E = 0x05;
 const CTRL_U = 0x15;
-const CTRL_W = 0x17;
 const ESC = 0x1b;
+const DEL = 0x7f;
 
 // ESC <letter> is the readline meta-prefix encoding. ESC b = meta-b (word
 // back), ESC f = meta-f (word forward), ESC d = meta-d (kill word right).
@@ -91,8 +93,12 @@ export const MAC_TERMINAL_KEYBINDINGS: ReadonlyArray<MacTerminalKeybinding> = [
   {
     key: "Backspace",
     mods: ["alt"],
-    bytes: [CTRL_W],
-    description: "Kill previous word",
+    // iTerm2's "Natural Text Editing" uses ESC + DEL — readline's
+    // `backward-kill-word`. More granular than ^W (which is
+    // `unix-word-rubout` and uses whitespace-only boundaries). Users
+    // expecting iTerm2 muscle memory get the right thing here.
+    bytes: [ESC, DEL],
+    description: "Kill previous word (readline backward-kill-word)",
   },
   {
     key: "Delete",
