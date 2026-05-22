@@ -119,12 +119,33 @@ export function shouldShowHooksInstallPrompt(status: HooksStatusReport): boolean
 
 function HooksInstallPrompt({ onDone }: { onDone: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [capturedTabId] = useState(
+    () => useTabStore.getState().activeTab()?.id ?? null,
+  );
+  const activeTabId = useTabStore(
+    (state) => state.activeSpace()?.activeTabId ?? null,
+  );
+
+  useEffect(() => {
+    hideTabWebviewsForHooksPrompt().catch((e) =>
+      console.error("hide hook prompt webviews failed", e),
+    );
+  }, [activeTabId]);
+
+  const done = () => {
+    onDone();
+    window.setTimeout(() => {
+      restoreTabWebviewAfterHooksPrompt(capturedTabId).catch((e) =>
+        console.error("restore hook prompt webview failed", e),
+      );
+    }, 0);
+  };
 
   const install = async () => {
     setBusy(true);
     try {
       await invoke("install_hooks");
-      onDone();
+      done();
     } catch (e) {
       console.error("install_hooks failed", e);
       setBusy(false);
@@ -138,7 +159,7 @@ function HooksInstallPrompt({ onDone }: { onDone: () => void }) {
     } catch (e) {
       console.error("decline_hooks_install failed", e);
     } finally {
-      onDone();
+      done();
     }
   };
 
@@ -160,6 +181,42 @@ function HooksInstallPrompt({ onDone }: { onDone: () => void }) {
         </div>
       </div>
     </div>
+  );
+}
+
+export async function hideTabWebviewsForHooksPrompt(): Promise<void> {
+  await invoke("hide_all");
+}
+
+export async function restoreTabWebviewAfterHooksPrompt(
+  capturedTabId: string | null,
+): Promise<void> {
+  const state = useTabStore.getState();
+  const tabId = tabIdToShowAfterHooksPrompt(capturedTabId, {
+    activeSpaceId: state.activeSpaceId,
+    tabs: state.tabs,
+  });
+
+  if (tabId) {
+    await invoke("show_tab", { id: tabId });
+  } else {
+    await invoke("hide_all");
+  }
+}
+
+export function tabIdToShowAfterHooksPrompt(
+  capturedTabId: string | null,
+  state: Pick<
+    ReturnType<typeof useTabStore.getState>,
+    "activeSpaceId" | "tabs"
+  >,
+): string | null {
+  if (capturedTabId && state.tabs.some((tab) => tab.id === capturedTabId)) {
+    return capturedTabId;
+  }
+
+  return (
+    state.tabs.find((tab) => tab.spaceId === state.activeSpaceId)?.id ?? null
   );
 }
 

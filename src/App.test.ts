@@ -12,7 +12,9 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 
 import {
+  hideTabWebviewsForHooksPrompt,
   listenForTabLifecycleClose,
+  restoreTabWebviewAfterHooksPrompt,
   shouldShowHooksInstallPrompt,
   type HooksStatusReport,
 } from "./App";
@@ -164,5 +166,88 @@ describe("hook install prompt decision", () => {
     expect(
       shouldShowHooksInstallPrompt({ ...baseStatus, promptSkipped: true }),
     ).toBe(false);
+  });
+});
+
+describe("hook install prompt webview lifecycle", () => {
+  it("hides native Tab webviews while open and restores the captured active Tab", async () => {
+    useTabStore.setState({
+      tabs: [
+        {
+          id: "tab-active",
+          kind: "terminal",
+          title: "Terminal",
+          url: "local://terminal",
+          spaceId: "space-default",
+          loading: false,
+        },
+      ],
+      spaces: [
+        {
+          id: "space-default",
+          name: "Default",
+          color: "#6366f1",
+          profileId: "profile-default",
+          activeTabId: "tab-active",
+        },
+      ],
+      activeSpaceId: "space-default",
+    });
+
+    await hideTabWebviewsForHooksPrompt();
+    await restoreTabWebviewAfterHooksPrompt("tab-active");
+
+    expect(invokeMock.mock.calls).toContainEqual(["hide_all"]);
+    expect(invokeMock.mock.calls).toContainEqual([
+      "show_tab",
+      { id: "tab-active" },
+    ]);
+  });
+
+  it("falls back to the first active-Space Tab when the captured Tab is gone", async () => {
+    useTabStore.setState({
+      tabs: [
+        {
+          id: "tab-fallback",
+          kind: "browser",
+          title: "Fallback",
+          url: "https://example.com",
+          spaceId: "space-default",
+          loading: false,
+        },
+        {
+          id: "tab-other-space",
+          kind: "browser",
+          title: "Other",
+          url: "https://other.example",
+          spaceId: "space-other",
+          loading: false,
+        },
+      ],
+      spaces: [
+        {
+          id: "space-default",
+          name: "Default",
+          color: "#6366f1",
+          profileId: "profile-default",
+          activeTabId: "tab-fallback",
+        },
+        {
+          id: "space-other",
+          name: "Other",
+          color: "#f97316",
+          profileId: "profile-default",
+          activeTabId: "tab-other-space",
+        },
+      ],
+      activeSpaceId: "space-default",
+    });
+
+    await restoreTabWebviewAfterHooksPrompt("tab-closed");
+
+    expect(invokeMock.mock.calls).toContainEqual([
+      "show_tab",
+      { id: "tab-fallback" },
+    ]);
   });
 });
