@@ -278,10 +278,15 @@ describe("tabStore hydrate", () => {
       "create_tab",
       "create_tab",
       "create_tab",
+      "show_tab",
       "drain_pending_agent_captures",
       "tmux_safe_many",
       "reap_orphan_tmux_sessions",
     ]);
+    const showCall = invokeMock.mock.calls.find(
+      ([cmd]) => cmd === "show_tab",
+    );
+    expect(showCall?.[1]).toEqual({ id: "tab-browser" });
     const safeCall = invokeMock.mock.calls.find(
       ([cmd]) => cmd === "tmux_safe_many",
     );
@@ -356,6 +361,7 @@ describe("tabStore hydrate", () => {
     expect(invokeMock.mock.calls.map(([cmd]) => cmd)).toEqual([
       "create_tab",
       "create_tab",
+      "show_tab",
       "drain_pending_agent_captures",
       "tmux_safe_many",
       "reap_orphan_tmux_sessions",

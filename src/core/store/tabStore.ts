@@ -571,6 +571,24 @@ export function createTabStore(): TabStoreHook {
         }
       }
 
+      // After the create_tab loop, Rust's active_tab is the LAST tab
+      // we replayed (each create_tab calls show_webview which updates
+      // active_tab). The frontend's activeTabId is the FIRST tab in
+      // the active space. Realign by explicitly showing the frontend's
+      // chosen active tab so the correct webview is on top from first
+      // paint — otherwise the user has to click another tab and back
+      // to see the right contents.
+      const activeSpace = spacesWithActive.find(
+        (sp) => sp.id === (spaces[0]?.id ?? DEFAULT_SPACE.id),
+      );
+      if (activeSpace?.activeTabId) {
+        try {
+          await invoke("show_tab", { id: activeSpace.activeTabId });
+        } catch (e) {
+          console.error("hydrate: show_tab for initial active failed", e);
+        }
+      }
+
       listenForAgentSessionCaptures(get, set, () => persistence);
       await drainPendingAgentCaptures(get, set, () => persistence);
       await reapOrphanTmuxSessions(tabs, spacesWithActive);
