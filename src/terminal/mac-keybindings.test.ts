@@ -127,17 +127,17 @@ describe("lookupMacTerminalKeybinding", () => {
     ).toEqual([0x1b, 0x64]); // ESC + 'd'
   });
 
-  it("maps alt+up/down to the ctrl-up/down CSI sequences", () => {
+  it("does not bind alt+up or alt+down (no useful action in default shells)", () => {
     expect(
       lookupMacTerminalKeybinding(
         evt({ key: "ArrowUp", altKey: true }) as KeyboardEvent,
       ),
-    ).toEqual([0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x41]); // ESC [ 1 ; 5 A
+    ).toBeNull();
     expect(
       lookupMacTerminalKeybinding(
         evt({ key: "ArrowDown", altKey: true }) as KeyboardEvent,
       ),
-    ).toEqual([0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x42]); // ESC [ 1 ; 5 B
+    ).toBeNull();
   });
 
   it("does not match cmd+shift+backspace (user might want different behavior)", () => {

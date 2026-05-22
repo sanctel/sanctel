@@ -36,11 +36,6 @@ const DEL = 0x7f;
 // back), ESC f = meta-f (word forward), ESC d = meta-d (kill word right).
 const META = (letter: string): number[] => [ESC, letter.charCodeAt(0)];
 
-// CSI sequences for cursor / ctrl-arrow. VS Code uses ESC[1;5A etc. for
-// ctrl+up / ctrl+down on macOS via alt — non-standard but widely accepted.
-const CSI_CTRL_UP = [ESC, 0x5b, 0x31, 0x3b, 0x35, 0x41]; // ESC [ 1 ; 5 A
-const CSI_CTRL_DOWN = [ESC, 0x5b, 0x31, 0x3b, 0x35, 0x42]; // ESC [ 1 ; 5 B
-
 export const MAC_TERMINAL_KEYBINDINGS: ReadonlyArray<MacTerminalKeybinding> = [
   // Line navigation
   {
@@ -67,21 +62,6 @@ export const MAC_TERMINAL_KEYBINDINGS: ReadonlyArray<MacTerminalKeybinding> = [
     mods: ["alt"],
     bytes: META("f"),
     description: "Move cursor one word forward",
-  },
-  // VS Code convention: alt+up/down send ctrl+up/down sequences, which
-  // most shells treat as nothing (no readline binding by default) but
-  // history-search-friendly TUIs may bind.
-  {
-    key: "ArrowUp",
-    mods: ["alt"],
-    bytes: CSI_CTRL_UP,
-    description: "Ctrl+Up (history-search-friendly)",
-  },
-  {
-    key: "ArrowDown",
-    mods: ["alt"],
-    bytes: CSI_CTRL_DOWN,
-    description: "Ctrl+Down",
   },
   // Line / word kill
   {
