@@ -285,6 +285,26 @@ fn refresh_sanctel_symlink_for_home(home: &Path, current_exe: &Path) -> Result<(
     std::fs::create_dir_all(&bin_dir)
         .map_err(|e| format!("create {} failed: {e}", bin_dir.display()))?;
     let link_path = bin_dir.join("sanctel");
+
+    // Resolve current_exe to its canonical (non-symlink) path. On macOS,
+    // _NSGetExecutablePath returns the argv[0]-shaped path the binary was
+    // invoked with, so when sanctel is launched THROUGH our own symlink
+    // (e.g., `~/.sanctel/bin/sanctel install-hooks`), `current_exe()` is
+    // the symlink path itself. Pointing the symlink at the symlink would
+    // self-loop (`too many levels of symbolic links` from the OS).
+    let canonical_target = std::fs::canonicalize(current_exe).map_err(|e| {
+        format!(
+            "canonicalize current exe ({}) failed: {e}",
+            current_exe.display()
+        )
+    })?;
+    if canonical_target == link_path {
+        return Err(format!(
+            "refusing to symlink {} to itself (canonical target collides with link path)",
+            link_path.display()
+        ));
+    }
+
     if let Ok(meta) = std::fs::symlink_metadata(&link_path) {
         if meta.file_type().is_dir() {
             return Err(format!("{} is a directory", link_path.display()));
@@ -292,7 +312,7 @@ fn refresh_sanctel_symlink_for_home(home: &Path, current_exe: &Path) -> Result<(
         std::fs::remove_file(&link_path)
             .map_err(|e| format!("remove {} failed: {e}", link_path.display()))?;
     }
-    create_symlink(current_exe, &link_path)
+    create_symlink(&canonical_target, &link_path)
         .map_err(|e| format!("symlink {} failed: {e}", link_path.display()))
 }
 
@@ -457,5 +477,58 @@ mod tests {
         assert!(install_hook_settings("{", COMMAND).is_err());
         assert!(uninstall_hook_settings("{").is_err());
         assert!(has_sanctel_hook("{").is_err());
+    }
+
+    #[test]
+    fn refresh_symlink_resolves_current_exe_when_invoked_via_existing_symlink() {
+        // Simulate sanctel being launched THROUGH the symlink it's about
+        // to refresh — the path coming in from std::env::current_exe() is
+        // the symlink path itself, not the real binary. We must follow
+        // the symlink before installing the new one, or it self-loops.
+        use std::process::Command;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "sanctel-symlink-refresh-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let home = scratch.join("home");
+        let bin_dir = home.join(".sanctel").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let link_path = bin_dir.join("sanctel");
+
+        // A real binary somewhere else in the scratch dir is the canonical
+        // target. Use any executable that exists; the symlink target just
+        // has to be a real file on disk for canonicalize to succeed.
+        let real_binary = scratch.join("sanctel-real");
+        std::fs::write(&real_binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        Command::new("chmod")
+            .args(["+x", real_binary.to_str().unwrap()])
+            .status()
+            .unwrap();
+
+        // Pre-create the link pointing at the real binary (mirroring a
+        // healthy prior install).
+        std::os::unix::fs::symlink(&real_binary, &link_path).unwrap();
+
+        // Now invoke refresh with the SYMLINK path as current_exe — the
+        // case we're guarding against.
+        refresh_sanctel_symlink_for_home(&home, &link_path)
+            .expect("refresh must succeed when invoked through the symlink");
+
+        // The symlink must point at the canonical binary, NOT at itself.
+        let new_target = std::fs::read_link(&link_path).unwrap();
+        assert_eq!(
+            new_target,
+            std::fs::canonicalize(&real_binary).unwrap(),
+            "refresh produced a self-loop; expected canonical binary path",
+        );
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 }
