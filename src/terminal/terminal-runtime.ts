@@ -26,6 +26,7 @@ export { parseAttachError } from "./attach-error";
 export type { ParsedAttachError } from "./attach-error";
 
 import { type ClipboardApi, installClipboard } from "./clipboard";
+import { lookupMacTerminalKeybinding } from "./mac-keybindings";
 
 export interface MountOptions {
   /** Wired by the host page to call `create_tab` for the URL. When omitted,
@@ -106,22 +107,17 @@ export function mount(
     );
   });
 
-  // macOS keybindings that xterm.js doesn't surface natively, mapped to
-  // the standard readline / shell control sequences. Returning `false`
-  // from the handler tells xterm to skip its own (no-op) processing.
-  //
-  // cmd+backspace → ^U (NAK, 0x15) — kill the current input line back
-  //   to its start. Matches iTerm2 / Terminal.app conventions; users
-  //   coming from those apps reach for this combo by muscle memory.
+  // macOS keybindings that xterm.js doesn't surface natively (cmd/alt
+  // chords for line / word editing), translated to readline control
+  // sequences. Table lifted from VS Code's terminal contrib — see
+  // src/terminal/mac-keybindings.ts for the source.
   term.attachCustomKeyEventHandler((ev) => {
-    if (ev.type !== "keydown") return true;
-    if (ev.metaKey && !ev.ctrlKey && !ev.altKey && ev.key === "Backspace") {
-      invoke("terminal_write", { bytes: [0x15] }).catch((e) =>
-        console.error("terminal_write failed", e),
-      );
-      return false;
-    }
-    return true;
+    const bytes = lookupMacTerminalKeybinding(ev);
+    if (!bytes) return true;
+    invoke("terminal_write", { bytes: Array.from(bytes) }).catch((e) =>
+      console.error("terminal_write failed", e),
+    );
+    return false;
   });
 
   // Forward xterm size changes (driven by fit.fit() below) to tmux via Rust.
