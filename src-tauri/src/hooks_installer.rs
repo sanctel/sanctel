@@ -35,9 +35,18 @@ struct HookTarget {
 pub fn install_hook_settings(input: &str, command: &str) -> Result<String, String> {
     let mut root = parse_settings(input)?;
     let session_start = session_start_hooks_mut(&mut root)?;
-    if !session_start.iter().any(is_sanctel_hook_entry) {
-        session_start.push(json!({ "type": "command", "command": command }));
-    }
+    // Always remove any prior sanctel entry (including legacy bare-shape
+    // entries from earlier sanctel builds) so install is self-healing
+    // across schema migrations. Idempotency-by-count is preserved: after
+    // install there is exactly one sanctel entry in the correct shape.
+    session_start.retain(|entry| !is_sanctel_hook_entry(entry));
+    // Claude's settings schema expects each event-array entry to be a
+    // wrapper object containing a `hooks` array of command entries.
+    // {"hooks": [{"type": "command", "command": "..."}]} — see
+    // https://code.claude.com/docs/en/hooks
+    session_start.push(json!({
+        "hooks": [{ "type": "command", "command": command }]
+    }));
     stringify_settings(&root)
 }
 
@@ -100,6 +109,22 @@ fn existing_session_start_hooks_mut(root: &mut Value) -> Result<Option<&mut Vec<
 }
 
 fn is_sanctel_hook_entry(entry: &Value) -> bool {
+    // Correct shape (post-fix and what every modern CLI requires):
+    //   {"hooks": [{"type": "command", "command": "...<marker>..."}]}
+    if let Some(hooks) = entry.get("hooks").and_then(Value::as_array) {
+        if hooks.iter().any(|inner| {
+            inner
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|cmd| cmd.contains(SANCTEL_HOOK_MARKER))
+        }) {
+            return true;
+        }
+    }
+    // Legacy bare shape from sanctel pre-fix:
+    //   {"type": "command", "command": "...<marker>..."}
+    // Detection is retained so uninstall (and install's retain-then-push)
+    // can clean up entries written by older builds during migration.
     entry
         .get("command")
         .and_then(Value::as_str)
@@ -298,7 +323,7 @@ mod tests {
 
         assert_eq!(
             out["hooks"]["SessionStart"],
-            json!([{ "type": "command", "command": COMMAND }])
+            json!([{ "hooks": [{ "type": "command", "command": COMMAND }] }])
         );
     }
 
@@ -321,20 +346,51 @@ mod tests {
         let input = json!({
             "hooks": {
                 "SessionStart": [
-                    { "type": "command", "command": "/usr/local/bin/notify.sh" }
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] }
                 ]
             }
         })
         .to_string();
 
         let out = parse(&install_hook_settings(&input, COMMAND).unwrap());
+        let entries = out["hooks"]["SessionStart"].as_array().unwrap();
 
-        assert_eq!(out["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            out["hooks"]["SessionStart"][0]["command"],
-            "/usr/local/bin/notify.sh"
-        );
-        assert_eq!(out["hooks"]["SessionStart"][1]["command"], COMMAND);
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "/usr/local/bin/notify.sh"));
+        assert!(entries.iter().any(|e| e["hooks"][0]["command"] == COMMAND));
+    }
+
+    #[test]
+    fn install_migrates_legacy_bare_entry_to_wrapped_shape() {
+        // An earlier sanctel build wrote bare entries. Reinstalling must
+        // replace them with the correct wrapped shape, not duplicate them.
+        let input = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] },
+                    { "type": "command", "command": COMMAND }
+                ]
+            }
+        })
+        .to_string();
+
+        let out = parse(&install_hook_settings(&input, COMMAND).unwrap());
+        let entries = out["hooks"]["SessionStart"].as_array().unwrap();
+
+        assert_eq!(entries.len(), 2);
+        // The third-party entry is preserved as-is.
+        assert!(entries
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "/usr/local/bin/notify.sh"));
+        // The sanctel entry exists in the WRAPPED shape; no bare entry remains.
+        assert!(entries
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == COMMAND));
+        assert!(!entries
+            .iter()
+            .any(|e| e.get("command").and_then(Value::as_str) == Some(COMMAND)));
     }
 
     #[test]
@@ -342,7 +398,29 @@ mod tests {
         let input = json!({
             "hooks": {
                 "SessionStart": [
-                    { "type": "command", "command": "/usr/local/bin/notify.sh" },
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] },
+                    { "hooks": [{ "type": "command", "command": COMMAND }] }
+                ]
+            }
+        })
+        .to_string();
+
+        let out = parse(&uninstall_hook_settings(&input).unwrap());
+
+        assert_eq!(
+            out["hooks"]["SessionStart"],
+            json!([{ "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] }])
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_legacy_bare_sanctel_entries() {
+        // Mid-migration: an earlier sanctel build left a bare-shape entry.
+        // Uninstall must still recognize and remove it.
+        let input = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] },
                     { "type": "command", "command": COMMAND }
                 ]
             }
@@ -353,7 +431,7 @@ mod tests {
 
         assert_eq!(
             out["hooks"]["SessionStart"],
-            json!([{ "type": "command", "command": "/usr/local/bin/notify.sh" }])
+            json!([{ "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] }])
         );
     }
 
@@ -362,7 +440,7 @@ mod tests {
         let input = json!({
             "hooks": {
                 "SessionStart": [
-                    { "type": "command", "command": "/usr/local/bin/notify.sh" }
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/notify.sh" }] }
                 ]
             }
         })
