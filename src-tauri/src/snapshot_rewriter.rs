@@ -76,7 +76,12 @@ fn resume_command(agent: AgentCli, session_id: &str) -> String {
     match agent {
         AgentCli::Claude => format!(":claude --resume {}", session_id),
         AgentCli::Codex => format!(":codex resume {}", session_id),
-        AgentCli::Gemini => format!(":gemini --session-id {}", session_id),
+        // Gemini's `--session-id` errors if the id already exists ("Use
+        // --resume to resume it"). Its `--help` claims `--resume` only
+        // accepts an index or "latest", but the runtime error message
+        // ("Use --resume {number}, --resume {uuid}, or --resume latest")
+        // confirms UUIDs are accepted too. Verified empirically.
+        AgentCli::Gemini => format!(":gemini --resume {}", session_id),
     }
 }
 
@@ -141,7 +146,7 @@ mod tests {
 
         assert_eq!(
             rewritten,
-            "pane\tsanctel_wt_sanctel-main__term-3\t0\t1\t:*\t0\tgemini\t:/repo\t1\tgemini\t:gemini --session-id gemini-session-1\n",
+            "pane\tsanctel_wt_sanctel-main__term-3\t0\t1\t:*\t0\tgemini\t:/repo\t1\tgemini\t:gemini --resume gemini-session-1\n",
         );
     }
 
@@ -182,7 +187,7 @@ mod tests {
 
         assert_eq!(
             rewritten,
-            "pane\tsanctel_wt_sanctel-scratch__term-1\t0\t1\t:*\t0\tReady\t:/home\t1\tgemini\t:gemini --session-id gemini-session-1\n",
+            "pane\tsanctel_wt_sanctel-scratch__term-1\t0\t1\t:*\t0\tReady\t:/home\t1\tgemini\t:gemini --resume gemini-session-1\n",
         );
     }
 
